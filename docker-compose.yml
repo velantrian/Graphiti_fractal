@@ -1,6 +1,8 @@
 services:
   neo4j:
-    image: neo4j:5.26-community
+    # Pin the current 5.26 LTS patch instead of floating on 5.26-community.
+    # 5.26.29 (2026-08-04) includes security fixes; major-family upgrades stay separate.
+    image: neo4j:5.26.29-community
     container_name: neo4j
     restart: unless-stopped
     environment:
