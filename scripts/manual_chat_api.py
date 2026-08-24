@@ -8,6 +8,7 @@ import httpx
 
 API_BASE = os.getenv("FRACTAL_API_BASE", "http://127.0.0.1:8000")
 API_TOKEN = (os.getenv("FRACTAL_API_TOKEN") or "").strip()
+USER_ID = (os.getenv("FRACTAL_USER_ID") or "sergey").strip()
 
 
 def _headers() -> dict[str, str]:
@@ -16,7 +17,7 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {API_TOKEN}"}
 
 
-def remember(text: str, memory_type: str = "personal", user_id: str = "sergey") -> dict:
+def remember(text: str, memory_type: str = "personal") -> dict:
     response = httpx.post(
         f"{API_BASE}/remember",
         headers=_headers(),
@@ -24,7 +25,7 @@ def remember(text: str, memory_type: str = "personal", user_id: str = "sergey") 
             "text": text,
             "memory_type": memory_type,
             "source_description": "manual_api_smoke",
-            "user_id": user_id,
+            "user_id": USER_ID,
         },
         timeout=60,
     )
@@ -32,11 +33,11 @@ def remember(text: str, memory_type: str = "personal", user_id: str = "sergey") 
     return response.json()
 
 
-def chat(message: str, user_id: str = "sergey") -> dict:
+def chat(message: str) -> dict:
     response = httpx.post(
         f"{API_BASE}/chat",
         headers=_headers(),
-        json={"message": message, "user_id": user_id},
+        json={"message": message, "user_id": USER_ID},
         timeout=120,
     )
     response.raise_for_status()
@@ -44,7 +45,7 @@ def chat(message: str, user_id: str = "sergey") -> dict:
 
 
 def interactive() -> None:
-    print("🌐 Fractal Memory manual API smoke")
+    print(f"🌐 Fractal Memory manual API smoke (owner={USER_ID})")
     print("/remember <text> | /chat <message> | /quit")
     while True:
         try:
