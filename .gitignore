@@ -42,4 +42,4 @@ htmlcov/
 # Generated artifacts
 architecture_manifest.md
 project_structure.json
-visualization/graph_data.json
+static/graph_data.json
