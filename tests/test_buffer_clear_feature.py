@@ -42,16 +42,17 @@ def test_buffer_clear_endpoint(client):
     assert TEST_USER not in _recent_memories
 
 
-def test_buffer_clear_empty(client):
+def test_buffer_clear_uses_server_owner_when_user_id_is_omitted(client):
     _conversation_buffers.pop(TEST_USER, None)
     _recent_memories.pop(TEST_USER, None)
 
     response = client.post(
         "/buffer/clear",
         headers=_auth_headers(),
-        json={"user_id": TEST_USER},
+        json={},
     )
     assert response.status_code == 200
     data = response.json()
+    assert data["user_id"] == TEST_USER
     assert data["cleared"]["conversation_buffer"] == 0
     assert data["cleared"]["recent_memories"] == 0
