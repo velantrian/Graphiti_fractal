@@ -20,5 +20,18 @@ def test_research_technologies_are_not_silently_runtime_dependencies():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8").lower()
     active = requirements + "\n" + compose
 
-    for research_dependency in ("psycopg", "pgvector", "graphrag", "openspg"):
+    research_dependencies = (
+        "psycopg",
+        "pgvector",
+        "graphrag",
+        "openspg",
+        "dowhy",
+        "causal-learn",
+        "causal_learn",
+        "graphdatascience",
+        "kuzu",
+        "ladybugdb",
+        "ladybug-db",
+    )
+    for research_dependency in research_dependencies:
         assert research_dependency not in active
