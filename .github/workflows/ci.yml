@@ -43,6 +43,7 @@ jobs:
           python -m pytest -q \
             tests/test_mcp_smoke.py \
             tests/test_security_contract.py \
+            tests/test_instance_contract.py \
             tests/test_dedupe_contract.py \
             tests/test_embedding_fail_closed.py \
             tests/test_buffer_clear_feature.py \
