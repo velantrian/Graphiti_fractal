@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core import get_graphiti_client
+from core.instance import get_instance_user_id
 from core.memory_ops import MemoryOps
 from experience.retrieval import get_antipatterns, get_success_patterns
 from knowledge.ingest import ingest_text_document, resolve_group_id
@@ -25,7 +26,7 @@ class Tool:
 TOOLS: list[Tool] = [
     Tool(
         name="memory.search_knowledge",
-        description="Поиск по Knowledge Memory.",
+        description="Поиск по shared Knowledge Memory.",
         input_schema={
             "type": "object",
             "properties": {
@@ -51,7 +52,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="memory.remember",
-        description="Добавить текст в память через единый MemoryOps ingest path.",
+        description="Добавить текст в память владельца FRACTAL_USER_ID.",
         input_schema={
             "type": "object",
             "properties": {
@@ -62,14 +63,13 @@ TOOLS: list[Tool] = [
                     "enum": ["personal", "project", "knowledge", "experience", None],
                     "default": None,
                 },
-                "user_id": {"type": "string", "default": "mcp_user"},
             },
             "required": ["text"],
         },
     ),
     Tool(
         name="memory.upload",
-        description="Загрузить текстовый документ через Graphiti ingestion pipeline.",
+        description="Загрузить текстовый документ от владельца FRACTAL_USER_ID.",
         input_schema={
             "type": "object",
             "properties": {
@@ -80,7 +80,6 @@ TOOLS: list[Tool] = [
                     "enum": ["personal", "project", "knowledge", "experience"],
                     "default": "knowledge",
                 },
-                "user_id": {"type": "string", "default": "mcp_user"},
             },
             "required": ["text"],
         },
@@ -105,7 +104,6 @@ _graphiti = None
 
 
 def _write(msg: dict[str, Any]) -> None:
-    global _framing_mode
     mode = _framing_mode or "lsp"
     body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
     if mode == "ndjson":
@@ -126,17 +124,17 @@ def _read_message() -> dict[str, Any] | None:
         if not first.strip():
             continue
 
-        first_stripped = first.strip()
-        lower = first_stripped.lower()
+        stripped = first.strip()
+        lower = stripped.lower()
         is_header = lower.startswith(b"content-length:") or (
-            b":" in first_stripped and not first_stripped.startswith((b"{", b"["))
+            b":" in stripped and not stripped.startswith((b"{", b"["))
         )
 
         if is_header:
             headers: dict[str, str] = {}
 
-            def consume(raw_line: bytes) -> None:
-                text = raw_line.decode("ascii", errors="ignore").strip()
+            def consume(raw: bytes) -> None:
+                text = raw.decode("ascii", errors="ignore").strip()
                 if ":" in text:
                     key, value = text.split(":", 1)
                     headers[key.strip().lower()] = value.strip()
@@ -166,7 +164,7 @@ def _read_message() -> dict[str, Any] | None:
 
         _framing_mode = _framing_mode or "ndjson"
         try:
-            return json.loads(first_stripped.decode("utf-8"))
+            return json.loads(stripped.decode("utf-8"))
         except json.JSONDecodeError:
             continue
 
@@ -187,20 +185,19 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 
 
 async def _tool_call(name: str, args: dict[str, Any]) -> Any:
-    graphiti = await _get_graphiti()
+    owner = get_instance_user_id()
 
     if name == "memory.search_knowledge":
         query = str(args.get("query") or "").strip()
         if not query:
             raise ValueError("query is required")
-        limit = _bounded_int(args.get("limit"), default=10, minimum=1, maximum=50)
-        group_id = args.get("group_id")
+        graphiti = await _get_graphiti()
         return {
             "items": await search_knowledge(
                 graphiti,
                 query,
-                limit=limit,
-                group_id=group_id,
+                limit=_bounded_int(args.get("limit"), default=10, minimum=1, maximum=50),
+                group_id=args.get("group_id"),
             )
         }
 
@@ -208,11 +205,11 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         mode = str(args.get("mode") or "success")
         if mode not in {"success", "antipatterns"}:
             raise ValueError("mode must be success or antipatterns")
-        limit = _bounded_int(args.get("limit"), default=5, minimum=1, maximum=50)
+        graphiti = await _get_graphiti()
         kwargs = {
             "task_type": args.get("task_type"),
             "context_hash": args.get("context_hash"),
-            "limit": limit,
+            "limit": _bounded_int(args.get("limit"), default=5, minimum=1, maximum=50),
         }
         items = (
             await get_success_patterns(graphiti, **kwargs)
@@ -225,9 +222,8 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         text = str(args.get("text") or "").strip()
         if not text:
             raise ValueError("text is required")
-        user_id = str(args.get("user_id") or "mcp_user")
-        memory = MemoryOps(graphiti, user_id)
-        return await memory.remember_text(
+        graphiti = await _get_graphiti()
+        return await MemoryOps(graphiti, owner).remember_text(
             text,
             memory_type=args.get("memory_type"),
             source_description=str(args.get("source_description") or "mcp_remember"),
@@ -240,11 +236,12 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         memory_type = str(args.get("memory_type") or "knowledge")
         if memory_type not in {"personal", "project", "knowledge", "experience"}:
             raise ValueError("invalid memory_type")
+        graphiti = await _get_graphiti()
         return await ingest_text_document(
             graphiti,
             text,
             source_description=str(args.get("source_description") or "mcp_upload"),
-            user_id=str(args.get("user_id") or "mcp_user"),
+            user_id=owner,
             group_id=resolve_group_id(memory_type),
         )
 
@@ -254,19 +251,15 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             raise ValueError("uuid is required")
         hard = bool(args.get("hard", False))
         if hard and os.getenv("FRACTAL_ALLOW_HARD_DELETE") != "1":
-            raise PermissionError(
-                "hard delete is disabled; set FRACTAL_ALLOW_HARD_DELETE=1 explicitly"
-            )
-
-        driver = graphiti.driver
+            raise PermissionError("hard delete is disabled; set FRACTAL_ALLOW_HARD_DELETE=1 explicitly")
+        graphiti = await _get_graphiti()
         if hard:
-            res = await driver.execute_query(
+            result = await graphiti.driver.execute_query(
                 "MATCH (n {uuid:$uuid}) DETACH DELETE n RETURN 1 AS done",
                 uuid=uuid,
             )
-            return {"deleted": bool(res.records), "mode": "hard"}
-
-        res = await driver.execute_query(
+            return {"deleted": bool(result.records), "mode": "hard"}
+        result = await graphiti.driver.execute_query(
             """
             MATCH (n {uuid:$uuid})
             SET n.deleted=true, n.deleted_at=$ts
@@ -275,7 +268,7 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             uuid=uuid,
             ts=datetime.now(timezone.utc).isoformat(),
         )
-        return {"deleted": bool(res.records), "mode": "soft"}
+        return {"deleted": bool(result.records), "mode": "soft"}
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -301,11 +294,10 @@ async def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
             "id": req_id,
             "result": {
                 "protocolVersion": protocol_version,
-                "serverInfo": {"name": "fractal-memory-mcp", "version": "0.2.0"},
+                "serverInfo": {"name": "fractal-memory-mcp", "version": "0.3.0"},
                 "capabilities": {"tools": {}},
             },
         }
-
     if method == "initialized":
         return None
     if method == "shutdown":
@@ -317,11 +309,9 @@ async def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": _tools_list_payload()}}
     if method == "tools/call":
         params = msg.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
         try:
-            out = await _tool_call(name, args)
-            text = json.dumps(out, ensure_ascii=False, indent=2) if not isinstance(out, str) else out
+            output = await _tool_call(params.get("name"), params.get("arguments") or {})
+            text = json.dumps(output, ensure_ascii=False, indent=2) if not isinstance(output, str) else output
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -335,7 +325,6 @@ async def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
             }
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"ok": True}}
-
     if req_id is not None:
         return {
             "jsonrpc": "2.0",
