@@ -48,6 +48,7 @@ jobs:
             tests/test_runtime_dependency_policy.py \
             tests/test_memory_lifecycle.py \
             tests/test_memory_import.py \
+            tests/test_derived_graph.py \
             tests/test_dedupe_contract.py \
             tests/test_embedding_fail_closed.py \
             tests/test_buffer_clear_feature.py \
