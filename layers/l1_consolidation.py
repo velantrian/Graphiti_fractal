@@ -1,30 +1,54 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
+from graphiti_core.search.search_filters import SearchFilters, DateFilter, ComparisonOperator
+
 from core import get_graphiti_client
 
 
 async def get_l1_context(graphiti, user_context: str, hours_back: int = 24) -> str:
-    """
-    L1: Recent episode context (last N hours).
-    Автоматически резюмирует недавние эпизоды.
-    """
+    """Return recent, current episodic context for the requested time window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    search_filter = SearchFilters(
+        invalid_at=[[DateFilter(date=None, comparison_operator=ComparisonOperator.is_null)]]
+    )
 
-    _ = datetime.now(timezone.utc) - timedelta(hours=hours_back)
-    edges = await graphiti.search(user_context, num_results=10)
+    result = await graphiti.search_(
+        query=user_context,
+        config=COMBINED_HYBRID_SEARCH_RRF,
+        search_filter=search_filter,
+    )
 
-    summary = f"📋 L1 Summary (last {hours_back}h):\n\n"
+    recent = []
+    for episode in getattr(result, "episodes", []) or []:
+        ts = getattr(episode, "reference_time", None) or getattr(episode, "created_at", None)
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts >= cutoff:
+            recent.append((ts, episode))
 
-    if edges:
-        summary += "Relationships (uuids):\n"
-        for edge in edges[:5]:
-            summary += (
-                f"  • {getattr(edge, 'source_node_uuid', '?')} "
-                f"{getattr(edge, 'relationship_type', 'RELATES_TO')} "
-                f"{getattr(edge, 'target_node_uuid', '?')}\n"
-            )
+    recent.sort(key=lambda item: item[0], reverse=True)
+    lines = [f"📋 L1 Recent Context (last {hours_back}h):", ""]
+    if not recent:
+        lines.append("No recent matching episodes found.")
+        return "\n".join(lines)
 
-    return summary
+    for ts, episode in recent[:10]:
+        text = (
+            getattr(episode, "content", None)
+            or getattr(episode, "summary", None)
+            or getattr(episode, "name", None)
+            or ""
+        )
+        text = " ".join(str(text).split())
+        if len(text) > 320:
+            text = text[:317] + "..."
+        lines.append(f"• {ts.isoformat()} — {text}")
+
+    return "\n".join(lines)
 
 
 async def test_l1():
@@ -36,4 +60,3 @@ async def test_l1():
 
 if __name__ == "__main__":
     asyncio.run(test_l1())
-
