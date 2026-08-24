@@ -12,6 +12,7 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
 
 from core.datetime_utils import dt_to_iso, normalize_dt
+from core.graphrag_policy import apply_mode_weights, plan_retrieval
 from core.recall_telemetry import record_recall
 from core.text_utils import is_correction_text
 from core.types import ContextResult, SearchResult
@@ -170,11 +171,14 @@ class MemoryOps:
         include_episodes: bool = True,
         include_entities: bool = True,
         as_of: Optional[datetime] = None,
+        retrieval_mode: str = "auto",
     ) -> SearchResult:
-        """Search each namespace independently and merge results in the app layer.
+        """Search each namespace independently, merge, then apply read-side intent.
 
         Cross-namespace retrieval does not create or traverse SAME_AS bridges.
-        Each Graphiti call is explicitly bound to one group_id.
+        Each Graphiti call is explicitly bound to one group_id. GraphRAG-inspired
+        LOCAL/GLOBAL/DRIFT behavior is applied only after this canonical search;
+        it never creates a second retrieval or persistence authority.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
@@ -182,6 +186,7 @@ class MemoryOps:
         if not query:
             return SearchResult()
 
+        plan = plan_retrieval(query, retrieval_mode)
         resolved_scopes = self._resolve_scopes(scopes)
         temporal_filter = self._temporal_filter(as_of)
         raw_results = await asyncio.gather(
@@ -292,20 +297,27 @@ class MemoryOps:
                 reverse=True,
             )[:limit]
 
-        episode_list = ranked(episodes)
-        entity_list = ranked(entities)
-        edge_list = ranked(edges)
-        community_list = ranked(communities)
-        return SearchResult(
-            episodes=episode_list,
-            entities=entity_list,
-            edges=edge_list,
-            communities=community_list,
-            total_episodes=len(episode_list),
-            total_entities=len(entity_list),
-            total_edges=len(edge_list),
-            total_communities=len(community_list),
+        result = SearchResult(
+            episodes=ranked(episodes),
+            entities=ranked(entities),
+            edges=ranked(edges),
+            communities=ranked(communities),
         )
+        result.total_episodes = len(result.episodes)
+        result.total_entities = len(result.entities)
+        result.total_edges = len(result.edges)
+        result.total_communities = len(result.communities)
+        apply_mode_weights(result, plan)
+        logger.debug(
+            "GraphRAG retrieval mode applied",
+            extra={
+                "requested_mode": plan.requested_mode.value,
+                "effective_mode": plan.effective_mode.value,
+                "reason": plan.reason,
+                "scopes": resolved_scopes,
+            },
+        )
+        return result
 
     async def build_context_for_query(
         self,
@@ -316,6 +328,7 @@ class MemoryOps:
         include_episodes: bool = True,
         include_entities: bool = True,
         as_of: Optional[datetime] = None,
+        retrieval_mode: str = "auto",
     ) -> ContextResult:
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -327,6 +340,7 @@ class MemoryOps:
             include_episodes=include_episodes,
             include_entities=include_entities,
             as_of=as_of,
+            retrieval_mode=retrieval_mode,
         )
 
         retrieved_ids = [
