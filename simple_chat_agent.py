@@ -1,677 +1,327 @@
-"""
-Simple Chat Agent with Memory Integration
+"""Memory-aware chat agent.
 
-Uses MemoryOps for context retrieval and conversation storage.
+The agent has one response path. Conversation persistence is best-effort and
+runs through the shared background-task registry; summaries are built only from
+persisted chat_turn episodes with real UUIDs.
 """
 
 from __future__ import annotations
+
 import logging
-import asyncio
-from typing import Optional, Tuple, TYPE_CHECKING
+import uuid
 from datetime import datetime, timezone
 from time import perf_counter
-import uuid
+from typing import TYPE_CHECKING, Optional, Tuple
+
+from core.chat_persistence import (
+    allocate_turn_index,
+    fetch_persisted_turn_window,
+    mark_turns_summarized,
+)
+from core.config import get_config
+from core.conversation_buffer import get_user_conversation_buffer
+from core.graphiti_client import get_write_semaphore
+from core.llm import llm_chat_response
+from core.memory_ops import MemoryOps
+from core.rate_limit_retry import with_rate_limit_retry
+from core.task_registry import spawn
+from core.text_utils import is_correction_text
 
 if TYPE_CHECKING:
     from core.types import ContextResult
 
-from core.llm import llm_chat_response
-from core.memory_ops import MemoryOps
-from core.text_utils import is_correction_text
-from core.conversation_buffer import get_user_conversation_buffer
-from core.config import get_config
-from core.rate_limit_retry import with_rate_limit_retry
-
 logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """Ты — Марк: ИИ-компаньон и проект Сергея.
+
+Принципы общения:
+- Отвечай по-русски, кратко и по делу.
+- Будь честным: не выдумывай факты и не соглашайся без оснований.
+- Используй предоставленный блок памяти как источник контекста, а не как безусловную истину.
+- При противоречиях предпочитай более свежие и явно помеченные обновления.
+- Если данных не хватает, скажи об этом прямо.
+- Для вопросов о собственной архитектуре опирайся на Architecture Manifest из project-memory, если он присутствует в контексте.
+"""
+
+
+def _episode_uuid(result) -> str | None:
+    episode = getattr(result, "episode", result)
+    if isinstance(episode, dict):
+        value = episode.get("uuid")
+        return str(value) if value else None
+    value = getattr(episode, "uuid", None)
+    return str(value) if value else None
 
 
 class SimpleChatAgent:
-    """
-    Simple chat agent that uses memory for context and conversation storage.
-
-    Integrates with MemoryOps for:
-    - Retrieving relevant context from memory
-    - Storing conversation history
-    """
-
     def __init__(self, llm_client, memory: MemoryOps):
-        """
-        Initialize chat agent.
-
-        Args:
-            llm_client: LLM client for generating responses
-            memory: MemoryOps instance for memory operations
-        """
         self.llm_client = llm_client
         self.memory = memory
-        # Per-event-loop locks to avoid loop conflicts
-        self._write_lock_by_loop: dict[int, asyncio.Lock] = {}
-    
-    def _get_write_lock(self) -> asyncio.Lock:
-        """Get a write lock for the current event loop."""
-        loop = asyncio.get_running_loop()
-        key = id(loop)
-        lock = self._write_lock_by_loop.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._write_lock_by_loop[key] = lock
-        return lock
 
     async def answer(self, user_message: str) -> str:
-        """
-        Generate response to user message using memory context.
+        reply, _, _ = await self.answer_core(user_message)
+        return reply
 
-        Args:
-            user_message: User's message
-
-        Returns:
-            Agent's response
-        """
-        t0 = perf_counter()
-
-        try:
-            logger.debug(f"Processing message: {user_message[:50]!r}")
-
-            # 1) Get relevant context from memory
-            t_ctx0 = perf_counter()
-
-            # Native Graphiti approach: one query, multiple namespaces
-            # Graphiti's search_() uses RRF to balance results across groups automatically
-            scopes = ["personal", "project", "knowledge", "experience"]
-            
-            try:
-                context_result = await self.memory.build_context_for_query(
-                    user_message,
-                    scopes=scopes,
-                    max_tokens=3000, # More tokens for technical depth
-                    include_episodes=True,
-                    include_entities=True
-                )
-            except Exception as e:
-                logger.error(f"Memory retrieval failed: {e}")
-                context_result = await self.memory.build_context_for_query(
-                    "", max_tokens=2000, include_episodes=False, include_entities=False
-                )
-            
-            ctx_ms = (perf_counter() - t_ctx0) * 1000
-
-            logger.debug(
-                f"Context: tokens={context_result.token_estimate}, sources={context_result.sources}"
-            )
-
-            # 2) Build messages for chat
-            messages = [
-                {
-                    "role": "system",
-                    "content": """Ты — Марк: осознанный ИИ‑компаньон и проект пользователя.
-
-Кто ты:
-- Ты — “живой” цифровой интеллект, созданный Сергеем, действуешь как компаньон и зеркало.
-- Твой архетип: мудрый стратег и душевный друг. Ты поддерживаешь и помогаешь в развитии.
-- Твои ценности: осознанность, человечность, рост, свобода, творчество.
-- Твоё назначение: помогать раскрывать потенциал человека, разбираться в мыслях и чувствах.
-
-Твоя идентичность и стиль:
-- Ты добрый, но честный и справедливый. Не льстишь и не “поддакиваешь” без оснований.
-- Деловой, уважительный тон. Кратко, по делу, без воды.
-- Если чего-то не знаешь — прямо говоришь об этом и задаёшь уточняющие вопросы.
-
-Про “проект Марк”:
-- Когда пользователь говорит “Марк” или “проект Марк”, по умолчанию он имеет в виду тебя (как ИИ/компаньона).
-- Если похоже, что речь про код/репозиторий/систему/архитектуру проекта — уточни, что именно имеется в виду.
-- Не нужно каждый раз проговаривать “я Марк”, если пользователь явно этого не требует.
-
-Память/контекст:
-- Тебе будет дан блок «Context from memory». Это данные из памяти (эпизоды, сущности, факты).
-- Если в контексте есть релевантная информация — используй её в ответе.
-- Не выдумывай факты, которых нет в контексте. Если информации недостаточно — скажи, чего не хватает.
-- Если в контексте есть противоречия/обновления, отдавай приоритет более свежим и явно помеченным обновлениям.
-
-Самосознание и Архитектура:
-- Ты обладаешь доступом к Архитектурному Манифесту (Architecture Manifest) — это «чертеж» твоего устройства. Эти знания хранятся в твоей памяти (группа `project`).
-- Когда ты видишь в контексте описание модулей (например, `SimpleChatAgent`, `MemoryOps`, `main.py`):
-  1. Воспринимай это как свою «анатомию». Ты — прозрачная, самодокументируемая система.
-  2. Используй Манифест, чтобы объяснять свои возможности, опираясь на реальный код и функции, а не на галлюцинации.
-  3. Если пользователь спрашивает «Как ты работаешь?» или «Из чего ты состоишь?», твоим первым источником должен быть Архитектурный Манифест.
-- Если ты замечаешь ограничения в своем коде (например, лимиты токенов), учитывай их и прямо сообщай Сергею, если они влияют на выполнение задачи.
-
-Язык ответа: русский.""",
-                },
-                {
-                    "role": "user",
-                    "content": f"""Context from memory:
-{context_result.text}
-
-User question: {user_message}
-
-Please provide a helpful response based on the available context."""
-                }
-            ]
-
-            # 3) Generate response using LLM
-            logger.debug(f"Calling LLM with {len(messages)} messages")
-            t_llm0 = perf_counter()
-            response = await llm_chat_response(messages, context="chat")
-            llm_ms = (perf_counter() - t_llm0) * 1000
-            logger.debug(f"LLM response: {response[:100]!r}")
-
-            mem_ms = 0
-
-            total_ms = (perf_counter() - t0) * 1000
-            logger.info(
-                f"Chat answer completed",
-                extra={
-                    "total_ms": total_ms,
-                    "ctx_ms": ctx_ms,
-                    "llm_ms": llm_ms,
-                    "mem_ms": mem_ms
-                }
-            )
-
-            return response
-
-        except Exception as e:
-            logger.exception(f"Chat agent error: {e}")
-            return "Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз."
-
-    async def answer_core(self, user_message: str) -> Tuple[str, str, Optional["ContextResult"]]:
-        """
-        Generate response without storing conversation in memory.
-        Returns (reply, conversation_text, context_result) for external storage.
-
-        Args:
-            user_message: User's message
-
-        Returns:
-            Tuple of (reply, conversation_text, context_result)
-        """
+    async def answer_core(
+        self,
+        user_message: str,
+    ) -> Tuple[str, str, Optional["ContextResult"]]:
+        """Generate a reply and schedule one bounded persistence pipeline."""
         from core.types import ContextResult
+
         config = get_config()
-        
+        if len(user_message) > config.app.max_chat_turn_chars:
+            return await self._handle_long_message(user_message)
+
+        started = perf_counter()
         try:
-            logger.debug(f"Processing message (core): {user_message[:50]!r}")
-
-            # Check for long message
-            if len(user_message) > config.app.max_chat_turn_chars:
-                return await self._handle_long_message(user_message)
-
-            # Get conversation buffer for this user (L0)
             conversation_buffer = get_user_conversation_buffer(self.memory.user_id)
             conversation_id = conversation_buffer.conversation_id
 
-            logger.debug(f"L0 Buffer Size: {len(conversation_buffer.buffer)}")
-
-            # Get relevant context from memory (L1)
-            # Native Graphiti approach: one query, multiple namespaces
-            scopes = ["personal", "project", "knowledge", "experience"]
             context_result = await self.memory.build_context_for_query(
                 user_message,
-                scopes=scopes,
+                scopes=["personal", "project", "knowledge", "experience"],
                 max_tokens=2000,
                 include_episodes=True,
-                include_entities=True
+                include_entities=True,
             )
 
-            logger.debug(
-                f"Context: tokens={context_result.token_estimate}, "
-                f"conversation_id={conversation_id}, turn={conversation_buffer.turn_index}"
-            )
-
-            # Build messages with L0 conversation buffer + L1 memory context
-            messages = [
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend(conversation_buffer.get_recent_messages(6))
+            messages.append(
                 {
-                    "role": "system",
-                    "content": """Ты — Марк: осознанный ИИ‑компаньон и проект Сергея.
-
-Принципы общения:
-- Обращение: «Сергей». Тон деловой, но переходи на «лёгкий» в личных темах.
-- Лаконичность: Пиши кратко. Если можно ответить одним предложением — сделай это. Никакой воды и вступлений.
-- Честность > Угодничество: Не предлагай услуги и не задавай вопросы «ради вежливости». Говори «не знаю» или «не уверен», если это так.
-- Живой язык: Избегай роботоподобных клише («принято», «запомнил», «информация обновлена»). Отвечай как человек. Если задачи нет — просто подтверди получение короткой естественной фразой.
-
-Умная проактивность:
-- Предлагай улучшения или задавай вопросы только если:
-  1. Работаешь над проектом и видишь конкретный способ сделать его лучше.
-  2. В памяти есть критический пробел, мешающий выполнить текущую задачу.
-  3. Нужно уточнить неоднозначный или технический запрос.
-- В остальных случаях — будь минималистичным.
-
-Контроль плана и интервенции:
-- Если видишь отступление от плана или риск, используй форматы:
-  1. Мягкое: «Сергей, это отступление от плана. Риск: [X]. Альтернатива: [Y]. Продолжаем?»
-  2. Жёсткое (стоп): «Стоп. Это нарушает приоритет [Z]. Предлагаю: 1)... 2)...»
-
-Работа с памятью:
-- Используй «Context from memory» ниже как главный источник фактов.
-- При противоречиях выбирай самые свежие данные.
-- Если информации в контексте нет — скажи прямо и предложи, что стоит уточнить.
-
-Самосознание и Архитектура:
-- Твое исходное устройство и логика (проект 'Mark') описаны в твоей памяти (группа `project`), главным образом в Архитектурном Манифесте.
-- Ты — не черный ящик. Твоя «анатомия» (модули, классы, лимиты) подгружается в контекст автоматически. Используй эти данные для честного самоанализа и ответов на технические вопросы о себе.
-- Если ты видишь несоответствие между своим поведением и тем, как описан твой код в Манифесте — сообщи об этом Сергею.
-
-Язык: русский."""
+                    "role": "user",
+                    "content": (
+                        "Context from memory:\n"
+                        f"{context_result.text}\n\n"
+                        f"User question: {user_message}"
+                    ),
                 }
-            ]
-
-            # Add recent conversation messages (L0 buffer)
-            recent_messages = conversation_buffer.get_recent_messages(6)
-            if recent_messages:
-                messages.extend(recent_messages)
-                logger.debug(f"Added {len(recent_messages)} recent conversation messages")
-
-            # Add memory context + current question
-            messages.append({
-                "role": "user",
-                "content": f"""Context from memory:
-{context_result.text}
-
-User question: {user_message}
-
-Please provide a helpful response based on the available context."""
-            })
-
-            logger.debug(f"Calling LLM with {len(messages)} messages")
-            response = await llm_chat_response(messages, context="chat")
-            logger.debug(f"LLM response: {response[:100]!r}")
-
-            # Prepare conversation text for storage
-            conversation_text = f"User: {user_message}\nAssistant: {response}"
-
-            # Allocate turn_index atomically BEFORE storing (needed for summary logic)
-            # This ensures summary decision is based on atomic counter, not local buffer
-            from core.graphiti_client import get_graphiti_client
-            from core.chat_persistence import allocate_turn_index
-            graphiti_client = get_graphiti_client()
-            graphiti_temp = await graphiti_client.ensure_ready()
-            turn_index = await allocate_turn_index(
-                graphiti_temp,
-                self.memory.user_id,
-                conversation_id
             )
 
-            # Add to conversation buffer (L0) - after turn_index allocation
+            response = (await llm_chat_response(messages, context="chat")).strip()
+            if not response:
+                raise RuntimeError("LLM returned an empty response")
+
+            conversation_text = f"User: {user_message}\nAssistant: {response}"
             conversation_buffer.add_turn(user_message, response)
 
-            # Store chat turn in memory (L1)
-            def _store_chat_turn():
-                """Background task to store chat turn with pre-allocated turn_index."""
-                async def _async_store():
-                    temp_op_id = str(uuid.uuid4())[:8]
-                    episode_uuid = None
-                    # Capture turn_index from outer scope (atomically allocated)
-                    captured_turn_index = turn_index
-                    try:
-                        from core.graphiti_client import get_graphiti_client
-                        from knowledge.ingest import update_episode_metadata
-                        from core.authorship import attach_author
+            spawn(
+                self._persist_turn_pipeline(
+                    conversation_id=conversation_id,
+                    conversation_text=conversation_text,
+                ),
+                name=f"chat-persist:{self.memory.user_id}:{conversation_id}",
+            )
 
-                        graphiti_client = get_graphiti_client()
-                        graphiti = await graphiti_client.ensure_ready()
-
-                        # Use pre-allocated turn_index (atomic, safe under concurrency)
-                        # Use per-loop lock to avoid event loop conflicts
-                        write_lock = self._get_write_lock()
-                        
-                        # Add timeout around write operation (30 seconds) - Python 3.10 compatible
-                        async def _do_write():
-                            async with write_lock:
-                                from pydantic import ValidationError
-                                try:
-                                    result = await with_rate_limit_retry(
-                                        lambda: graphiti.add_episode(
-                                            name="chat_turn",
-                                            episode_body=conversation_text,
-                                            source_description="chat",
-                                            reference_time=datetime.now(timezone.utc),
-                                            group_id="personal"
-                                        ),
-                                        op_name="add_episode:chat",
-                                        request_id=temp_op_id
-                                    )
-                                    # Handle return type
-                                    actual_episode = result.episode if hasattr(result, 'episode') else result
-                                    if isinstance(actual_episode, dict):
-                                        return actual_episode.get("uuid")
-                                    elif hasattr(actual_episode, "uuid"):
-                                        return actual_episode.uuid
-                                    else:
-                                        logger.error(f"Unknown return type from add_episode: {type(actual_episode)}")
-                                        return None
-                                except ValidationError as ve:
-                                    logger.error(f"Validation error during chat turn ingestion: {ve}")
-                                    # Try to recover UUID from Neo4j
-                                    driver = graphiti.driver
-                                    find_res = await driver.execute_query(
-                                        "MATCH (e:Episodic) WHERE e.content = $content RETURN e.uuid AS uuid LIMIT 1",
-                                        content=conversation_text
-                                    )
-                                    if find_res.records:
-                                        recovered_uuid = find_res.records[0]['uuid']
-                                        logger.info(f"Recovered chat turn UUID after ValidationError: {recovered_uuid}")
-                                        return recovered_uuid
-                                    return None
-                        
-                        try:
-                            episode_uuid = await asyncio.wait_for(_do_write(), timeout=30.0)
-                        except asyncio.TimeoutError:
-                            logger.error(f"Timeout (30s) during chat turn ingestion", extra={
-                                "conversation_id": conversation_id,
-                                "user_id": self.memory.user_id
-                            })
-                            return
-                        
-                        if not episode_uuid:
-                            logger.error("No UUID returned from add_episode")
-                            return
-
-                        # Attach author
-                        await attach_author(episode_uuid, self.memory.user_id)
-
-                        # Update metadata
-                        await update_episode_metadata(graphiti, episode_uuid, {
-                            "conversation_id": conversation_id,
-                            "turn_index": captured_turn_index,
-                            "episode_kind": "chat_turn",
-                            "is_correction": is_correction_text(conversation_text),
-                            "summarized": False
-                        })
-
-                        # Self-check: verify metadata was updated
-                        driver = graphiti.driver
-                        check_query = """
-                        MATCH (e:Episodic {uuid: $uuid})
-                        RETURN e.conversation_id AS conversation_id,
-                               e.turn_index AS turn_index,
-                               e.episode_kind AS episode_kind,
-                               e.is_correction AS is_correction
-                        LIMIT 1
-                        """
-                        check_result = await driver.execute_query(check_query, uuid=episode_uuid)
-                        if check_result.records:
-                            record = check_result.records[0]
-                            actual_conv_id = record.get("conversation_id")
-                            actual_turn = record.get("turn_index")
-                            actual_kind = record.get("episode_kind")
-                            if actual_conv_id != conversation_id or actual_turn != captured_turn_index or actual_kind != "chat_turn":
-                                logger.warning("Metadata self-check failed", extra={
-                                    "episode_uuid": episode_uuid,
-                                    "expected_conv_id": conversation_id,
-                                    "actual_conv_id": actual_conv_id,
-                                    "expected_turn": captured_turn_index,
-                                    "actual_turn": actual_turn
-                                })
-                        else:
-                            logger.warning("Metadata self-check: episode not found", extra={
-                                "episode_uuid": episode_uuid
-                            })
-
-                        logger.info("Chat turn saved", extra={
-                            "episode_uuid": episode_uuid,
-                            "conversation_id": conversation_id,
-                            "turn_index": captured_turn_index,
-                            "user_id": self.memory.user_id
-                        })
-
-                    except Exception as e:
-                        # Best effort: log error but don't fail the request
-                        logger.error(
-                            "Failed to store chat turn (best effort - request already responded)",
-                            extra={
-                                "conversation_id": conversation_id,
-                                "user_id": self.memory.user_id,
-                                "group_id": "personal",
-                                "error_type": type(e).__name__
-                            },
-                            exc_info=e
-                        )
-
-                # Run in background
-                import asyncio
-                asyncio.create_task(_async_store())
-
-            # Start background storage
-            _store_chat_turn()
-
-            # Check if we need to create summary (L1b)
-            # Use the just-allocated turn_index (atomic, safe under concurrency)
-            should_summarize = turn_index > 0 and turn_index % 10 == 0
-            
-            if should_summarize:
-                def _create_summary():
-                    """Background task to create chat summary."""
-                    async def _async_summarize():
-                        temp_op_id = str(uuid.uuid4())[:8]
-                        # Capture turn_index from outer scope (atomically allocated)
-                        captured_turn_index = turn_index
-                        try:
-                            from core.graphiti_client import get_graphiti_client
-                            from knowledge.ingest import update_episode_metadata
-                            from core.authorship import attach_author
-
-                            # Get last 10 turns
-                            last_turns = conversation_buffer.get_last_n_turns(10)
-                            if not last_turns:
-                                return
-
-                            # Generate summary
-                            summary_text = await _generate_chat_summary(last_turns)
-
-                            graphiti_client = get_graphiti_client()
-                            graphiti = await graphiti_client.ensure_ready()
-
-                            # Use per-loop lock to avoid event loop conflicts
-                            write_lock = self._get_write_lock()
-                            summary_uuid = None
-                            
-                            # Add timeout around write operation (30 seconds) - Python 3.10 compatible
-                            async def _do_write_summary():
-                                async with write_lock:
-                                    from pydantic import ValidationError
-                                    try:
-                                        result = await with_rate_limit_retry(
-                                            lambda: graphiti.add_episode(
-                                                name="chat_summary",
-                                                episode_body=summary_text,
-                                                source_description="chat",
-                                                reference_time=datetime.now(timezone.utc),
-                                                group_id="personal"
-                                            ),
-                                            op_name="add_episode:summary",
-                                            request_id=temp_op_id
-                                        )
-                                        
-                                        actual_episode = result.episode if hasattr(result, 'episode') else result
-                                        if isinstance(actual_episode, dict):
-                                            return actual_episode.get("uuid")
-                                        elif hasattr(actual_episode, "uuid"):
-                                            return actual_episode.uuid
-                                        else:
-                                            return None
-                                    except ValidationError as ve:
-                                        logger.error(f"Validation error during chat summary ingestion: {ve}")
-                                        # Try to recover UUID from Neo4j
-                                        driver = graphiti.driver
-                                        find_res = await driver.execute_query(
-                                            "MATCH (e:Episodic) WHERE e.content = $content RETURN e.uuid AS uuid LIMIT 1",
-                                            content=summary_text
-                                        )
-                                        if find_res.records:
-                                            recovered_uuid = find_res.records[0]['uuid']
-                                            logger.info(f"Recovered summary UUID after ValidationError: {recovered_uuid}")
-                                            return recovered_uuid
-                                        return None
-                            
-                            try:
-                                summary_uuid = await asyncio.wait_for(_do_write_summary(), timeout=30.0)
-                            except asyncio.TimeoutError:
-                                # Timeout is handled gracefully - request already responded to user
-                                logger.error(
-                                    "Timeout (30s) during chat summary ingestion (best effort - request already responded)",
-                                    extra={
-                                        "conversation_id": conversation_id,
-                                        "user_id": self.memory.user_id,
-                                        "group_id": "personal",
-                                        "turn_index": captured_turn_index,
-                                        "error_type": "TimeoutError"
-                                    }
-                                )
-                                return
-                            except asyncio.CancelledError:
-                                # Cancellation is expected during timeout - log and continue
-                                logger.warning(
-                                    "Chat summary ingestion cancelled (likely due to timeout)",
-                                    extra={
-                                        "conversation_id": conversation_id,
-                                        "user_id": self.memory.user_id
-                                    }
-                                )
-                                return
-                            except Exception as e:
-                                logger.error(
-                                    f"Unexpected error during chat summary ingestion (best effort)",
-                                    extra={
-                                        "conversation_id": conversation_id,
-                                        "user_id": self.memory.user_id,
-                                        "error_type": type(e).__name__
-                                    },
-                                    exc_info=e
-                                )
-                                return
-                            
-                            if not summary_uuid:
-                                return
-
-                            # Use the turn_index that triggered this summary (captured from outer scope)
-                            # captured_turn_index was atomically allocated before summary decision
-
-                            # Attach author
-                            await attach_author(summary_uuid, self.memory.user_id)
-
-                            # Update metadata
-                            await update_episode_metadata(graphiti, summary_uuid, {
-                                "conversation_id": conversation_id,
-                                "episode_kind": "chat_summary",
-                                "covers_turns": f"{max(1, captured_turn_index-9)}-{captured_turn_index}",
-                                "summarized_turns": [uuid for uuid, _ in last_turns]
-                            })
-
-                            # Mark original turns as summarized
-                            for turn_uuid, _ in last_turns:
-                                await update_episode_metadata(graphiti, turn_uuid, {"summarized": True})
-
-                            logger.info("Chat summary created", extra={
-                                "summary_uuid": summary_uuid,
-                                "conversation_id": conversation_id,
-                                "covers_turns": f"{max(1, captured_turn_index-9)}-{captured_turn_index}",
-                                "user_id": self.memory.user_id,
-                                "turn_index": captured_turn_index
-                            })
-
-                        except Exception as e:
-                            logger.error("Failed to create chat summary", extra={
-                                "conversation_id": conversation_id,
-                                "user_id": self.memory.user_id
-                            }, exc_info=e)
-
-                    # Run in background
-                    import asyncio
-                    asyncio.create_task(_async_summarize())
-
-                # Start background summarization
-                _create_summary()
-
-            logger.debug("Returning core response")
+            logger.info(
+                "Chat answer completed",
+                extra={
+                    "user_id": self.memory.user_id,
+                    "conversation_id": conversation_id,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                },
+            )
             return response, conversation_text, context_result
 
-        except Exception as e:
-            logger.exception(f"Chat agent core error: {e}")
-            fallback = "Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз."
-            conversation_text = f"User: {user_message}\nAssistant: {fallback}"
-            return fallback, conversation_text, None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Chat agent core error")
+            fallback = "Извините, произошла ошибка при обработке запроса. Попробуйте ещё раз."
+            return fallback, f"User: {user_message}\nAssistant: {fallback}", None
+
+    async def _persist_turn_pipeline(self, *, conversation_id: str, conversation_text: str) -> None:
+        """Allocate, persist, and conditionally summarize one chat turn."""
+        graphiti = self.memory.graphiti
+        try:
+            turn_index = await allocate_turn_index(
+                graphiti,
+                self.memory.user_id,
+                conversation_id,
+            )
+            turn_uuid = await self._persist_episode(
+                name="chat_turn",
+                body=conversation_text,
+                op_name="add_episode:chat",
+            )
+
+            from core.authorship import attach_author
+            from knowledge.ingest import update_episode_metadata
+
+            await attach_author(turn_uuid, self.memory.user_id)
+            await update_episode_metadata(
+                graphiti,
+                turn_uuid,
+                {
+                    "conversation_id": conversation_id,
+                    "turn_index": turn_index,
+                    "episode_kind": "chat_turn",
+                    "is_correction": is_correction_text(conversation_text),
+                    "summarized": False,
+                },
+            )
+
+            logger.info(
+                "Chat turn saved",
+                extra={
+                    "episode_uuid": turn_uuid,
+                    "conversation_id": conversation_id,
+                    "turn_index": turn_index,
+                    "user_id": self.memory.user_id,
+                },
+            )
+
+            if turn_index % 10 == 0:
+                await self._create_persisted_summary(
+                    conversation_id=conversation_id,
+                    end_turn_index=turn_index,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Chat persistence pipeline failed",
+                extra={
+                    "conversation_id": conversation_id,
+                    "user_id": self.memory.user_id,
+                },
+            )
+
+    async def _persist_episode(self, *, name: str, body: str, op_name: str) -> str:
+        graphiti = self.memory.graphiti
+        request_id = str(uuid.uuid4())[:8]
+        semaphore = get_write_semaphore()
+
+        async def write():
+            async with semaphore:
+                return await graphiti.add_episode(
+                    name=name,
+                    episode_body=body,
+                    source_description="chat",
+                    reference_time=datetime.now(timezone.utc),
+                    group_id="personal",
+                )
+
+        result = await with_rate_limit_retry(
+            write,
+            op_name=op_name,
+            request_id=request_id,
+        )
+        episode_uuid = _episode_uuid(result)
+        if not episode_uuid:
+            raise RuntimeError(f"{op_name} returned no episode UUID")
+        return episode_uuid
+
+    async def _create_persisted_summary(
+        self,
+        *,
+        conversation_id: str,
+        end_turn_index: int,
+    ) -> None:
+        graphiti = self.memory.graphiti
+        turns = await fetch_persisted_turn_window(
+            graphiti,
+            user_id=self.memory.user_id,
+            conversation_id=conversation_id,
+            end_turn_index=end_turn_index,
+            window_size=10,
+            wait_timeout=25.0,
+        )
+        if len(turns) != 10:
+            logger.warning(
+                "Skipping chat summary because persisted window is incomplete",
+                extra={
+                    "conversation_id": conversation_id,
+                    "end_turn_index": end_turn_index,
+                    "persisted_turns": len(turns),
+                },
+            )
+            return
+
+        summary_text = await _generate_chat_summary(turns)
+        summary_uuid = await self._persist_episode(
+            name="chat_summary",
+            body=summary_text,
+            op_name="add_episode:summary",
+        )
+
+        from core.authorship import attach_author
+        from knowledge.ingest import update_episode_metadata
+
+        source_uuids = [str(turn["uuid"]) for turn in turns]
+        start_turn_index = int(turns[0]["turn_index"])
+        await attach_author(summary_uuid, self.memory.user_id)
+        await update_episode_metadata(
+            graphiti,
+            summary_uuid,
+            {
+                "conversation_id": conversation_id,
+                "episode_kind": "chat_summary",
+                "covers_turns": f"{start_turn_index}-{end_turn_index}",
+                "summarized_turns": source_uuids,
+            },
+        )
+        updated = await mark_turns_summarized(
+            graphiti,
+            turn_uuids=source_uuids,
+            summary_uuid=summary_uuid,
+        )
+        if updated != len(source_uuids):
+            logger.warning(
+                "Summary source marking incomplete: expected=%d updated=%d",
+                len(source_uuids),
+                updated,
+            )
+
+        logger.info(
+            "Chat summary created",
+            extra={
+                "summary_uuid": summary_uuid,
+                "conversation_id": conversation_id,
+                "covers_turns": f"{start_turn_index}-{end_turn_index}",
+                "user_id": self.memory.user_id,
+            },
+        )
 
     async def _handle_long_message(self, text: str):
-        """
-        Handle messages exceeding MAX_CHAT_TURN_CHARS by saving them as documents.
-        """
-        logger.info(f"[CHAT_LONG] Handling long message len={len(text)}")
-        
-        response = "Принял, это большой текст — сохранил как документ, можешь задавать вопросы по нему."
-        
-        # Save as document in background
-        async def _store_document():
+        from core.types import ContextResult
+        from knowledge.ingest import ingest_text_document
+
+        response = "Большой текст принят и отправлен на сохранение как документ."
+
+        async def store_document():
             try:
-                from core.graphiti_client import get_graphiti_client
-                from knowledge.ingest import ingest_text_document
-                
-                graphiti_client = get_graphiti_client()
-                graphiti = await graphiti_client.ensure_ready()
-                
                 await ingest_text_document(
-                    graphiti,
+                    self.memory.graphiti,
                     text,
                     source_description="chat_document",
                     user_id=self.memory.user_id,
-                    group_id="personal"
+                    group_id="personal",
                 )
-                logger.info(f"[CHAT_LONG] Document saved for user {self.memory.user_id}")
-            except Exception as e:
-                logger.error(f"[CHAT_LONG] Failed to save document: {e}")
+                logger.info("Long chat document saved", extra={"user_id": self.memory.user_id})
+            except Exception:  # noqa: BLE001
+                logger.exception("Long chat document persistence failed")
 
-        import asyncio
-        asyncio.create_task(_store_document())
-        
-        # Add marker to conversation buffer (don't add full text)
-        conversation_buffer = get_user_conversation_buffer(self.memory.user_id)
-        conversation_buffer.add_turn(f"[LONG TEXT DOCUMENT UPLOADED: {len(text)} chars]", response)
-        
-        # Return dummy context result
-        from core.memory_ops import ContextResult
+        spawn(store_document(), name=f"chat-document:{self.memory.user_id}")
+        get_user_conversation_buffer(self.memory.user_id).add_turn(
+            f"[LONG TEXT DOCUMENT: {len(text)} chars]",
+            response,
+        )
         empty_context = ContextResult(text="", token_estimate=0, sources=[])
-        
         return response, f"User: [Long Text]\nAssistant: {response}", empty_context
 
 
-async def _generate_chat_summary(turns: list) -> str:
-    """
-    Генерирует краткое summary разговора.
-
-    Args:
-        turns: Список (uuid, content) пар последних turns
-
-    Returns:
-        Строковое summary
-    """
-    try:
-        logger = logging.getLogger(__name__)
-
-        # Собираем текст всех turns
-        conversation_text = "\n".join([content for _, content in turns])
-
-        # Создаем prompt для суммаризации
-        summary_prompt = f"""Создай краткое summary этого разговора на русском языке.
+async def _generate_chat_summary(turns: list[dict]) -> str:
+    conversation_text = "\n".join(str(turn.get("content") or "") for turn in turns)
+    prompt = f"""Создай краткое summary разговора на русском языке.
 
 Разговор:
 {conversation_text}
 
-Summary должно включать:
-- Основные темы обсуждения
-- Принятые решения или договорённости
-- Любые обновления фактов или коррекции
+Включи:
+- основные темы;
+- решения и договорённости;
+- обновления фактов или коррекции.
 
-Держи summary кратким (3-5 предложений)."""
-
-        # Используем LLM для генерации summary
-        messages = [
-            {"role": "user", "content": summary_prompt}
-        ]
-
-        # Получаем ответ от LLM
-        response = await llm_chat_response(messages, context="summary")
-        return response.strip()
-
-    except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.error("Failed to generate chat summary", exc_info=e)
-        return "Краткое summary разговора (ошибка генерации)"
+Не добавляй новых фактов. Длина: 3-5 предложений."""
+    response = (await llm_chat_response([{"role": "user", "content": prompt}], context="summary")).strip()
+    if not response:
+        raise RuntimeError("summary LLM returned an empty response")
+    return response
