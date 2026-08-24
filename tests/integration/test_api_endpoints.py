@@ -1,4 +1,4 @@
-"""Integration tests for the authenticated FastAPI surface."""
+"""Integration tests for the authenticated single-tenant FastAPI surface."""
 
 import os
 
@@ -12,6 +12,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_TOKEN = "integration-test-token"
+TEST_USER = "api_test_user"
 
 
 @pytest_asyncio.fixture
@@ -35,6 +36,7 @@ async def graphiti_for_api_test():
 @pytest_asyncio.fixture
 async def async_client(graphiti_for_api_test, monkeypatch):
     monkeypatch.setenv("FRACTAL_API_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("FRACTAL_USER_ID", TEST_USER)
     monkeypatch.delenv("FRACTAL_ALLOW_HARD_DELETE", raising=False)
     monkeypatch.delenv("FRACTAL_ALLOW_CLEAR_ALL", raising=False)
 
@@ -66,7 +68,7 @@ async def test_protected_endpoint_rejects_missing_token(async_client):
     response = await async_client.post(
         "/buffer/clear",
         headers={"Authorization": ""},
-        json={"user_id": "api_test_user"},
+        json={"user_id": TEST_USER},
     )
     assert response.status_code == 401
 
@@ -76,9 +78,18 @@ async def test_protected_endpoint_rejects_wrong_token(async_client):
     response = await async_client.post(
         "/buffer/clear",
         headers={"Authorization": "Bearer wrong-token"},
-        json={"user_id": "api_test_user"},
+        json={"user_id": TEST_USER},
     )
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_single_tenant_rejects_other_user(async_client):
+    response = await async_client.post(
+        "/buffer/clear",
+        json={"user_id": "other_user"},
+    )
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -87,7 +98,7 @@ async def test_remember_endpoint(async_client):
         "/remember",
         json={
             "text": "Тестовый текст для API теста.",
-            "user_id": "api_test_user",
+            "user_id": TEST_USER,
             "memory_type": "knowledge",
             "source_description": "api_integration_test",
         },
@@ -100,7 +111,7 @@ async def test_remember_endpoint(async_client):
 async def test_remember_empty_text_is_validation_error(async_client):
     response = await async_client.post(
         "/remember",
-        json={"text": "", "user_id": "api_test_user"},
+        json={"text": "", "user_id": TEST_USER},
     )
     assert response.status_code == 422
 
@@ -119,7 +130,7 @@ async def test_knowledge_search_endpoint(async_client):
 async def test_buffer_clear_endpoint(async_client):
     response = await async_client.post(
         "/buffer/clear",
-        json={"user_id": "api_test_user"},
+        json={"user_id": TEST_USER},
     )
     assert response.status_code == 200
     assert "cleared" in response.json()
@@ -156,5 +167,4 @@ async def test_clear_all_is_deny_by_default(async_client):
 async def test_openapi_docs_available(async_client):
     response = await async_client.get("/openapi.json", headers={"Authorization": ""})
     assert response.status_code == 200
-    data = response.json()
-    assert data["info"]["title"] == "Fractal Memory API"
+    assert response.json()["info"]["title"] == "Fractal Memory API"
