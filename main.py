@@ -2,34 +2,33 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 
+from benchmarks.benchmark import run_benchmark
 from core import get_graphiti_client
 from core.graphiti_client import get_write_semaphore
-from queries.context_builder import build_agent_context
-from queries.quality_check import check_graph_quality
-from queries.search_strategies import test_search_strategies
+from core.migrations import apply_migrations
 from layers.l1_consolidation import get_l1_context
 from layers.l2_semantic import get_l2_semantic_context
 from layers.l3_fractal import get_l3_fractal_context
-from visualization.visualization_export import export_to_file
-from benchmarks.benchmark import run_benchmark
-from core.migrations import apply_migrations
-from scripts.consolidate import consolidate_l3_memory
+from queries.context_builder import build_agent_context
 from queries.dedupe_entities import main as dedupe_entities_main
+from queries.quality_check import check_graph_quality
+from queries.search_strategies import test_search_strategies
+from scripts.consolidate import consolidate_l3_memory
+from visualization.visualization_export import export_to_file
 
 
 async def ensure_graphiti():
-    client = get_graphiti_client()
-    return await client.ensure_ready()
+    return await get_graphiti_client().ensure_ready()
 
 
 async def cmd_setup(args):
     graphiti = await ensure_graphiti()
-    mig = await apply_migrations(graphiti)
+    migration = await apply_migrations(graphiti)
     print("✅ Graphiti/Neo4j готов, индексы созданы")
-    if mig["total"] > 0:
+    if migration["total"] > 0:
         print(
-            f"✅ Migrations: applied={mig['applied']} "
-            f"skipped={mig['skipped']} total={mig['total']}"
+            f"✅ Migrations: applied={migration['applied']} "
+            f"skipped={migration['skipped']} total={migration['total']}"
         )
 
 
@@ -49,13 +48,6 @@ async def cmd_seed(args):
             The project status is in Development phase.
             Sergey is the primary developer.
             Priority is High - this is a core research initiative.
-
-            Key concepts involved:
-            - Fractal Architecture: a hierarchical representation system
-            - Knowledge Graph: semantic network of entities and relationships
-            - Temporal Logic: maintaining contradictions over time
-
-            These concepts are at Advanced abstraction level (3-4).
             """,
             source="project_documentation",
         ),
@@ -63,54 +55,46 @@ async def cmd_seed(args):
             name="Strategic Decision - Vanilla First",
             body="""
             Decision made on 2025-12-10:
+            We decided to simplify the Fractal Memory implementation by starting with
+            vanilla Graphiti instead of building custom Redis buffer layer.
 
-            "We decided to simplify the Fractal Memory implementation by starting with
-            vanilla Graphiti instead of building custom Redis buffer layer."
-
-            Made by: Natasha
-            Rationale: Reduce complexity, avoid Integration Hell, focus on core value.
-            Dependencies: This affects L0 optimization, L1 consolidation logic.
-            Status: Active - this is our current strategy.
+            Rationale: Reduce complexity and focus on core value.
+            Status: Active.
             """,
             source="decision_log",
         ),
         dict(
             name="Team Structure",
             body="""
-            The development team consists of:
-            - Sergey: Senior Developer, specializing in AI/ML and Python
-            - Natasha: Technical Lead and Business Advisor, strategic guidance
-
-            Team Name: Fractal Memory Core Team
-            Focus: Building production-grade memory system for AI agents
-            Communication: Primarily Telegram for async discussions
+            The development team consists of Sergey and Natasha.
+            Focus: Building a memory system for AI agents.
             """,
             source="team_documentation",
         ),
     ]
 
     write_semaphore = get_write_semaphore()
-    for ep in episodes:
+    for episode in episodes:
         async with write_semaphore:
             await graphiti.add_episode(
-                name=ep["name"],
-                episode_body=ep["body"],
-                source_description=ep["source"],
+                name=episode["name"],
+                episode_body=episode["body"],
+                source_description=episode["source"],
                 reference_time=datetime.now(timezone.utc),
             )
-        print(f"✅ Added episode: {ep['name']}")
+        print(f"✅ Added episode: {episode['name']}")
 
     from knowledge.ingest import link_user_to_person_entity
 
     await link_user_to_person_entity(graphiti, "sergey", "Sergey")
-
     if args.with_search:
         await cmd_search_demo(args)
-
     print("✨ Demo data loaded")
 
 
 async def cmd_clear(args):
+    if args.confirm != "CLEAR_ALL_MEMORY":
+        raise SystemExit("Refusing destructive clear: pass --confirm CLEAR_ALL_MEMORY")
     graphiti = await ensure_graphiti()
     await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
     await graphiti.build_indices_and_constraints()
@@ -120,10 +104,10 @@ async def cmd_clear(args):
 
 async def cmd_migrate(args):
     graphiti = await ensure_graphiti()
-    mig = await apply_migrations(graphiti)
+    migration = await apply_migrations(graphiti)
     print(
-        f"✅ Migrations: applied={mig['applied']} "
-        f"skipped={mig['skipped']} total={mig['total']}"
+        f"✅ Migrations: applied={migration['applied']} "
+        f"skipped={migration['skipped']} total={migration['total']}"
     )
 
 
@@ -137,22 +121,13 @@ async def cmd_search_demo(args):
 
 async def cmd_context(args):
     graphiti = await ensure_graphiti()
-    context = await build_agent_context(
-        graphiti,
-        entity_name=args.entity,
-        context_size=args.size,
-    )
+    context = await build_agent_context(graphiti, entity_name=args.entity, context_size=args.size)
     print(context if context else "⚠️  Сущность не найдена")
 
 
 async def cmd_l1(args):
     graphiti = await ensure_graphiti()
-    summary = await get_l1_context(
-        graphiti,
-        user_context=args.query,
-        hours_back=args.hours,
-    )
-    print(summary)
+    print(await get_l1_context(graphiti, user_context=args.query, hours_back=args.hours))
 
 
 async def cmd_l2(args):
@@ -182,94 +157,77 @@ async def cmd_consolidate(args):
 
 
 async def cmd_dedupe_entities(args):
-    await dedupe_entities_main(dry_run=args.dry_run)
+    await dedupe_entities_main(dry_run=not args.apply)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Fractal Memory / Graphiti CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
-        "setup", help="Создать индексы/констрейнты Graphiti"
-    ).set_defaults(func=cmd_setup)
+    subparsers.add_parser("setup", help="Создать индексы/констрейнты Graphiti").set_defaults(func=cmd_setup)
 
-    seed_p = subparsers.add_parser("seed", help="Создать демо-эпизоды и сущности")
-    seed_p.add_argument(
-        "--with-search",
-        action="store_true",
-        help="Запустить поисковую демонстрацию после загрузки",
+    seed_parser = subparsers.add_parser("seed", help="Создать демо-эпизоды и сущности")
+    seed_parser.add_argument("--with-search", action="store_true")
+    seed_parser.set_defaults(func=cmd_seed)
+
+    subparsers.add_parser("quality", help="Отчёт по качеству графа").set_defaults(func=cmd_quality)
+
+    clear_parser = subparsers.add_parser("clear", help="Полностью очистить граф")
+    clear_parser.add_argument(
+        "--confirm",
+        required=True,
+        help="Для destructive clear требуется точное значение CLEAR_ALL_MEMORY",
     )
-    seed_p.set_defaults(func=cmd_seed)
+    clear_parser.set_defaults(func=cmd_clear)
 
-    subparsers.add_parser("quality", help="Отчёт по качеству графа").set_defaults(
-        func=cmd_quality
-    )
-    subparsers.add_parser(
-        "clear", help="Очистить граф (reset) и пересоздать индексы"
-    ).set_defaults(func=cmd_clear)
-    subparsers.add_parser(
-        "migrate", help="Применить миграции из папки migrations/"
-    ).set_defaults(func=cmd_migrate)
-    subparsers.add_parser(
-        "search-demo", help="Демонстрация стратегий поиска"
-    ).set_defaults(func=cmd_search_demo)
+    subparsers.add_parser("migrate", help="Применить миграции").set_defaults(func=cmd_migrate)
+    subparsers.add_parser("search-demo", help="Демонстрация поиска").set_defaults(func=cmd_search_demo)
 
-    ctx_p = subparsers.add_parser("context", help="Построить контекст для сущности")
-    ctx_p.add_argument("entity", help="Имя сущности")
-    ctx_p.add_argument(
-        "--size", choices=["minimal", "medium", "full"], default="full"
-    )
-    ctx_p.set_defaults(func=cmd_context)
+    context_parser = subparsers.add_parser("context", help="Построить контекст для сущности")
+    context_parser.add_argument("entity")
+    context_parser.add_argument("--size", choices=["minimal", "medium", "full"], default="full")
+    context_parser.set_defaults(func=cmd_context)
 
-    l1_p = subparsers.add_parser("l1", help="L1 recent context summary")
-    l1_p.add_argument(
-        "--query", default="Fractal Memory", help="Поисковая фраза для недавних эпизодов"
-    )
-    l1_p.add_argument("--hours", type=int, default=24, help="Часов назад для выборки")
-    l1_p.set_defaults(func=cmd_l1)
+    l1_parser = subparsers.add_parser("l1", help="L1 recent context")
+    l1_parser.add_argument("--query", default="Fractal Memory")
+    l1_parser.add_argument("--hours", type=int, default=24)
+    l1_parser.set_defaults(func=cmd_l1)
 
-    l2_p = subparsers.add_parser("l2", help="L2 semantic patterns")
-    l2_p.add_argument("entity", help="Имя сущности")
-    l2_p.set_defaults(func=cmd_l2)
+    l2_parser = subparsers.add_parser("l2", help="L2 semantic communities")
+    l2_parser.add_argument("entity")
+    l2_parser.set_defaults(func=cmd_l2)
 
-    l3_p = subparsers.add_parser("l3", help="L3 fractal abstraction")
-    l3_p.add_argument("entity", help="Имя сущности")
-    l3_p.set_defaults(func=cmd_l3)
+    l3_parser = subparsers.add_parser("l3", help="L3 fractal abstraction")
+    l3_parser.add_argument("entity")
+    l3_parser.set_defaults(func=cmd_l3)
 
-    viz_p = subparsers.add_parser("viz-export", help="Экспорт графа в JSON для D3")
-    viz_p.add_argument(
+    viz_parser = subparsers.add_parser("viz-export", help="Экспорт графа для static viewer")
+    viz_parser.add_argument(
         "--output",
-        default="visualization/graph_data.json",
-        help="Путь к JSON (по умолчанию visualization/graph_data.json)",
+        default="static/graph_data.json",
+        help="Путь к JSON (по умолчанию static/graph_data.json)",
     )
-    viz_p.set_defaults(func=cmd_viz_export)
+    viz_parser.set_defaults(func=cmd_viz_export)
 
-    subparsers.add_parser(
-        "benchmark", help="Перфоманс add_episode/search"
-    ).set_defaults(func=cmd_benchmark)
+    subparsers.add_parser("benchmark", help="Performance benchmark").set_defaults(func=cmd_benchmark)
 
-    consolidate_p = subparsers.add_parser(
-        "consolidate", help="Запустить консолидацию L3 памяти"
-    )
-    consolidate_p.add_argument(
-        "--hours", type=int, default=24 * 7, help="Количество часов для консолидации"
-    )
-    consolidate_p.set_defaults(func=cmd_consolidate)
+    consolidate_parser = subparsers.add_parser("consolidate", help="Запустить L3 consolidation")
+    consolidate_parser.add_argument("--hours", type=int, default=24 * 7)
+    consolidate_parser.set_defaults(func=cmd_consolidate)
 
-    dedupe_p = subparsers.add_parser(
-        "dedupe-entities", help="Дедуплицировать Entity узлы по имени"
+    dedupe_parser = subparsers.add_parser("dedupe-entities", help="Namespace-safe Entity dedupe")
+    dedupe_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Применить изменения. Без флага выполняется только dry-run.",
     )
-    dedupe_p.add_argument(
-        "--dry-run", action="store_true", help="Анализ без применения изменений"
-    )
-    dedupe_p.set_defaults(func=cmd_dedupe_entities)
+    dedupe_parser.set_defaults(func=cmd_dedupe_entities)
 
     return parser
 
 
 def main():
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     asyncio.run(args.func(args))
 
 
