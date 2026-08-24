@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Namespace-safe Episodic deduplication utility.
 
-Duplicates are considered equal only within the same group_id and only after
-normalizing episode text. The default command soft-deletes duplicates; physical
-purge is an explicit, separate option.
+Duplicates are equal only inside the same group_id and after text normalization.
+Dry-run is the default. Mutation requires --apply; physical purge is a separate,
+explicit option.
 """
 
 import argparse
@@ -25,7 +25,7 @@ def fingerprint(text: str) -> str:
 
 
 async def fetch_episodes(driver) -> list[dict]:
-    res = await driver.execute_query(
+    result = await driver.execute_query(
         """
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
@@ -38,13 +38,13 @@ async def fetch_episodes(driver) -> list[dict]:
     )
     return [
         {
-            "uuid": rec["uuid"],
-            "text": rec["text"] or "",
-            "group_id": rec["group_id"],
-            "created_at": rec["created_at"],
-            "reference_time": rec["reference_time"],
+            "uuid": record["uuid"],
+            "text": record["text"] or "",
+            "group_id": record["group_id"],
+            "created_at": record["created_at"],
+            "reference_time": record["reference_time"],
         }
-        for rec in res.records
+        for record in result.records
     ]
 
 
@@ -70,7 +70,7 @@ async def mark_duplicate(driver, uuid: str, master_uuid: str) -> None:
 
 async def purge_deleted(driver, days: int) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    res = await driver.execute_query(
+    result = await driver.execute_query(
         """
         MATCH (e:Episodic)
         WHERE e.deleted = true
@@ -81,16 +81,15 @@ async def purge_deleted(driver, days: int) -> int:
         """,
         cutoff=cutoff.isoformat(),
     )
-    return res.records[0]["purged"] if res.records else 0
+    return result.records[0]["purged"] if result.records else 0
 
 
 def _master_sort_key(item: dict):
-    # Prefer the oldest known source as the canonical copy, then stable UUID.
-    ts = item.get("reference_time") or item.get("created_at")
-    return (str(ts or ""), item["uuid"])
+    timestamp = item.get("reference_time") or item.get("created_at")
+    return (str(timestamp or ""), item["uuid"])
 
 
-async def main(*, dry_run: bool = False, purge_days: int | None = None):
+async def main(*, dry_run: bool = True, purge_days: int | None = None):
     graphiti = await get_graphiti_client().ensure_ready()
     driver = graphiti.driver
     episodes = await fetch_episodes(driver)
@@ -107,7 +106,7 @@ async def main(*, dry_run: bool = False, purge_days: int | None = None):
     print(f"Namespace-scoped duplicate candidates: {duplicates}")
 
     if dry_run:
-        print("✅ Dry run complete; no mutations applied")
+        print("✅ Dry run complete; no mutations applied. Re-run with --apply to mutate.")
         return
 
     fingerprints_set = 0
@@ -137,12 +136,16 @@ async def main(*, dry_run: bool = False, purge_days: int | None = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Namespace-safe Episodic deduplication")
-    parser.add_argument("--dry-run", action="store_true", help="Report only; do not mutate")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply soft-delete/fingerprint mutations. Default is dry-run.",
+    )
     parser.add_argument(
         "--purge-deleted-days",
         type=int,
         default=None,
-        help="Explicitly hard-delete already soft-deleted episodes older than N days",
+        help="With --apply, hard-delete already soft-deleted episodes older than N days",
     )
     args = parser.parse_args()
-    asyncio.run(main(dry_run=args.dry_run, purge_days=args.purge_deleted_days))
+    asyncio.run(main(dry_run=not args.apply, purge_days=args.purge_deleted_days))
