@@ -12,6 +12,7 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
 
 from core.datetime_utils import dt_to_iso, normalize_dt
+from core.recall_telemetry import record_recall
 from core.text_utils import is_correction_text
 from core.types import ContextResult, SearchResult
 from experience.writer import ingest_experience
@@ -327,6 +328,23 @@ class MemoryOps:
             include_entities=include_entities,
             as_of=as_of,
         )
+
+        retrieved_ids = [
+            item["uuid"]
+            for collection in (result.episodes, result.entities, result.edges, result.communities)
+            for item in collection
+            if item.get("uuid")
+        ]
+        if retrieved_ids:
+            try:
+                await record_recall(
+                    self.graphiti,
+                    user_id=self.user_id,
+                    query=query,
+                    object_uuids=retrieved_ids,
+                )
+            except Exception as exc:  # telemetry must never break retrieval
+                logger.warning("Recall telemetry failed closed from answer path: %s", type(exc).__name__)
 
         sections: list[str] = []
         sources = {"episodes": 0, "entities": 0, "edges": 0, "communities": 0}
