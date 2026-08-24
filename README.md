@@ -7,8 +7,9 @@ Fractal Memory — локальная single-tenant система памяти 
 ```text
 Web UI ─┐
 HTTP API ├─> MemoryOps ─> Graphiti ─> Neo4j
-MCP stdio┤       │
-CLI ─────┘       ├─ canonical ingest: knowledge/ingest.py
+MCP stdio┤       │             │
+CLI ─────┘       │             └─ explicit OpenAI model policy
+                 ├─ canonical ingest: knowledge/ingest.py
                  └─ scoped retrieval: one search per group_id -> app-layer fusion
 ```
 
@@ -22,7 +23,8 @@ CLI ─────┘       ├─ canonical ingest: knowledge/ingest.py
 - text ingestion проходит через один Graphiti-native pipeline (`knowledge/ingest.py`);
 - post-processing эпизодов адресуется по точному UUID, а не по совпадающему тексту;
 - hard delete и full clear выключены по умолчанию;
-- embedding failure не подменяется нулевым вектором.
+- embedding failure не подменяется нулевым вектором;
+- упоминание AI-модели в исторических документах не означает, что она является текущим runtime default или поддерживаемым provider adapter.
 
 ## 📦 Baseline
 
@@ -30,6 +32,40 @@ CLI ─────┘       ├─ canonical ingest: knowledge/ingest.py
 - `graphiti_core==0.29.3`
 - Neo4j: `>=5.26,<6`
 - FastAPI + Uvicorn
+
+## 🤖 AI model policy
+
+**Current-policy snapshot: 2026-08-24.** Активные defaults централизованы в `core/model_policy.py`, чтобы чат и внутренний Graphiti ingestion не расходились по скрытым model defaults.
+
+| Workload | Default |
+|---|---|
+| Interactive chat | `gpt-5.6-terra` |
+| General / summary synthesis | `gpt-5.6-luna` |
+| Graphiti main extraction/reasoning | `gpt-5.6-terra` |
+| Graphiti small-model prompts | `gpt-5.6-luna` |
+| Embeddings | `text-embedding-3-small` |
+
+Terra используется как сбалансированный основной уровень, Luna — для более дешёвых bounded summary/small-model workload. Более мощную модель можно выбрать через env без изменения кода.
+
+Текущий first-class provider path в Fractal — **OpenAI**. Claude, Gemini, DeepSeek, Qwen, Grok и другие семейства могут упоминаться в документации как часть истории/экосистемы, но такое упоминание **не означает наличие runtime adapter**.
+
+История переходов от GPT-4 / GPT-4o mini и параллельное развитие Claude, Gemini, DeepSeek, Qwen и Grok сохранены в [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md). Старые названия не удаляются из historical Day-документов: они остаются временными снимками развития проекта.
+
+> Embedding model намеренно не меняется автоматически вместе с chat/LLM model: такая замена меняет identity векторного индекса и должна быть отдельным reindex/migration решением.
+
+### Model overrides
+
+```env
+OPENAI_MODEL=gpt-5.6-terra
+CHAT_OPENAI_MODEL=gpt-5.6-terra
+SUMMARY_OPENAI_MODEL=gpt-5.6-luna
+GRAPHITI_OPENAI_MODEL=gpt-5.6-terra
+GRAPHITI_OPENAI_SMALL_MODEL=gpt-5.6-luna
+GRAPHITI_OPENAI_REASONING_EFFORT=none
+EMBEDDING_MODEL=text-embedding-3-small
+```
+
+Приоритет локального chat/summary выбора: `<CONTEXT>_OPENAI_MODEL` → `OPENAI_MODEL` → `core/model_policy.py`.
 
 ## 🚀 Быстрый запуск
 
@@ -72,6 +108,8 @@ FRACTAL_API_TOKEN=<long-random-token>
 FRACTAL_USER_ID=sergey
 ```
 
+Model overrides опциональны: без них используются defaults из `core/model_policy.py`.
+
 Destructive operations остаются выключенными:
 
 ```env
@@ -112,6 +150,8 @@ text
 ```
 
 Одинаковый текст в разных `group_id` не считается автоматически одним и тем же memory object.
+
+Graphiti получает explicit `OpenAIClient` с моделью из той же central policy; он больше не зависит от невидимого upstream LLM default.
 
 ## 💬 Chat persistence
 
@@ -198,6 +238,7 @@ Always-on CI запускается на Python 3.10 и 3.12 и проверяе
 - compile active Python surface;
 - MCP initialize + exact tool contract;
 - fail-closed API auth;
+- current AI model policy + env override contract;
 - namespace-safe dedupe contracts;
 - embedding fail-closed behavior;
 - buffer clear contract;
@@ -207,6 +248,8 @@ Always-on CI запускается на Python 3.10 и 3.12 и проверяе
 pytest -q \
   tests/test_mcp_smoke.py \
   tests/test_security_contract.py \
+  tests/test_instance_contract.py \
+  tests/test_model_policy.py \
   tests/test_dedupe_contract.py \
   tests/test_embedding_fail_closed.py \
   tests/test_buffer_clear_feature.py \
@@ -240,7 +283,10 @@ Green core CI означает только прохождение этих ко
 
 Этот `README.md` описывает **current runtime contract**.
 
-Файлы `docs/Day_*`, старые master plans и refactoring notes — исторические материалы развития проекта. Они полезны как история решений, но не являются authoritative описанием текущего runtime. При конфликте ориентируйся на README + текущий код + CI contracts.
+- [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md) — current model-policy explanation + historical evolution record.
+- `docs/Day_*`, старые master plans и refactoring notes — исторические материалы развития проекта.
+
+Исторические документы полезны как история решений, включая старые названия моделей вроде GPT-4/GPT-4o mini, но не являются authoritative описанием текущего runtime. При конфликте ориентируйся на README + `core/model_policy.py` + текущий код + CI contracts.
 
 ## ⚠️ Known bounded limitations
 
@@ -248,4 +294,5 @@ Green core CI означает только прохождение этих ко
 - upload-job status хранится process-local и исчезает после restart;
 - post-processing после `Graphiti.add_episode()` не является одной Neo4j transaction с внутренней Graphiti ingestion;
 - concurrent exact-duplicate race между pre-check и завершением Graphiti write полностью не устранён;
+- first-class provider path в этом репозитории пока OpenAI-only;
 - LLM/Neo4j integration tier требует внешние сервисы и не входит в always-on core CI.
