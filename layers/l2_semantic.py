@@ -17,14 +17,12 @@ async def trigger_community_build(graphiti):
         raise
 
 
-async def get_l2_semantic_context(graphiti, entity_name: str) -> str | None:
-    """Retrieve Graphiti community summaries for a matching entity."""
+async def get_l2_semantic_context_with_sources(graphiti, entity_name: str) -> tuple[str | None, list[str]]:
+    """Retrieve L2 community context together with exact source community UUIDs."""
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
-        return "Graphiti driver not found for L2 context."
+        return "Graphiti driver not found for L2 context.", []
 
-    # Graphiti 0.29.x models community membership as
-    # (:Community)-[:HAS_MEMBER]->(:Entity).
     query = """
     MATCH (e:Entity)
     WHERE toLower(e.name) CONTAINS toLower($name)
@@ -49,13 +47,17 @@ async def get_l2_semantic_context(graphiti, entity_name: str) -> str | None:
                 records = await res.list()
     except Exception as exc:
         logger.warning("L2 community query failed: %s", exc)
-        return "L2 Context: community structure unavailable; run build_communities and retry."
+        return "L2 Context: community structure unavailable; run build_communities and retry.", []
 
     if not records:
-        return None
+        return None, []
 
     lines = [f"🧠 L2 Semantic Context (Communities) for '{entity_name}':", ""]
+    source_ids: list[str] = []
     for rec in records:
+        c_uuid = rec["uuid"]
+        if c_uuid:
+            source_ids.append(str(c_uuid))
         c_name = rec["name"] or "Unnamed Community"
         c_sum = rec["summary"] or "No summary available."
         c_level = rec.get("level") if hasattr(rec, "get") else rec["level"]
@@ -65,7 +67,13 @@ async def get_l2_semantic_context(graphiti, entity_name: str) -> str | None:
         lines.append(c_sum)
         lines.append("")
 
-    return "\n".join(lines).rstrip()
+    return "\n".join(lines).rstrip(), source_ids
+
+
+async def get_l2_semantic_context(graphiti, entity_name: str) -> str | None:
+    """Backward-compatible context-only wrapper."""
+    context, _ = await get_l2_semantic_context_with_sources(graphiti, entity_name)
+    return context
 
 
 async def test_l2():
