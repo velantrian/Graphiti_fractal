@@ -24,6 +24,7 @@ from core.graphiti_client import get_write_semaphore
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
+from core.provenance import build_provenance_record
 from core.rate_limit_retry import with_rate_limit_retry
 from core.task_registry import spawn
 from core.text_utils import is_correction_text
@@ -268,6 +269,13 @@ class SimpleChatAgent:
 
         source_uuids = [str(turn["uuid"]) for turn in turns]
         start_turn_index = int(turns[0]["turn_index"])
+        provenance = build_provenance_record(
+            kind="chat_summary",
+            source_ids=source_uuids,
+            activity="chat_summary_synthesis",
+            agent="fractal:summary",
+            payload=summary_text,
+        )
         await attach_author(summary_uuid, self.memory.user_id)
         await update_episode_metadata(
             graphiti,
@@ -277,6 +285,11 @@ class SimpleChatAgent:
                 "episode_kind": "chat_summary",
                 "covers_turns": f"{start_turn_index}-{end_turn_index}",
                 "summarized_turns": source_uuids,
+                "provenance_id": provenance["provenance_id"],
+                "provenance_activity": provenance["activity"],
+                "provenance_agent": provenance["agent"],
+                "payload_sha256": provenance["payload_sha256"],
+                "authoritative_fact": False,
             },
         )
         updated = await mark_turns_summarized(
@@ -297,6 +310,7 @@ class SimpleChatAgent:
                 "summary_uuid": summary_uuid,
                 "conversation_id": conversation_id,
                 "covers_turns": f"{start_turn_index}-{end_turn_index}",
+                "provenance_id": provenance["provenance_id"],
                 "user_id": self.memory.user_id,
             },
         )
