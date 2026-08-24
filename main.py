@@ -1,25 +1,8 @@
 import argparse
 import asyncio
 from datetime import datetime, timezone
-import sys
-from pathlib import Path
 
-# Apply library patches before importing core logic
-sys.path.append(str(Path(__file__).parent / "scripts"))
-try:
-    from apply_patches import apply_patches
-    apply_patches()
-except ImportError:
-    pass
-
-from core import (
-    DecisionEntity,
-    ProjectEntity,
-    TeamEntity,
-    TechnicalConceptEntity,
-    L3Summary, # Добавлено
-    get_graphiti_client,
-)
+from core import get_graphiti_client
 from core.graphiti_client import get_write_semaphore
 from queries.context_builder import build_agent_context
 from queries.quality_check import check_graph_quality
@@ -30,14 +13,13 @@ from layers.l3_fractal import get_l3_fractal_context
 from visualization.visualization_export import export_to_file
 from benchmarks.benchmark import run_benchmark
 from core.migrations import apply_migrations
-from scripts.consolidate import run_consolidate as cmd_consolidate # Импортируем скрипт консолидации
+from scripts.consolidate import consolidate_l3_memory
 from queries.dedupe_entities import main as dedupe_entities_main
 
 
 async def ensure_graphiti():
     client = get_graphiti_client()
-    graphiti = await client.ensure_ready()
-    return graphiti
+    return await client.ensure_ready()
 
 
 async def cmd_setup(args):
@@ -45,7 +27,10 @@ async def cmd_setup(args):
     mig = await apply_migrations(graphiti)
     print("✅ Graphiti/Neo4j готов, индексы созданы")
     if mig["total"] > 0:
-        print(f"✅ Migrations: applied={mig['applied']} skipped={mig['skipped']} total={mig['total']}")
+        print(
+            f"✅ Migrations: applied={mig['applied']} "
+            f"skipped={mig['skipped']} total={mig['total']}"
+        )
 
 
 async def cmd_seed(args):
@@ -79,7 +64,7 @@ async def cmd_seed(args):
             body="""
             Decision made on 2025-12-10:
 
-            "We decided to simplify the Fractal Memory implementation by starting with 
+            "We decided to simplify the Fractal Memory implementation by starting with
             vanilla Graphiti instead of building custom Redis buffer layer."
 
             Made by: Natasha
@@ -115,8 +100,8 @@ async def cmd_seed(args):
             )
         print(f"✅ Added episode: {ep['name']}")
 
-    # Link user to person entity
     from knowledge.ingest import link_user_to_person_entity
+
     await link_user_to_person_entity(graphiti, "sergey", "Sergey")
 
     if args.with_search:
@@ -127,7 +112,6 @@ async def cmd_seed(args):
 
 async def cmd_clear(args):
     graphiti = await ensure_graphiti()
-    # Полная очистка графа
     await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
     await graphiti.build_indices_and_constraints()
     await apply_migrations(graphiti)
@@ -137,7 +121,10 @@ async def cmd_clear(args):
 async def cmd_migrate(args):
     graphiti = await ensure_graphiti()
     mig = await apply_migrations(graphiti)
-    print(f"✅ Migrations: applied={mig['applied']} skipped={mig['skipped']} total={mig['total']}")
+    print(
+        f"✅ Migrations: applied={mig['applied']} "
+        f"skipped={mig['skipped']} total={mig['total']}"
+    )
 
 
 async def cmd_quality(args):
@@ -155,10 +142,7 @@ async def cmd_context(args):
         entity_name=args.entity,
         context_size=args.size,
     )
-    if context:
-        print(context)
-    else:
-        print("⚠️  Сущность не найдена")
+    print(context if context else "⚠️  Сущность не найдена")
 
 
 async def cmd_l1(args):
@@ -174,19 +158,13 @@ async def cmd_l1(args):
 async def cmd_l2(args):
     graphiti = await ensure_graphiti()
     summary = await get_l2_semantic_context(graphiti, args.entity)
-    if summary:
-        print(summary)
-    else:
-        print("⚠️  Сущность не найдена")
+    print(summary if summary else "⚠️  Сущность не найдена")
 
 
 async def cmd_l3(args):
     graphiti = await ensure_graphiti()
     summary = await get_l3_fractal_context(graphiti, args.entity)
-    if summary:
-        print(summary)
-    else:
-        print("⚠️  Сущность не найдена")
+    print(summary if summary else "⚠️  Сущность не найдена")
 
 
 async def cmd_viz_export(args):
@@ -198,30 +176,55 @@ async def cmd_benchmark(args):
     await run_benchmark()
 
 
+async def cmd_consolidate(args):
+    graphiti = await ensure_graphiti()
+    await consolidate_l3_memory(graphiti, hours_back=args.hours)
+
+
+async def cmd_dedupe_entities(args):
+    await dedupe_entities_main(dry_run=args.dry_run)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Fractal Memory / Graphiti CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("setup", help="Создать индексы/констрейнты Graphiti").set_defaults(
-        func=cmd_setup
-    )
+    subparsers.add_parser(
+        "setup", help="Создать индексы/констрейнты Graphiti"
+    ).set_defaults(func=cmd_setup)
 
     seed_p = subparsers.add_parser("seed", help="Создать демо-эпизоды и сущности")
-    seed_p.add_argument("--with-search", action="store_true", help="Запустить поисковую демонстрацию после загрузки")
+    seed_p.add_argument(
+        "--with-search",
+        action="store_true",
+        help="Запустить поисковую демонстрацию после загрузки",
+    )
     seed_p.set_defaults(func=cmd_seed)
 
-    subparsers.add_parser("quality", help="Отчёт по качеству графа").set_defaults(func=cmd_quality)
-    subparsers.add_parser("clear", help="Очистить граф (reset) и пересоздать индексы").set_defaults(func=cmd_clear)
-    subparsers.add_parser("migrate", help="Применить миграции из папки migrations/").set_defaults(func=cmd_migrate)
-    subparsers.add_parser("search-demo", help="Демонстрация стратегий поиска").set_defaults(func=cmd_search_demo)
+    subparsers.add_parser("quality", help="Отчёт по качеству графа").set_defaults(
+        func=cmd_quality
+    )
+    subparsers.add_parser(
+        "clear", help="Очистить граф (reset) и пересоздать индексы"
+    ).set_defaults(func=cmd_clear)
+    subparsers.add_parser(
+        "migrate", help="Применить миграции из папки migrations/"
+    ).set_defaults(func=cmd_migrate)
+    subparsers.add_parser(
+        "search-demo", help="Демонстрация стратегий поиска"
+    ).set_defaults(func=cmd_search_demo)
 
     ctx_p = subparsers.add_parser("context", help="Построить контекст для сущности")
     ctx_p.add_argument("entity", help="Имя сущности")
-    ctx_p.add_argument("--size", choices=["minimal", "medium", "full"], default="full")
+    ctx_p.add_argument(
+        "--size", choices=["minimal", "medium", "full"], default="full"
+    )
     ctx_p.set_defaults(func=cmd_context)
 
     l1_p = subparsers.add_parser("l1", help="L1 recent context summary")
-    l1_p.add_argument("--query", default="Fractal Memory", help="Поисковая фраза для недавних эпизодов")
+    l1_p.add_argument(
+        "--query", default="Fractal Memory", help="Поисковая фраза для недавних эпизодов"
+    )
     l1_p.add_argument("--hours", type=int, default=24, help="Часов назад для выборки")
     l1_p.set_defaults(func=cmd_l1)
 
@@ -241,18 +244,25 @@ def build_parser():
     )
     viz_p.set_defaults(func=cmd_viz_export)
 
-    subparsers.add_parser("benchmark", help="Перфоманс add_episode/search").set_defaults(func=cmd_benchmark)
-    
-    # Добавляем команду для консолидации L3
-    consolidate_p = subparsers.add_parser("consolidate", help="Запустить консолидацию L3 памяти")
-    consolidate_p.add_argument("--hours", type=int, default=24*7, help="Количество часов для консолидации")
-    consolidate_p.set_defaults(func=lambda args: cmd_consolidate(ensure_graphiti(), hours_back=args.hours))
+    subparsers.add_parser(
+        "benchmark", help="Перфоманс add_episode/search"
+    ).set_defaults(func=cmd_benchmark)
 
-    # Добавляем команду для дедупликации Entity узлов
-    dedupe_p = subparsers.add_parser("dedupe-entities", help="Дедуплицировать Entity узлы по имени")
-    dedupe_p.add_argument("--dry-run", action="store_true", help="Анализ без применения изменений")
-    dedupe_p.set_defaults(func=lambda args: dedupe_entities_main(dry_run=args.dry_run))
+    consolidate_p = subparsers.add_parser(
+        "consolidate", help="Запустить консолидацию L3 памяти"
+    )
+    consolidate_p.add_argument(
+        "--hours", type=int, default=24 * 7, help="Количество часов для консолидации"
+    )
+    consolidate_p.set_defaults(func=cmd_consolidate)
 
+    dedupe_p = subparsers.add_parser(
+        "dedupe-entities", help="Дедуплицировать Entity узлы по имени"
+    )
+    dedupe_p.add_argument(
+        "--dry-run", action="store_true", help="Анализ без применения изменений"
+    )
+    dedupe_p.set_defaults(func=cmd_dedupe_entities)
 
     return parser
 
@@ -265,4 +275,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
