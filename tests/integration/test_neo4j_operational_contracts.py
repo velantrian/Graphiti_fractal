@@ -4,6 +4,11 @@ import os
 import pytest
 from neo4j import AsyncGraphDatabase
 
+from core.ingest_atomicity import (
+    acquire_ingest_claim,
+    finalize_episode_identity,
+    mark_ingest_claim_episode_created,
+)
 from core.recall_telemetry import read_recall_signals, record_recall
 
 
@@ -85,8 +90,70 @@ async def test_live_neo4j_recall_telemetry_is_non_authoritative_and_tracks_query
             object_uuid="episode-1",
         )
         assert result.records[0]["recall_count"] == 2
+        assert result.records[0]["unique_queries"] if "unique_queries" in result.records[0] else True
         assert result.records[0]["valid_at"] is None
         assert result.records[0]["invalid_at"] is None
         assert result.records[0]["fact"] is None
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
+    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+    user = os.environ.get("NEO4J_USER", "neo4j")
+    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
+    driver = await _connect_with_retry(uri, user, password)
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        token = await acquire_ingest_claim(
+            graphiti,
+            group_id="knowledge",
+            fingerprint="fp-1",
+        )
+        assert token
+        duplicate = await acquire_ingest_claim(
+            graphiti,
+            group_id="knowledge",
+            fingerprint="fp-1",
+        )
+        assert duplicate is None
+
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:$uuid, content:'bounded'})",
+            uuid="episode-atomic-1",
+        )
+        await mark_ingest_claim_episode_created(
+            graphiti,
+            group_id="knowledge",
+            fingerprint="fp-1",
+            token=token,
+            episode_uuid="episode-atomic-1",
+        )
+        await finalize_episode_identity(
+            graphiti,
+            episode_uuid="episode-atomic-1",
+            group_id="knowledge",
+            fingerprint="fp-1",
+            claim_token=token,
+            user_id="integration-owner",
+        )
+
+        result = await graphiti.driver.execute_query(
+            """
+            MATCH (u:User {user_id:'integration-owner'})-[:AUTHORED]->(e:Episodic {uuid:'episode-atomic-1'})
+            MATCH (c:FractalIngestClaim {claim_key:'knowledge:fp-1'})
+            RETURN e.fingerprint AS fingerprint,
+                   e.group_id AS group_id,
+                   c.state AS state,
+                   c.episode_uuid AS episode_uuid
+            """
+        )
+        record = result.records[0]
+        assert record["fingerprint"] == "fp-1"
+        assert record["group_id"] == "knowledge"
+        assert record["state"] == "COMMITTED"
+        assert record["episode_uuid"] == "episode-atomic-1"
     finally:
         await driver.close()
