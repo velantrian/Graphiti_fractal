@@ -1,223 +1,261 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone
 from time import perf_counter
 
-from fastapi import HTTPException
-
 from core.config import get_config
-from core.text_utils import normalize_text, fingerprint, split_into_paragraphs
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
+from core.text_utils import fingerprint, split_into_semantic_chunks
 
 logger = logging.getLogger(__name__)
 
+MEMORY_TYPES = {"personal", "project", "knowledge", "experience"}
 
-async def episode_exists(graphiti, fp: str, content: str) -> bool:
-    # 1. Exact match fallback
-    driver = graphiti.driver
-    res = await driver.execute_query(
+
+async def _resolve_episode_uuid(
+    graphiti,
+    *,
+    episode_uuid: str | None = None,
+    content: str | None = None,
+    group_id: str | None = None,
+) -> str:
+    """Resolve one episode exactly or fail closed on ambiguity."""
+    if episode_uuid:
+        return episode_uuid
+    if not content:
+        raise ValueError("episode_uuid or content is required")
+
+    query = """
+    MATCH (e:Episodic)
+    WHERE e.content = $content
+      AND ($group_id IS NULL OR e.group_id = $group_id)
+      AND coalesce(e.deleted, false) = false
+    RETURN e.uuid AS uuid
+    LIMIT 2
+    """
+    result = await graphiti.driver.execute_query(
+        query,
+        content=content,
+        group_id=group_id,
+    )
+    uuids = [record["uuid"] for record in result.records if record["uuid"]]
+    if not uuids:
+        raise LookupError("episode not found")
+    if len(uuids) != 1:
+        raise RuntimeError(
+            "episode content lookup is ambiguous; supply episode_uuid instead of mutating by content"
+        )
+    return str(uuids[0])
+
+
+async def episode_exists(
+    graphiti,
+    fp: str,
+    content: str,
+    group_id: str | None = None,
+) -> bool:
+    """Check exact duplicate identity, scoped to group_id when supplied."""
+    result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic)
-        WHERE e.fingerprint = $fp OR e.content = $content
+        WHERE coalesce(e.deleted, false) = false
+          AND ($group_id IS NULL OR e.group_id = $group_id)
+          AND (e.fingerprint = $fp OR e.content = $content)
         RETURN e.uuid AS uuid
         LIMIT 1
         """,
         fp=fp,
         content=content,
+        group_id=group_id,
     )
-    if len(res.records) > 0:
-        return True
-    return False
+    return bool(result.records)
 
 
-async def find_similar_episode(graphiti, vector: list[float], threshold: float = 0.95) -> str | None:
-    """
-    Search for semantically similar episode.
-    Returns UUID if found, None otherwise.
-    """
+async def find_similar_episode(
+    graphiti,
+    vector: list[float],
+    threshold: float = 0.95,
+    group_id: str | None = None,
+) -> str | None:
+    """Return one semantically similar episode UUID inside the requested namespace."""
     if not vector:
         return None
-        
-    driver = graphiti.driver
     try:
-        # Check if index exists first to avoid error during init
-        # But usually we just try query. If index missing, it might fail.
-        # We rely on migration 002.
-        res = await driver.execute_query(
+        result = await graphiti.driver.execute_query(
             """
-            CALL db.index.vector.queryNodes('fractal_episodic_vector', 1, $vec)
+            CALL db.index.vector.queryNodes('fractal_episodic_vector', 5, $vector)
             YIELD node, score
             WHERE score >= $threshold
+              AND coalesce(node.deleted, false) = false
+              AND ($group_id IS NULL OR node.group_id = $group_id)
             RETURN node.uuid AS uuid, score
+            ORDER BY score DESC
+            LIMIT 1
             """,
-            vec=vector,
-            threshold=threshold
+            vector=vector,
+            threshold=threshold,
+            group_id=group_id,
         )
-        if res.records:
-            rec = res.records[0]
-            # print(f"DEBUG: Found similar episode {rec['uuid']} score={rec['score']}")
-            return rec["uuid"]
-    except Exception as e:
-        # Index might not exist yet or vector dimension mismatch
-        pass
-    return None
+    except Exception as exc:  # index may be absent in minimal deployments
+        logger.debug("Vector duplicate lookup unavailable: %s", type(exc).__name__)
+        return None
+    return str(result.records[0]["uuid"]) if result.records else None
 
 
-async def update_last_seen(graphiti, uuid: str, group_id: str):
-    driver = graphiti.driver
-    await driver.execute_query(
+async def update_last_seen(graphiti, uuid: str, group_id: str) -> None:
+    await graphiti.driver.execute_query(
         """
-        MATCH (e:Episodic {uuid: $uuid})
-        SET e.last_seen_at = $ts, e.group_id = $gid
+        MATCH (e:Episodic {uuid:$uuid})
+        SET e.last_seen_at=$timestamp, e.group_id=$group_id
         """,
         uuid=uuid,
-        ts=datetime.now(timezone.utc).isoformat(),
-        gid=group_id
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        group_id=group_id,
     )
 
 
-async def set_fingerprint(graphiti, fp: str, content: str):
-    driver = graphiti.driver
-    await driver.execute_query(
-        """
-        MATCH (e:Episodic)
-        WHERE e.content = $content AND (e.fingerprint IS NULL)
-        SET e.fingerprint = $fp
-        """,
+async def set_fingerprint(
+    graphiti,
+    fp: str,
+    content: str | None = None,
+    *,
+    episode_uuid: str | None = None,
+    group_id: str | None = None,
+) -> None:
+    uuid = await _resolve_episode_uuid(
+        graphiti,
+        episode_uuid=episode_uuid,
         content=content,
-        fp=fp,
+        group_id=group_id,
+    )
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic {uuid:$uuid}) SET e.fingerprint=$fingerprint",
+        uuid=uuid,
+        fingerprint=fp,
     )
 
 
-async def set_embedding(graphiti, content: str, vector: list[float]):
+async def set_embedding(
+    graphiti,
+    content: str | None,
+    vector: list[float],
+    *,
+    episode_uuid: str | None = None,
+    group_id: str | None = None,
+) -> None:
     if not vector:
-        return
-    driver = graphiti.driver
-    await driver.execute_query(
-        """
-        MATCH (e:Episodic)
-        WHERE e.content = $content
-        SET e.embedding = $vec
-        """,
+        raise ValueError("refusing to persist an empty embedding")
+    uuid = await _resolve_episode_uuid(
+        graphiti,
+        episode_uuid=episode_uuid,
         content=content,
-        vec=vector,
+        group_id=group_id,
+    )
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic {uuid:$uuid}) SET e.embedding=$vector",
+        uuid=uuid,
+        vector=vector,
     )
 
 
-async def set_group_id(graphiti, content: str, group_id: str):
-    driver = graphiti.driver
-    await driver.execute_query(
-        """
-        MATCH (e:Episodic)
-        WHERE e.content = $content
-        SET e.group_id = $gid
-        """,
+async def set_group_id(
+    graphiti,
+    content: str | None,
+    group_id: str,
+    *,
+    episode_uuid: str | None = None,
+) -> None:
+    uuid = await _resolve_episode_uuid(
+        graphiti,
+        episode_uuid=episode_uuid,
         content=content,
-        gid=group_id,
+        group_id=None,
+    )
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic {uuid:$uuid}) SET e.group_id=$group_id",
+        uuid=uuid,
+        group_id=group_id,
     )
 
 
-async def link_user(graphiti, fp: str, user_id: str):
-    driver = graphiti.driver
-    await driver.execute_query(
+async def link_user(
+    graphiti,
+    fp: str,
+    user_id: str,
+    *,
+    group_id: str | None = None,
+) -> None:
+    result = await graphiti.driver.execute_query(
         """
-        MERGE (u:User {user_id:$uid})
-        WITH u
-        MATCH (e:Episodic {fingerprint:$fp})
-        MERGE (u)-[:AUTHORED]->(e)
+        MATCH (e:Episodic {fingerprint:$fingerprint})
+        WHERE ($group_id IS NULL OR e.group_id=$group_id)
+          AND coalesce(e.deleted, false)=false
+        RETURN e.uuid AS uuid
+        LIMIT 2
         """,
-        uid=user_id,
-        fp=fp,
+        fingerprint=fp,
+        group_id=group_id,
     )
+    uuids = [record["uuid"] for record in result.records]
+    if len(uuids) != 1:
+        raise RuntimeError("fingerprint does not resolve to exactly one episode")
+
+    from core.authorship import attach_author
+
+    await attach_author(str(uuids[0]), user_id)
 
 
 def _infer_memory_type(text: str, source_description: str = "") -> str:
-    """
-    Автоматически определяет тип памяти на основе анализа текста и источника.
-
-    Returns:
-        "personal" | "project" | "experience" | "knowledge"
-    """
+    """Heuristic routing only; an explicit memory_type always wins."""
     text_lower = text.lower()
     source_lower = source_description.lower()
 
-    # Личные данные (о людях, отношениях, характеристиках)
-    personal_keywords = [
-        "я ", "мне ", "мой ", "моя ", "мои ", "меня ", "мной ",
-        "человек", "личность", "характер", "отношения", "друзья",
-        "семья", "родители", "дети", "любим", "интерес",
-        "воспитание", "привычки", "здоровье", "эмоции"
-    ]
-
-    # Данные о проектах (технические, рабочие)
-    project_keywords = [
-        "проект", "задача", "разработка", "код", "программа",
-        "алгоритм", "система", "архитектура", "дизайн",
-        "тестирование", "деплой", "продакшн", "баги", "фичи",
-        "коммит", "репозиторий", "билд", "конфиг", "документация"
-    ]
-
-    # Опыт работы (ошибки, успехи, паттерны)
-    experience_keywords = [
-        "ошибка", "проблема", "решение", "успех", "паттерн",
-        "урок", "опыт", "практика", "метод", "подход",
-        "техника", "стратегия", "результат", "итог"
-    ]
-
-    # Проверяем по источнику
     if "personal" in source_lower or "личн" in source_lower:
-        logger.debug(f"Inferred 'personal' from source: {source_description}")
         return "personal"
-    elif "project" in source_lower or "проект" in source_lower:
-        logger.debug(f"Inferred 'project' from source: {source_description}")
+    if "project" in source_lower or "проект" in source_lower:
         return "project"
-    elif "experience" in source_lower or "опыт" in source_lower:
-        logger.debug(f"Inferred 'experience' from source: {source_description}")
+    if "experience" in source_lower or "опыт" in source_lower:
         return "experience"
 
-    # Анализируем текст по ключевым словам
-    personal_score = sum(1 for keyword in personal_keywords if keyword in text_lower)
-    project_score = sum(1 for keyword in project_keywords if keyword in text_lower)
-    experience_score = sum(1 for keyword in experience_keywords if keyword in text_lower)
-
-    # Определяем тип по максимальному счету
-    max_score = max(personal_score, project_score, experience_score)
-
-    if max_score == 0:
-        inferred = "knowledge"  # Общие знания по умолчанию
-    elif personal_score == max_score:
-        inferred = "personal"
-    elif project_score == max_score:
-        inferred = "project"
-    else:
-        inferred = "experience"
-
-    logger.debug(
-        f"Inferred '{inferred}' from text analysis "
-        f"(scores: p={personal_score}, r={project_score}, e={experience_score})"
+    personal_keywords = (
+        "я ", "мне ", "мой ", "моя ", "мои ", "меня ", "семья", "привычки",
+        "отношения", "эмоции",
     )
-    return inferred
+    project_keywords = (
+        "проект", "задача", "разработка", "код", "архитектура", "репозиторий",
+        "коммит", "деплой", "документация",
+    )
+    experience_keywords = (
+        "ошибка", "проблема", "решение", "успех", "паттерн", "урок", "опыт",
+        "результат", "итог",
+    )
 
-
-def _get_group_id(memory_type: str) -> str:
-    """Возвращает group_id по типу памяти."""
-    config = get_config()
-    if memory_type == "personal":
-        return config.memory.personal_group_id
-    elif memory_type == "project":
-        return config.memory.project_group_id
-    elif memory_type == "experience":
-        return config.memory.experience_group_id
-    else:
-        return config.memory.knowledge_group_id
+    scores = {
+        "personal": sum(keyword in text_lower for keyword in personal_keywords),
+        "project": sum(keyword in text_lower for keyword in project_keywords),
+        "experience": sum(keyword in text_lower for keyword in experience_keywords),
+    }
+    best_type = max(scores, key=scores.get)
+    return best_type if scores[best_type] > 0 else "knowledge"
 
 
 def resolve_group_id(memory_type: str) -> str:
-    """Возвращает group_id по типу памяти (для API)."""
-    return _get_group_id(memory_type)
+    if memory_type not in MEMORY_TYPES:
+        raise ValueError(f"invalid memory_type: {memory_type!r}")
+    config = get_config()
+    return {
+        "personal": config.memory.personal_group_id,
+        "project": config.memory.project_group_id,
+        "knowledge": config.memory.knowledge_group_id,
+        "experience": config.memory.experience_group_id,
+    }[memory_type]
+
+
+def _get_group_id(memory_type: str) -> str:
+    """Backward-compatible alias for resolve_group_id."""
+    return resolve_group_id(memory_type)
 
 
 async def remember_text(
@@ -228,31 +266,17 @@ async def remember_text(
     user_id: str | None = None,
     memory_type: str | None = None,
 ) -> dict:
-    txt = text.strip()
-    if not txt:
+    cleaned = text.strip()
+    if not cleaned:
         raise ValueError("text is empty")
-
-    # Определяем тип памяти: явный имеет приоритет над автоматическим
-    if memory_type is None:
-        memory_type = _infer_memory_type(txt, source_description)
-        routing_mode = "auto"
-    else:
-        routing_mode = "explicit"
-
-    group_id = resolve_group_id(memory_type)
-
-    # Логируем решение маршрутизации
-    logger.info(f"[memory] Routed text (mode={routing_mode}) to group '{memory_type}' (group_id: {group_id})")
-
-    # Используем единую функцию ingest
+    routed_type = memory_type or _infer_memory_type(cleaned, source_description)
     return await ingest_text_document(
         graphiti,
-        txt,
+        cleaned,
         source_description=source_description,
         user_id=user_id,
-        group_id=group_id,
+        group_id=resolve_group_id(routed_type),
     )
-
 
 
 async def ingest_text_document(
@@ -264,148 +288,187 @@ async def ingest_text_document(
     job_id: str | None = None,
     group_id: str | None = None,
 ) -> dict:
+    """Canonical Graphiti-native text ingestion path.
+
+    Documents are split into bounded semantic chunks. Each chunk is written once
+    through Graphiti, then post-processing is addressed strictly by the returned
+    episode UUID. Exact duplicate checks are scoped to the target group_id.
     """
-    Единая точка входа для загрузки текста (и из /remember, и из /upload).
-    Никакого локального чанкинга, один episode_body = весь текст.
-    """
-    # Import job functions from api.jobs (no circular import)
     from api.jobs import update_upload_job
-    
-    config = get_config()
-    start = perf_counter()
-
-    # 1) Базовый профиль/обновление job
-    # Use robust chunking to handle large documents properly
-    from core.text_utils import split_into_semantic_chunks
-    chunks = split_into_semantic_chunks(text, max_chunk_size=1500, min_chunk_size=200)
-    total_chunks = len(chunks)
-    logger.info(f"[INGEST] Splitting text into {total_chunks} chunks (total len={len(text)})")
-
-    on_rate_limit_cb = None
-    warnings = []
-    
-    if job_id:
-        update_upload_job(job_id,
-                          stage="ingest",
-                          total_chunks=total_chunks,
-                          processed_chunks=0)
-        
-        def _on_rate_limit(sleep_s: float, attempt: int):
-            update_upload_job(
-                job_id, 
-                stage="rate_limited", 
-                message=f"Rate limited. Retrying in {sleep_s:.1f}s (Attempt {attempt})",
-                retry_in_seconds=sleep_s,
-                attempt=attempt
-            )
-        on_rate_limit_cb = _on_rate_limit
-
-    # 2) Вызов Graphiti по чанкам (Iterative add_episode)
-    ref_time = datetime.now(timezone.utc)
-    write_semaphore = get_write_semaphore()
-    
-    added_count = 0
-    errors = []
-    
+    from core.authorship import attach_author
     from core.rate_limit_retry import with_rate_limit_retry
-    from pydantic import ValidationError
     from core.safe_graphiti import filter_graphiti_results
-    
-    for i, chunk in enumerate(chunks, 1):
-        # Update chunk description to include part number if multiple chunks
-        chunk_source = f"{source_description} (part {i}/{total_chunks})" if total_chunks > 1 else source_description
-        
-        async with write_semaphore:
-            try:
-                episode_result = await with_rate_limit_retry(
-                    lambda: graphiti.add_episode(
+
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("text is empty")
+    if not group_id:
+        group_id = get_config().memory.knowledge_group_id
+
+    chunks = split_into_semantic_chunks(cleaned, max_chunk_size=1500, min_chunk_size=200)
+    if not chunks:
+        raise ValueError("text produced no ingestible chunks")
+
+    started = perf_counter()
+    total_chunks = len(chunks)
+    warnings: list[str] = []
+    errors: list[str] = []
+    added_count = 0
+    skipped_count = 0
+    reference_time = datetime.now(timezone.utc)
+    semaphore = get_write_semaphore()
+
+    if job_id:
+        update_upload_job(
+            job_id,
+            stage="ingest",
+            total_chunks=total_chunks,
+            processed_chunks=0,
+        )
+
+    def on_rate_limit(sleep_seconds: float, attempt: int) -> None:
+        if job_id:
+            update_upload_job(
+                job_id,
+                stage="rate_limited",
+                message=f"Rate limited; retry in {sleep_seconds:.1f}s",
+                retry_in_seconds=sleep_seconds,
+                attempt=attempt,
+            )
+
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_fp = fingerprint(chunk)
+        chunk_source = (
+            f"{source_description} (part {index}/{total_chunks})"
+            if total_chunks > 1
+            else source_description
+        )
+
+        try:
+            if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id):
+                skipped_count += 1
+                if job_id:
+                    update_upload_job(job_id, processed_chunks=index, stage="ingest")
+                continue
+
+            async def write_episode():
+                async with semaphore:
+                    return await graphiti.add_episode(
                         name=chunk_source[:100],
                         episode_body=chunk,
-                        source_description=source_description, # Keep original source grouping
-                        reference_time=ref_time,
-                        group_id=group_id,  # Передаем group_id сразу в Graphiti
-                    ),
-                    op_name=f"add_episode:upload:{i}",
-                    on_rate_limit=on_rate_limit_cb
+                        source_description=source_description,
+                        reference_time=reference_time,
+                        group_id=group_id,
+                    )
+
+            episode_result = await with_rate_limit_retry(
+                write_episode,
+                op_name=f"add_episode:upload:{index}",
+                on_rate_limit=on_rate_limit,
+            )
+            safety = filter_graphiti_results(episode_result)
+            if safety["dropped_entities"] or safety["dropped_edges"]:
+                warnings.append(
+                    f"Chunk {index}: dropped {safety['dropped_entities']} entities "
+                    f"and {safety['dropped_edges']} edges"
                 )
-                
-                # Filter results for safety
-                safe_results = filter_graphiti_results(episode_result)
-                
-                if safe_results["dropped_entities"] > 0 or safe_results["dropped_edges"] > 0:
-                    warn_msg = f"Chunk {i}: Dropped {safe_results['dropped_entities']} entities and {safe_results['dropped_edges']} edges"
-                    warnings.append(warn_msg)
 
-                actual_episode = episode_result.episode if hasattr(episode_result, 'episode') else episode_result
-                
-                # Post-processing for this chunk
-                if actual_episode and getattr(actual_episode, 'uuid', None):
-                    ep_uuid = actual_episode.uuid
-                    added_count += 1
-                    
-                    # Embedding enforcement (optional but good for retrieval)
-                    try:
-                        max_embed_chars = config.app.max_embedding_chars
-                        embed_text = chunk[:max_embed_chars]
-                        vec = await get_embedding(embed_text)
-                        if vec:
-                            await set_embedding(graphiti, chunk, vec)
-                    except Exception as e:
-                        logger.warning(f"Embedding failed for chunk {i}: {e}")
+            episode = getattr(episode_result, "episode", episode_result)
+            episode_uuid = (
+                episode.get("uuid") if isinstance(episode, dict) else getattr(episode, "uuid", None)
+            )
+            if not episode_uuid:
+                raise RuntimeError("Graphiti add_episode returned no episode UUID")
+            episode_uuid = str(episode_uuid)
 
-                    # Author link
-                    if user_id:
-                        from core.authorship import attach_author
-                        await attach_author(ep_uuid, user_id)
-                        
-                    # Group ID enforcement
-                    if group_id:
-                         await set_group_id(graphiti, chunk, group_id)
+            await set_fingerprint(
+                graphiti,
+                chunk_fp,
+                episode_uuid=episode_uuid,
+                group_id=group_id,
+            )
 
-            except ValidationError as ve:
-                logger.error(f"[INGEST] Chunk {i} validation error: {ve}")
-                warnings.append(f"Chunk {i} validation error: {ve}")
-                # Try recovery logic if needed, or just skip
-            except Exception as e:
-                logger.error(f"[INGEST] Chunk {i} failed: {e}", exc_info=True)
-                errors.append(f"Chunk {i}: {str(e)}")
-        
-        # Update job progress after each chunk
+            if user_id:
+                await attach_author(episode_uuid, user_id)
+
+            # Graphiti receives group_id during add_episode. Reassert by UUID only;
+            # never update all episodes sharing the same text.
+            await set_group_id(
+                graphiti,
+                None,
+                group_id,
+                episode_uuid=episode_uuid,
+            )
+
+            try:
+                embedding = await get_embedding(chunk[: get_config().app.max_embedding_chars])
+                if embedding is not None:
+                    await set_embedding(
+                        graphiti,
+                        None,
+                        embedding,
+                        episode_uuid=episode_uuid,
+                        group_id=group_id,
+                    )
+            except Exception as exc:  # embedding is retrieval enhancement, not ingest authority
+                logger.warning(
+                    "Embedding post-processing failed for chunk %d: %s",
+                    index,
+                    type(exc).__name__,
+                )
+                warnings.append(f"Chunk {index}: embedding unavailable")
+
+            added_count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ingest chunk %d/%d failed", index, total_chunks)
+            errors.append(f"Chunk {index}: {type(exc).__name__}: {exc}")
+
         if job_id:
-             update_upload_job(job_id,
-                          stage="ingest",
-                          total_chunks=total_chunks,
-                          processed_chunks=i)
+            update_upload_job(
+                job_id,
+                stage="ingest",
+                total_chunks=total_chunks,
+                processed_chunks=index,
+            )
 
-    # 5) Обновление job и профиля
-    elapsed = perf_counter() - start
-    
-    if errors:
-        final_stage = "done_with_warnings" if added_count > 0 else "error"
-        warnings.extend(errors)
-    elif warnings:
-        final_stage = "done_with_warnings"
+    elapsed = perf_counter() - started
+    if errors and added_count == 0 and skipped_count == 0:
+        status = "error"
+        stage = "error"
+    elif warnings or errors:
+        status = "ok"
+        stage = "done_with_warnings"
     else:
-        final_stage = "done"
+        status = "ok"
+        stage = "done"
 
+    warnings.extend(errors)
     if job_id:
-        update_upload_job(job_id,
-                          stage=final_stage,
-                          total_chunks=total_chunks,
-                          processed_chunks=added_count,
-                          profile={"total_time": elapsed},
-                          warnings=warnings)
+        update_upload_job(
+            job_id,
+            stage=stage,
+            total_chunks=total_chunks,
+            processed_chunks=total_chunks,
+            profile={"total_time": elapsed},
+            warnings=warnings,
+        )
 
     logger.info(
-        f"Document ingested: source='{source_description}' chunks={added_count}/{total_chunks} elapsed={elapsed:.3f}s"
+        "Document ingest complete source=%r group=%s added=%d skipped=%d total=%d elapsed=%.3fs",
+        source_description,
+        group_id,
+        added_count,
+        skipped_count,
+        total_chunks,
+        elapsed,
     )
-
     return {
-        "status": "ok" if final_stage != "error" else "error",
+        "status": status,
         "added": added_count,
+        "skipped": skipped_count,
         "chunks": total_chunks,
         "elapsed": elapsed,
-        "warnings": warnings
+        "warnings": warnings,
     }
 
 
@@ -416,155 +479,63 @@ async def ingest_text_document_simple(
     source_description: str = "uploaded_text",
     user_id: str | None = None,
 ) -> dict:
-    """
-    Резервная простая версия ingest без Graphiti.add_episode.
-    Используется только для отладки при проблемах с Graphiti.
-    """
-    from datetime import datetime, timezone
-    import uuid
-    # Используем нашу новую функцию разбиения
-    from core.text_utils import split_into_paragraphs
-    parts = split_into_paragraphs(text, max_len=1800, overlap=0)
-    logger.info(f"[INGEST-SIMPLE] Split text into {len(parts)} chunks using semantic splitting")
-
-    added = 0
-    ref_time = datetime.now(timezone.utc)
-    uid = user_id or os.getenv("USER_ID", "sergey")
-
-    driver = graphiti.driver
-
-    for idx, part in enumerate(parts, start=1):
-        fp = fingerprint(part)
-        logger.info(f"[INGEST-SIMPLE] Processing chunk {idx}/{len(parts)}, len={len(part)}")
-
-        # Проверяем существование
-        exists_query = """
-        MATCH (e:Episodic)
-        WHERE e.fingerprint = $fp
-        RETURN e.uuid AS uuid
-        LIMIT 1
-        """
-        result = await driver.execute_query(exists_query, params={"fp": fp})
-        if result.records:
-            logger.info(f"[INGEST-SIMPLE] Chunk {idx} already exists, skipping")
-            continue
-
-        try:
-            # Создаем episode напрямую
-            episode_uuid = str(uuid.uuid4())
-            create_query = """
-            CREATE (e:Episodic {
-                uuid: $uuid,
-                name: $name,
-                content: $content,
-                source_description: $source_desc,
-                created_at: $created_at,
-                valid_at: $valid_at,
-                fingerprint: $fp,
-                group_id: $group_id
-            })
-            """
-            params = {
-                "uuid": episode_uuid,
-                "name": f"Upload chunk {idx}",
-                "content": part,
-                "source_desc": source_description,
-                "created_at": ref_time.isoformat(),
-                "valid_at": ref_time.isoformat(),
-                "fp": fp,
-                "group_id": "knowledge"
-            }
-            await driver.execute_query(create_query, params=params)
-
-            # Создаем или связываем пользователя
-            user_query = """
-            MERGE (u:User {user_id: $uid})
-            WITH u
-            MATCH (e:Episodic {uuid: $episode_uuid})
-            MERGE (u)-[:AUTHORED]->(e)
-            """
-            await driver.execute_query(user_query, params={
-                "uid": uid,
-                "episode_uuid": episode_uuid
-            })
-
-            logger.info(f"[INGEST-SIMPLE] Episode added for chunk {idx}")
-            added += 1
-
-        except Exception as e:
-            logger.error(f"[INGEST-SIMPLE] Failed to add episode for chunk {idx}: {type(e).__name__}: {e}")
-            raise
-
-    return {"status": "ok", "added": added, "chunks": len(parts)}
+    """Backward-compatible alias; direct Neo4j episode creation has been removed."""
+    return await ingest_text_document(
+        graphiti,
+        text,
+        source_description=source_description,
+        user_id=user_id,
+        group_id=get_config().memory.knowledge_group_id,
+    )
 
 
 async def update_episode_metadata(graphiti, episode_uuid: str, metadata: dict):
-    """
-    Обновляет метаданные эпизода по UUID.
+    """Update an allow-listed set of episode metadata fields by exact UUID."""
+    allowed_fields = {
+        "conversation_id",
+        "turn_index",
+        "episode_kind",
+        "is_correction",
+        "summarized",
+        "covers_turns",
+        "summarized_turns",
+        "summary_uuid",
+    }
+    unknown = set(metadata) - allowed_fields
+    if unknown:
+        raise ValueError(f"unsupported episode metadata fields: {sorted(unknown)}")
+    if not metadata:
+        return {"status": "unchanged", "episode_uuid": episode_uuid}
 
-    Args:
-        graphiti: Graphiti клиент
-        episode_uuid: UUID эпизода
-        metadata: Словарь полей для обновления
-    """
-    driver = graphiti.driver
-
-    set_clauses = []
-    params = {"uuid": episode_uuid}
-
-    for key, value in metadata.items():
-        set_clauses.append(f"e.{key} = ${key}")
-        params[key] = value
-
-    query = f"""
-    MATCH (e:Episodic {{uuid: $uuid}})
-    SET {', '.join(set_clauses)}
-    RETURN e.uuid AS uuid
-    """
-
-    result = await driver.execute_query(query, **params)
-
-    if result.records:
-        logger.info(f"Updated episode metadata", extra={
-            "episode_uuid": episode_uuid,
-            "metadata_keys": list(metadata.keys())
-        })
-        return {"status": "updated", "episode_uuid": episode_uuid}
-    else:
-        logger.warning(f"Episode not found for metadata update", extra={
-            "episode_uuid": episode_uuid
-        })
-        return {"status": "not_found", "episode_uuid": episode_uuid}
+    params = {"uuid": episode_uuid, **metadata}
+    assignments = ", ".join(f"e.{key} = ${key}" for key in metadata)
+    result = await graphiti.driver.execute_query(
+        f"MATCH (e:Episodic {{uuid:$uuid}}) SET {assignments} RETURN e.uuid AS uuid",
+        **params,
+    )
+    if not result.records:
+        raise LookupError(f"episode not found for metadata update: {episode_uuid}")
+    return {"status": "updated", "episode_uuid": episode_uuid}
 
 
-async def link_user_to_person_entity(graphiti, user_id: str, person_name: str = "Сергей"):
-    """
-    Создаёт связь между User и Entity (человек).
-
-    Args:
-        graphiti: Graphiti клиент
-        user_id: ID пользователя (например, "sergey")
-        person_name: Имя сущности человека (по умолчанию "Сергей")
-    """
-    driver = graphiti.driver
-
-    query = """
-    MATCH (u:User {user_id: $user_id})
-    MATCH (e:Entity {name: $person_name})
-    MERGE (u)-[:IS]->(e)
-    RETURN u.user_id AS user_id, e.name AS entity_name
-    """
-
-    result = await driver.execute_query(query, user_id=user_id, person_name=person_name)
-
-    if result.records:
-        print(f"[USER_LINK] Created link: User '{user_id}' IS Entity '{person_name}'")
-        return {"status": "linked", "user_id": user_id, "entity_name": person_name}
-    else:
-        print(f"[USER_LINK] Could not create link - User or Entity not found")
+async def link_user_to_person_entity(
+    graphiti,
+    user_id: str,
+    person_name: str = "Сергей",
+):
+    """Link the configured User to one matching person Entity."""
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (u:User {user_id:$user_id})
+        MATCH (e:Entity {name:$person_name})
+        WITH u, e
+        LIMIT 1
+        MERGE (u)-[:IS]->(e)
+        RETURN u.user_id AS user_id, e.name AS entity_name
+        """,
+        user_id=user_id,
+        person_name=person_name,
+    )
+    if not result.records:
         return {"status": "not_found", "user_id": user_id, "entity_name": person_name}
-
-
-# ingest_text_document_simple оставлен для отладки/резервного использования
-# Основная функция использует Graphiti.add_episode для полноценной обработки
-
+    return {"status": "linked", "user_id": user_id, "entity_name": person_name}
