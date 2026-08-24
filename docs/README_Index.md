@@ -4,7 +4,7 @@
 >
 > Этот индекс сохраняет исходный путь разработки Fractal Memory и старые Day-by-Day документы как историю эволюции проекта. Он **не является инструкцией для текущего runtime**.
 >
-> Для current state используй root `README.md`; для ролей/истории AI — `AI_MODEL_EVOLUTION.md`; для storage/retrieval/graph/cache evolution — `TECHNOLOGY_EVOLUTION.md`; для OpenClaw-derived memory lifecycle patterns — `OPENCLAW_ADOPTED_PATTERNS.md`.
+> Для current state используй root `README.md`; для ролей/истории AI — `AI_MODEL_EVOLUTION.md`; для storage/retrieval/graph/cache evolution — `TECHNOLOGY_EVOLUTION.md`; для causal/provenance/GDS и backend alternatives — `DERIVED_GRAPH_AND_BACKENDS.md`; для OpenClaw-derived memory lifecycle patterns — `OPENCLAW_ADOPTED_PATTERNS.md`.
 
 ## 🕰️ Зачем оставлены старые документы
 
@@ -20,9 +20,11 @@
 | Текущая AI model policy | `../core/model_policy.py` |
 | Роли + история AI/MoE/cache | `AI_MODEL_EVOLUTION.md` |
 | Storage/graph/retrieval/cache technology map | `TECHNOLOGY_EVOLUTION.md` |
+| Causal/provenance/evidence/GDS + graph backend alternatives | `DERIVED_GRAPH_AND_BACKENDS.md` |
 | OpenClaw-derived recall/promotion/import/diagnostic patterns | `OPENCLAW_ADOPTED_PATTERNS.md` |
 | Текущая конфигурация | `../core/config.py` + `../.env.example` |
 | Реальные contracts | `../tests/` + `../.github/workflows/ci.yml` |
+| Derived graph policy contracts | `../core/derived_graph.py` |
 | Реализация L1/L2/L3 | `../layers/` |
 | Canonical ingest | `../knowledge/ingest.py` |
 | Scoped memory/retrieval | `../core/memory_ops.py` |
@@ -95,6 +97,25 @@
 
 Current runtime update from this audit is deliberately small: Neo4j stays on compatible **5.26 LTS** but Docker is pinned to fresh patch **5.26.29-community**. Other modern technologies remain documented/evaluated until a concrete requirement justifies implementation.
 
+## 🔗 Derived graph + lightweight backend choices
+
+`DERIVED_GRAPH_AND_BACKENDS.md` defines a new **read-side derived analysis plane** without changing Graphiti memory authority:
+
+- causal hypotheses with explicit method/confounders/evidence;
+- provenance/lineage inspired by W3C PROV;
+- `SUPPORTS / CONTRADICTS / REFINES / SUPERSEDES` evidence topology;
+- multidimensional confidence/uncertainty;
+- Neo4j GDS policy allowing only `stream|stats`, blocking `mutate|write` by default;
+- Louvain/Leiden/centrality/path/link-prediction ideas as derived analytics, never automatic facts.
+
+It also records graph-backend choice:
+
+- **Neo4j** — current active validated backend;
+- **KùzuDB** — historical lightweight embedded alternative; original project archived in 2025;
+- **LadybugDB** — current successor to Kùzu and an **ADJACENT** lightweight embedded/serverless candidate for a future compatibility benchmark, not an active dependency today.
+
+A backend experiment must prove Graphiti semantic/search/temporal parity before any switch. Fractal keeps one active durable graph authority at a time.
+
 ## 🦞 OpenClaw pattern adoption
 
 `OPENCLAW_ADOPTED_PATTERNS.md` records a bounded 2026-08-24 adoption of memory ideas from OpenClaw:
@@ -116,8 +137,9 @@ It also records what was deliberately **not** copied: gateway/channels, multi-ag
 4. Для текущей модели смотри `core/model_policy.py`.
 5. Для текущей архитектуры смотри root `README.md` и CI.
 6. Для современных adjacent/research technologies смотри `TECHNOLOGY_EVOLUTION.md`.
-7. Для текущего memory-lifecycle слоя смотри `OPENCLAW_ADOPTED_PATTERNS.md`.
-8. Не превращай historical/future-work список в автоматически обязательный backlog.
-9. Forum/Reddit evidence считай operator signal, а не спецификацией.
+7. Для causal/provenance/GDS/backend alternatives смотри `DERIVED_GRAPH_AND_BACKENDS.md`.
+8. Для текущего memory-lifecycle слоя смотри `OPENCLAW_ADOPTED_PATTERNS.md`.
+9. Не превращай historical/future-work список в автоматически обязательный backlog.
+10. Forum/Reddit evidence считай operator signal, а не спецификацией.
 
 Так проект сохраняет память о собственном развитии, но старые документы больше не конкурируют с текущей архитектурой. 🧠📜
