@@ -22,6 +22,7 @@ from core.config import get_config
 from core.conversation_buffer import get_user_conversation_buffer
 from core.graphiti_client import get_write_semaphore
 from core.llm import llm_chat_response
+from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
 from core.rate_limit_retry import with_rate_limit_retry
 from core.task_registry import spawn
@@ -78,26 +79,45 @@ class SimpleChatAgent:
             conversation_buffer = get_user_conversation_buffer(self.memory.user_id)
             conversation_id = conversation_buffer.conversation_id
 
-            context_result = await self.memory.build_context_for_query(
+            recall_enabled, recall_reason = should_recall(
                 user_message,
-                scopes=["personal", "project", "knowledge", "experience"],
-                max_tokens=2000,
-                include_episodes=True,
-                include_entities=True,
+                config.memory.recall_mode,
+            )
+            if recall_enabled:
+                context_result = await self.memory.build_context_for_query(
+                    user_message,
+                    scopes=["personal", "project", "knowledge", "experience"],
+                    max_tokens=2000,
+                    include_episodes=True,
+                    include_entities=True,
+                )
+                user_content = (
+                    "Context from memory:\n"
+                    f"{context_result.text}\n\n"
+                    f"User question: {user_message}"
+                )
+            else:
+                context_result = ContextResult(
+                    text="",
+                    token_estimate=0,
+                    sources={"episodes": 0, "entities": 0, "edges": 0, "communities": 0},
+                )
+                user_content = f"User question: {user_message}"
+
+            logger.debug(
+                "Memory recall decision",
+                extra={
+                    "user_id": self.memory.user_id,
+                    "conversation_id": conversation_id,
+                    "recall_mode": config.memory.recall_mode,
+                    "recall_enabled": recall_enabled,
+                    "recall_reason": recall_reason,
+                },
             )
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_buffer.get_recent_messages(6))
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Context from memory:\n"
-                        f"{context_result.text}\n\n"
-                        f"User question: {user_message}"
-                    ),
-                }
-            )
+            messages.append({"role": "user", "content": user_content})
 
             response = (await llm_chat_response(messages, context="chat")).strip()
             if not response:
@@ -120,6 +140,7 @@ class SimpleChatAgent:
                     "user_id": self.memory.user_id,
                     "conversation_id": conversation_id,
                     "duration_ms": (perf_counter() - started) * 1000,
+                    "memory_recall": recall_enabled,
                 },
             )
             return response, conversation_text, context_result
