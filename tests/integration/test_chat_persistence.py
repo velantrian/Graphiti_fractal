@@ -1,282 +1,187 @@
-"""
-Integration tests for chat persistence:
-- No duplicate saves
-- Race condition safety for turn_index
+"""Opt-in integration tests for persisted chat turns, summaries, and temporal search.
+
+Run with a real Neo4j/OpenAI test environment:
+    RUN_LLM_INGEST_TESTS=1 pytest -q tests/integration/test_chat_persistence.py
 """
 
-import os
-import pytest
 import asyncio
-from datetime import datetime, timezone, timedelta
-from core.graphiti_client import get_graphiti_client
+import os
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
 from core.memory_ops import MemoryOps
+from core.task_registry import drain
 from simple_chat_agent import SimpleChatAgent
-from core.llm import get_async_client
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_LLM_INGEST_TESTS") != "1",
-    reason="Requires LLM/Graphiti ingest; run explicitly with RUN_LLM_INGEST_TESTS=1"
+    reason="Requires real LLM + Graphiti ingest; set RUN_LLM_INGEST_TESTS=1",
 )
 
 
-async def wait_until(predicate, timeout=5.0, interval=0.1, description="condition"):
-    """
-    Poll until predicate returns True or timeout is reached.
-    
-    Args:
-        predicate: Async callable that returns True when condition is met
-        timeout: Maximum time to wait in seconds
-        interval: Polling interval in seconds
-        description: Description for error messages
-        
-    Returns:
-        True if condition was met, False if timeout
-    """
-    start = asyncio.get_event_loop().time()
-    while True:
-        if await predicate():
-            return True
-        elapsed = asyncio.get_event_loop().time() - start
-        if elapsed >= timeout:
-            return False
-        await asyncio.sleep(interval)
-
-
-@pytest.mark.asyncio
-async def test_no_duplicate_chat_turns(graphiti_client):
-    """
-    Test that a single chat request creates exactly one chat_turn episode.
-    """
-    graphiti = graphiti_client
-    user_id = f"test_no_dup_{datetime.now(timezone.utc).timestamp()}"
-    marker_text = f"DUPLICATE_TEST_{datetime.now(timezone.utc).isoformat()}"
-    
-    # Create agent and send one message with unique marker
-    memory = MemoryOps(graphiti, user_id)
-    llm_client = get_async_client()
-    agent = SimpleChatAgent(llm_client, memory)
-    
-    await agent.answer_core(f"Test message for duplicate check: {marker_text}")
-    
-    # Wait for background task to complete using polling
-    driver = graphiti.driver
-    async def check_turn_exists():
-        query = """
-        MATCH (e:Episodic {episode_kind: "chat_turn"})
-        WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-          AND e.content CONTAINS $marker
-        RETURN count(e) AS count
+async def _count_turns(driver, *, user_id: str, marker: str) -> int:
+    result = await driver.execute_query(
         """
-        result = await driver.execute_query(query, user_id=user_id, marker=marker_text)
-        count = result.records[0]["count"] if result.records else 0
-        return count >= 1
-    
-    # Poll until turn appears or timeout
-    found = await wait_until(check_turn_exists, timeout=10.0, description="chat_turn with marker")
-    assert found, f"Chat turn with marker '{marker_text}' was not created within timeout"
-    
-    # Check that there's exactly 1 turn with this marker
-    final_query = """
-    MATCH (e:Episodic {episode_kind: "chat_turn"})
-    WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-      AND e.content CONTAINS $marker
-    RETURN count(e) AS count
-    """
-    final_result = await driver.execute_query(final_query, user_id=user_id, marker=marker_text)
-    final_count = final_result.records[0]["count"] if final_result.records else 0
-    
-    # Should have exactly 1 chat_turn with this marker
-    assert final_count == 1, f"Expected exactly 1 chat_turn with marker, got {final_count}"
+        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {episode_kind:'chat_turn'})
+        WHERE e.content CONTAINS $marker
+        RETURN count(e) AS count
+        """,
+        user_id=user_id,
+        marker=marker,
+    )
+    return int(result.records[0]["count"]) if result.records else 0
 
 
 @pytest.mark.asyncio
-async def test_turn_index_race_condition(graphiti_client):
-    """
-    Test that concurrent chat requests get unique turn_index values.
-    """
+async def test_single_chat_request_persists_exactly_one_turn(graphiti_client, llm_client):
     graphiti = graphiti_client
-    user_id = f"test_race_{datetime.now(timezone.utc).timestamp()}"
+    user_id = f"chat_no_dup_{datetime.now(timezone.utc).timestamp()}"
+    marker = f"DUPLICATE_TEST_{datetime.now(timezone.utc).isoformat()}"
+
+    agent = SimpleChatAgent(llm_client, MemoryOps(graphiti, user_id))
+    await agent.answer_core(f"Test message: {marker}")
+    await drain(timeout=60)
+
+    assert await _count_turns(graphiti.driver, user_id=user_id, marker=marker) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_chat_turn_indices_are_unique_and_sequential(graphiti_client, llm_client):
+    graphiti = graphiti_client
+    user_id = f"chat_race_{datetime.now(timezone.utc).timestamp()}"
     marker_prefix = f"RACE_TEST_{datetime.now(timezone.utc).isoformat()}"
-    
     memory = MemoryOps(graphiti, user_id)
-    llm_client = get_async_client()
-    
-    # Send 5 concurrent requests with unique markers
-    async def send_chat(i: int):
-        agent = SimpleChatAgent(llm_client, memory)
-        marker = f"{marker_prefix}_MSG_{i}"
-        return await agent.answer_core(f"Concurrent message {i}: {marker}")
-    
-    results = await asyncio.gather(*[send_chat(i) for i in range(5)])
-    
-    # Wait for all background tasks to complete using polling
-    driver = graphiti.driver
-    async def check_all_turns_exist():
-        query = """
-        MATCH (e:Episodic {episode_kind: "chat_turn"})
-        WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-          AND e.content CONTAINS $marker_prefix
-        RETURN count(e) AS count
+
+    async def send(index: int):
+        marker = f"{marker_prefix}_MSG_{index}"
+        return await SimpleChatAgent(llm_client, memory).answer_core(
+            f"Concurrent message {index}: {marker}"
+        )
+
+    await asyncio.gather(*(send(index) for index in range(5)))
+    await drain(timeout=90)
+
+    result = await graphiti.driver.execute_query(
         """
-        result = await driver.execute_query(query, user_id=user_id, marker_prefix=marker_prefix)
-        count = result.records[0]["count"] if result.records else 0
-        return count >= 5
-    
-    # Poll until all turns appear or timeout
-    found = await wait_until(check_all_turns_exist, timeout=15.0, description="5 chat_turns with markers")
-    assert found, f"Not all 5 chat turns with marker prefix '{marker_prefix}' were created within timeout"
-    
-    # Check that all turn_index values are unique
-    query = """
-    MATCH (e:Episodic {episode_kind: "chat_turn"})
-    WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-      AND e.content CONTAINS $marker_prefix
-    RETURN e.turn_index AS turn_index, e.conversation_id AS conversation_id
-    ORDER BY e.turn_index
-    """
-    result = await driver.execute_query(query, user_id=user_id, marker_prefix=marker_prefix)
-    
-    turn_indices = [record["turn_index"] for record in result.records]
-    conversation_ids = set(record["conversation_id"] for record in result.records)
-    
-    # All should be in the same conversation
-    assert len(conversation_ids) == 1, f"Expected 1 conversation_id, got {len(conversation_ids)}"
-    
-    # All turn_index values should be unique
-    assert len(turn_indices) == len(set(turn_indices)), f"Duplicate turn_index values found: {turn_indices}"
-    
-    # Should have 5 turns
-    assert len(turn_indices) == 5, f"Expected 5 turns, got {len(turn_indices)}"
-    
-    # Turn indices should be sequential (1, 2, 3, 4, 5)
-    assert turn_indices == list(range(1, 6)), f"Expected [1,2,3,4,5], got {turn_indices}"
+        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {episode_kind:'chat_turn'})
+        WHERE e.content CONTAINS $marker_prefix
+        RETURN e.turn_index AS turn_index, e.conversation_id AS conversation_id
+        ORDER BY e.turn_index ASC
+        """,
+        user_id=user_id,
+        marker_prefix=marker_prefix,
+    )
+    indices = [int(record["turn_index"]) for record in result.records]
+    conversation_ids = {record["conversation_id"] for record in result.records}
+
+    assert len(conversation_ids) == 1
+    assert indices == [1, 2, 3, 4, 5]
 
 
 @pytest.mark.asyncio
-async def test_chat_summary_count(graphiti_client):
-    """
-    Test that summaries are created correctly (every 10 turns).
-    """
+async def test_summary_references_real_persisted_turn_uuids(graphiti_client, llm_client):
     graphiti = graphiti_client
-    user_id = f"test_summary_{datetime.now(timezone.utc).timestamp()}"
+    user_id = f"chat_summary_{datetime.now(timezone.utc).timestamp()}"
     marker_prefix = f"SUMMARY_TEST_{datetime.now(timezone.utc).isoformat()}"
-    
     memory = MemoryOps(graphiti, user_id)
-    llm_client = get_async_client()
-    
-    # Send 12 messages with markers (should create 1 summary at turn 10)
-    for i in range(12):
-        agent = SimpleChatAgent(llm_client, memory)
-        marker = f"{marker_prefix}_MSG_{i}"
-        await agent.answer_core(f"Message {i}: {marker}")
-        await asyncio.sleep(0.2)  # Small delay between messages
-    
-    # Wait for summary to be created using polling
-    driver = graphiti.driver
-    async def check_summary_exists():
-        query = """
-        MATCH (e:Episodic {episode_kind: "chat_summary"})
-        WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-        RETURN count(e) AS count
+    agent = SimpleChatAgent(llm_client, memory)
+
+    for index in range(10):
+        await agent.answer_core(f"Message {index}: {marker_prefix}_MSG_{index}")
+
+    await drain(timeout=180)
+
+    summary_result = await graphiti.driver.execute_query(
         """
-        result = await driver.execute_query(query, user_id=user_id)
-        count = result.records[0]["count"] if result.records else 0
-        return count >= 1
-    
-    # Poll until summary appears or timeout
-    found = await wait_until(check_summary_exists, timeout=20.0, description="chat_summary")
-    
-    # Check summary count
-    summary_query = """
-    MATCH (e:Episodic {episode_kind: "chat_summary"})
-    WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-    RETURN count(e) AS count
-    """
-    summary_result = await driver.execute_query(summary_query, user_id=user_id)
-    summary_count = summary_result.records[0]["count"] if summary_result.records else 0
-    
-    # Should have at least 1 summary (at turn 10)
-    assert summary_count >= 1, f"Expected at least 1 summary, got {summary_count}"
+        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(s:Episodic {episode_kind:'chat_summary'})
+        RETURN s.uuid AS uuid,
+               s.conversation_id AS conversation_id,
+               s.covers_turns AS covers_turns,
+               s.summarized_turns AS summarized_turns
+        ORDER BY s.created_at DESC
+        LIMIT 1
+        """,
+        user_id=user_id,
+    )
+    assert summary_result.records, "expected one persisted chat summary"
+    summary = summary_result.records[0]
+    source_uuids = list(summary["summarized_turns"] or [])
+
+    assert summary["covers_turns"] == "1-10"
+    assert len(source_uuids) == 10
+    assert len(set(source_uuids)) == 10
+
+    source_result = await graphiti.driver.execute_query(
+        """
+        MATCH (e:Episodic)
+        WHERE e.uuid IN $source_uuids
+        RETURN e.uuid AS uuid,
+               e.turn_index AS turn_index,
+               e.summarized AS summarized,
+               e.summary_uuid AS summary_uuid,
+               e.content AS content
+        ORDER BY e.turn_index ASC
+        """,
+        source_uuids=source_uuids,
+    )
+    assert len(source_result.records) == 10
+    assert [int(record["turn_index"]) for record in source_result.records] == list(range(1, 11))
+    assert all(record["summarized"] is True for record in source_result.records)
+    assert all(record["summary_uuid"] == summary["uuid"] for record in source_result.records)
+    assert all(marker_prefix in (record["content"] or "") for record in source_result.records)
 
 
 @pytest.mark.asyncio
-async def test_temporal_search_filters(graphiti_client):
-    """
-    Test that search_memory applies temporal filters correctly:
-    - By default returns only current facts (invalid_at IS NULL)
-    - With as_of parameter returns facts valid at that point in time
-    """
-    from core.memory_ops import MemoryOps
-
+async def test_temporal_search_current_and_as_of(graphiti_client):
     graphiti = graphiti_client
-    user_id = "test_temporal_user"
-    group_id = "test_temporal_group"
+    user_id = f"temporal_{datetime.now(timezone.utc).timestamp()}"
+    group_id = f"temporal_group_{datetime.now(timezone.utc).timestamp()}"
+    memory = MemoryOps(graphiti, user_id)
 
-    # Create MemoryOps instance
-    memory_ops = MemoryOps(user_id=user_id)
+    now = datetime.now(timezone.utc)
+    first_time = now - timedelta(days=30)
+    second_time = now
 
-    # Create test timeline: Moscow 30 days ago -> St. Petersburg now
-    t1 = datetime.now(timezone.utc) - timedelta(days=30)
-    t2 = datetime.now(timezone.utc)
-
-    # Add episode 1: "lived in Moscow" 30 days ago
     await graphiti.add_episode(
-        name="temporal_test_1",
+        name="temporal_test_moscow",
         episode_body="Сергей жил в Москве.",
         source_description="temporal_test",
         group_id=group_id,
-        reference_time=t1,
+        reference_time=first_time,
     )
-
-    # Add episode 2: "moved to St. Petersburg" now
     await graphiti.add_episode(
-        name="temporal_test_2",
+        name="temporal_test_petersburg",
         episode_body="Сергей переехал в Санкт-Петербург и теперь живет в Санкт-Петербурге.",
         source_description="temporal_test",
         group_id=group_id,
-        reference_time=t2,
+        reference_time=second_time,
     )
 
-    # Wait for processing
-    await asyncio.sleep(2)
-
     try:
-        # Test 1: Current search should return only St. Petersburg facts
-        current_result = await memory_ops.search_memory(
+        current = await memory.search_memory(
             "где живет Сергей",
             scopes=[group_id],
-            limit=10
+            limit=10,
         )
+        current_facts = [edge.get("fact", "") for edge in current.edges]
+        assert any("Санкт-Петербург" in fact for fact in current_facts)
+        assert not any("Москв" in fact for fact in current_facts)
 
-        # Should find current facts (St. Petersburg), not invalidated ones (Moscow)
-        edge_facts = [edge.fact for edge in current_result.edges if hasattr(edge, 'fact')]
-        assert any("Санкт-Петербург" in fact for fact in edge_facts), f"No current St. Petersburg facts found. Edges: {edge_facts}"
-
-        # Should NOT find invalidated Moscow facts
-        assert not any("Москв" in fact for fact in edge_facts), f"Found invalidated Moscow facts in current search: {edge_facts}"
-
-        # Test 2: Point-in-time search 35 days ago should return Moscow facts
-        past_time = datetime.now(timezone.utc) - timedelta(days=35)
-        past_result = await memory_ops.search_memory(
+        historical = await memory.search_memory(
             "где жил Сергей",
             scopes=[group_id],
             limit=10,
-            as_of=past_time
+            as_of=now - timedelta(days=15),
         )
-
-        past_edge_facts = [edge.fact for edge in past_result.edges if hasattr(edge, 'fact')]
-        # Should find Moscow facts that were valid at that time
-        moscow_found = any("Москв" in fact for fact in past_edge_facts)
-        # Note: This test may be less strict since point-in-time filtering depends on exact implementation
-        # The important part is that current search doesn't return invalidated facts
-
-        print(f"Current search found: {len(current_result.edges)} edges")
-        print(f"Past search found: {len(past_result.edges)} edges")
-
+        historical_facts = [edge.get("fact", "") for edge in historical.edges]
+        assert any("Москв" in fact for fact in historical_facts)
     finally:
-        # Cleanup test data
         await graphiti.driver.execute_query(
-            "MATCH (n {group_id: $group_id}) DETACH DELETE n",
-            group_id=group_id
+            "MATCH (n {group_id:$group_id}) DETACH DELETE n",
+            group_id=group_id,
         )
-
+        await graphiti.driver.execute_query(
+            "MATCH (u:User {user_id:$user_id}) DETACH DELETE u",
+            user_id=user_id,
+        )
