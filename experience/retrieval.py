@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from core.settings import settings
+from core.config import get_config
 
 
-async def get_success_patterns(graphiti, *, task_type: str | None, context_hash: str | None, limit: int = 5):
-    """
-    Базовый retrieval по опыту: возвращаем последние успешные TaskRun в похожем контексте.
-    """
-    driver = graphiti.driver
-    res = await driver.execute_query(
+def _experience_group_id() -> str:
+    return get_config().memory.experience_group_id
+
+
+async def get_success_patterns(
+    graphiti,
+    *,
+    task_type: str | None,
+    context_hash: str | None,
+    limit: int = 5,
+):
+    """Return recent successful TaskRun records in a matching experience context."""
+    result = await graphiti.driver.execute_query(
         """
         MATCH (tr:TaskRun)
         WHERE tr.group_id = $gid
@@ -31,20 +38,23 @@ async def get_success_patterns(graphiti, *, task_type: str | None, context_hash:
         ORDER BY tr.ended_at DESC
         LIMIT $limit
         """,
-        gid=settings.EXPERIENCE_GROUP_ID,
+        gid=_experience_group_id(),
         task_type=task_type,
         ctx=context_hash,
         limit=max(1, min(limit, 50)),
     )
-    return [dict(rec) for rec in res.records]
+    return [dict(record) for record in result.records]
 
 
-async def get_antipatterns(graphiti, *, task_type: str | None, context_hash: str | None, limit: int = 5):
-    """
-    Антипримеры: группируем по error_type и tool_chain_hash в похожем контексте.
-    """
-    driver = graphiti.driver
-    res = await driver.execute_query(
+async def get_antipatterns(
+    graphiti,
+    *,
+    task_type: str | None,
+    context_hash: str | None,
+    limit: int = 5,
+):
+    """Group failure patterns by error type and tool-chain hash."""
+    result = await graphiti.driver.execute_query(
         """
         MATCH (tr:TaskRun)
         WHERE tr.group_id = $gid
@@ -60,11 +70,9 @@ async def get_antipatterns(graphiti, *, task_type: str | None, context_hash: str
         ORDER BY c DESC, last_seen DESC
         LIMIT $limit
         """,
-        gid=settings.EXPERIENCE_GROUP_ID,
+        gid=_experience_group_id(),
         task_type=task_type,
         ctx=context_hash,
         limit=max(1, min(limit, 50)),
     )
-    return [dict(rec) for rec in res.records]
-
-
+    return [dict(record) for record in result.records]

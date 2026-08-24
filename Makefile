@@ -2,7 +2,7 @@ VENV?=.venv
 PYTHON?=$(VENV)/bin/python
 PIP?=$(VENV)/bin/pip
 
-.PHONY: venv install setup seed quality search context l1 l2 l3 viz benchmark test migrate
+.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
 
 venv:
 	python -m venv $(VENV)
@@ -29,13 +29,16 @@ l1:
 	$(PYTHON) main.py l1 --query "Fractal Memory" --hours 24
 
 l2:
-	$(PYTHON) main.py l2 "Sergey"
+	$(PYTHON) main.py l2 "Graphiti"
 
 l3:
-	$(PYTHON) main.py l3 "Fractal Memory"
+	$(PYTHON) main.py l3 "Graphiti"
+
+l3-build:
+	$(PYTHON) main.py l3-build "Graphiti"
 
 viz:
-	$(PYTHON) main.py viz-export --output visualization/graph_data.json
+	$(PYTHON) main.py viz-export --output static/graph_data.json
 
 benchmark:
 	$(PYTHON) main.py benchmark
@@ -46,10 +49,15 @@ test:
 migrate:
 	$(PYTHON) main.py migrate
 
+# Cleanup targets are intentionally dry-run only. Use the CLI with --apply explicitly.
+dedupe-entities:
+	$(PYTHON) main.py dedupe-entities
+
+dedupe-episodes:
+	$(PYTHON) main.py dedupe-episodes
+
 web:
-	$(PYTHON) -m uvicorn app:app --host 0.0.0.0 --port 8000
-# Dockerized workflow
-.PHONY: dc-build dc-up dc-down dc-logs
+	$(PYTHON) -m uvicorn app:app --host 127.0.0.1 --port 8000
 
 dc-build:
 	docker compose build
@@ -62,4 +70,3 @@ dc-down:
 
 dc-logs:
 	docker compose logs -f
-

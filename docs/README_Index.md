@@ -1,195 +1,145 @@
-# 📚 ДОКУМЕНТАЦИЯ: Fractal Memory v2 на Graphiti
+# 📚 Fractal Memory — Historical Documentation Index
 
-## 🎯 Начни отсюда
+> **Status: HISTORICAL / NON-AUTHORITATIVE**
+>
+> Этот индекс сохраняет исходный путь разработки Fractal Memory и старые Day-by-Day документы как историю эволюции проекта. Он **не является инструкцией для текущего runtime**.
+>
+> Для current state используй root `README.md`; для ролей/истории AI — `AI_MODEL_EVOLUTION.md`; для storage/retrieval/graph/cache evolution — `TECHNOLOGY_EVOLUTION.md`; для causal/provenance/GDS и backend alternatives — `DERIVED_GRAPH_AND_BACKENDS.md`; для OpenClaw-derived memory lifecycle patterns — `OPENCLAW_ADOPTED_PATTERNS.md`.
 
-Тебе нужно 9 дней и следующие документы:
+## 🕰️ Зачем оставлены старые документы
 
-### 🚀 **INSTANT START** (30 минут)
-**Файл:** `Quick_Start_30min.md`
-- Запуск Neo4j через Docker
-- Python setup
-- Первый рабочий граф за 30 минут
-- Проверка в Neo4j Browser
+Ранние документы фиксируют, как проект развивался: от первоначальной 9-дневной схемы и custom entity экспериментов до текущей Graphiti-native архитектуры. Поэтому старые API-примеры, предположения, benchmark-цели, названия моделей и технологические идеи **не стираются задним числом**.
 
-**Результат:** 3 узла в графе, стабильное соединение
+Историческое упоминание **GPT-4** в `Day_2_Custom_Entities.md` остаётся временным снимком своего этапа. Аналогично старые database/retrieval/graph предположения следует читать в контексте даты документа.
 
----
+## ✅ Current authoritative/reference entrypoints
 
-### 📋 **ПОЛНАЯ СПЕЦИФИКАЦИЯ** (Справочник)
-**Файл:** `Graphiti_Full_Spec.md`
-- Полный 9-дневный план (этапы 1-3)
-- Все операции Graphiti API
-- Конфигурация параметров
-- Технические требования
-- Антипаттерны
+| Что нужно | Источник |
+|---|---|
+| Текущая архитектура/runtime contract | `../README.md` |
+| Текущая AI model policy | `../core/model_policy.py` |
+| Роли + история AI/MoE/cache | `AI_MODEL_EVOLUTION.md` |
+| Storage/graph/retrieval/cache technology map | `TECHNOLOGY_EVOLUTION.md` |
+| Causal/provenance/evidence/GDS + graph backend alternatives | `DERIVED_GRAPH_AND_BACKENDS.md` |
+| OpenClaw-derived recall/promotion/import/diagnostic patterns | `OPENCLAW_ADOPTED_PATTERNS.md` |
+| Текущая конфигурация | `../core/config.py` + `../.env.example` |
+| Реальные contracts | `../tests/` + `../.github/workflows/ci.yml` |
+| Derived graph policy contracts | `../core/derived_graph.py` |
+| Реализация L1/L2/L3 | `../layers/` |
+| Canonical ingest | `../knowledge/ingest.py` |
+| Scoped memory/retrieval | `../core/memory_ops.py` |
 
-**Используй:** как справочник при возникновении вопросов
+## 📜 Historical development trail
 
----
+### Day 2 — Custom Entities
+`Day_2_Custom_Entities.md`
 
-### 📅 **ДЕНЬ 1: Setup** (4 часа)
-**Файл:** `Quick_Start_30min.md`
-- Docker + Python + первый эпизод
-- ✅ Цель: 3+ узла в Neo4j
+Сохраняет первоначальный эксперимент с custom entity types и старый GPT-4-era пример. Полезен для понимания происхождения идей, но код/API оттуда нельзя считать текущим без сверки.
 
----
+### Day 3–4 — Visualization & Queries
+`Day_3_4_Visualization_Queries.md`
 
-### 📅 **ДЕНЬ 2: Custom Entities** (6 часов)
-**Файл:** `Day_2_Custom_Entities.md`
-- 4 Pydantic модели (Project, Concept, Decision, Team)
-- Добавление 3 эпизодов разных типов
-- Проверка автоэкстракции сущностей
-- ✅ Цель: 15-20 узлов, кастомные типы работают
+История ранних Cypher/search/context-builder подходов. Современный retrieval path находится в текущем коде и использует bounded per-namespace search.
 
----
+### Day 5–7 — Fractal Layers
+`Day_5_7_Fractal_Layers.md`
 
-### 📅 **ДЕНЬ 3-4: Visualization & Queries** (9 часов)
-**Файл:** `Day_3_4_Visualization_Queries.md`
-- Neo4j Browser Cypher запросы
-- Проверка качества данных (дубликаты)
-- Стратегии поиска (keyword, hybrid, relationship, temporal)
-- Context builder для LLM
-- ✅ Цель: Визуально подтверждено, поиск работает
+История ранних L1/L2/L3 концепций. Текущие L2/L3 используют Graphiti Communities + bounded LLM synthesis.
 
----
+### Day 8–9 — Visualization & Performance
+`Day_8_9_Visualization_Performance.md`
 
-### 📅 **ДЕНЬ 5-7: Fractal Layers** (15 часов)
-**Файл:** `Day_5_7_Fractal_Layers.md`
-- L1: Recent episode consolidation
-- L2: Semantic relationship patterns
-- L3: Fractal hierarchies & abstractions
-- ✅ Цель: 3-слойная архитектура работает
+Исторические цели визуализации и performance-профилирования. Старые числа не являются текущими гарантиями/SLO.
 
----
+### Master Project Plan
+`Master_Project_Plan.md`
 
-### 📅 **ДЕНЬ 8-9: Visualization & Performance** (9 часов)
-**Файл:** `Day_8_9_Visualization_Performance.md`
-- D3.js интерактивный граф
-- Graph export to JSON
-- Performance benchmarking
-- ✅ Цель: Интерактивная UI + metrics
+Исходный 9-дневный план. Сохраняется как архитектурная летопись, а не как актуальный backlog.
 
----
+### Testing / refactoring notes
 
-### 🗺️ **МАСТЕР-ПЛАН** (Overview)
-**Файл:** `Master_Project_Plan.md`
-- Полный timeline на 9 дней
-- Структура проекта
-- Success metrics на каждый день
-- Troubleshooting
-- Next phases (неделя 2+)
+- `TESTING_AND_SIMPLE_AGENT.md`
+- `HANDS_ON_TESTING.md`
+- `REFACTORING_CHANGELOG.md`
+- `GRAPH_CONNECTIVITY.md`
+- `memory_ops.md`
 
----
+Использовать для истории решений и отладки старых состояний; при конфликте с current README/code/contracts побеждает current state.
 
-## 📂 КАК ИСПОЛЬЗОВАТЬ ДОКУМЕНТЫ
+## 🤖 История и роли AI
 
-### Сценарий 1: Только начинаю
-```
-1. Прочитай Quick_Start_30min.md (10 минут)
-2. Следи инструкциям (30 минут)
-3. Проверь результат в Neo4j Browser
-4. Переходи на День 2
-```
+`AI_MODEL_EVOLUTION.md` фиксирует не только поколения GPT/Claude/Gemini/DeepSeek/Qwen/Grok, но и **зачем конкретные семейства/tiers могут использоваться**, а также:
 
-### Сценарий 2: Застрял на дне N
-```
-1. Открой соответствующий файл (День N)
-2. Прочитай стратегию дня
-3. Скопируй код в свой проект
-4. Запусти и проверь чеклист
-5. Если ошибка → смотри Master_Project_Plan.md Troubleshooting
-```
+- MoE как sparse model architecture;
+- total vs active parameters;
+- dense vs MoE deployment implications;
+- KV cache / prefix cache / provider prompt cache;
+- official-source facts отдельно от Reddit/community operator signal.
 
-### Сценарий 3: Нужна информация о функции
-```
-1. Открой Graphiti_Full_Spec.md
-2. Найди раздел "QUICK REFERENCE: API METHODS"
-3. Скопируй метод и адаптируй под свой код
-```
+Ключевое правило:
 
----
+> **Model mentioned ≠ provider supported ≠ runtime default ≠ architecture adopted.**
 
-## 🔑 КЛЮЧЕВЫЕ ФАЙЛЫ ПО КАТЕГОРИЯМ
+## 🧱 История и роли технологий
 
-### Для Setup
-- Quick_Start_30min.md
+`TECHNOLOGY_EVOLUTION.md` разводит по слоям:
 
-### Для Разработки (по дням)
-- Day_2_Custom_Entities.md
-- Day_3_4_Visualization_Queries.md
-- Day_5_7_Fractal_Layers.md
-- Day_8_9_Visualization_Performance.md
+- Graphiti — temporal knowledge-graph memory semantics;
+- Neo4j — active durable graph store;
+- SQLite — embedded relational/local store;
+- PostgreSQL — relational transactional/product state;
+- pgvector — vector search inside PostgreSQL;
+- RAG — retrieval pattern;
+- GraphRAG — graph/community-aware retrieval;
+- KAG — knowledge-structured/hybrid reasoning;
+- CAG — reusable long-context/KV working-set pattern;
+- KV/prefix/prompt cache — inference acceleration, **not durable memory**.
 
-### Для Справки
-- Graphiti_Full_Spec.md (тех. детали)
-- Master_Project_Plan.md (timeline + structure)
+Current runtime update from this audit is deliberately small: Neo4j stays on compatible **5.26 LTS** but Docker is pinned to fresh patch **5.26.29-community**. Other modern technologies remain documented/evaluated until a concrete requirement justifies implementation.
 
-### Для Отладки
-- Master_Project_Plan.md → Troubleshooting
+## 🔗 Derived graph + lightweight backend choices
 
----
+`DERIVED_GRAPH_AND_BACKENDS.md` defines a new **read-side derived analysis plane** without changing Graphiti memory authority:
 
-## 📊 ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ ПО ДНЯМ
+- causal hypotheses with explicit method/confounders/evidence;
+- provenance/lineage inspired by W3C PROV;
+- `SUPPORTS / CONTRADICTS / REFINES / SUPERSEDES` evidence topology;
+- multidimensional confidence/uncertainty;
+- Neo4j GDS policy allowing only `stream|stats`, blocking `mutate|write` by default;
+- Louvain/Leiden/centrality/path/link-prediction ideas as derived analytics, never automatic facts.
 
-| День | Результат | Файл |
-|------|-----------|------|
-| 1 | 3+ узла в граве, поиск работает | Quick_Start |
-| 2 | 15-20 узлов, кастомные типы | Day_2 |
-| 3-4 | Cypher queries работают, контекст собирается | Day_3-4 |
-| 5-7 | L1-L3 слои реализованы | Day_5-7 |
-| 8-9 | Интерактивный граф + performance report | Day_8-9 |
+It also records graph-backend choice:
 
----
+- **Neo4j** — current active validated backend;
+- **KùzuDB** — historical lightweight embedded alternative; original project archived in 2025;
+- **LadybugDB** — current successor to Kùzu and an **ADJACENT** lightweight embedded/serverless candidate for a future compatibility benchmark, not an active dependency today.
 
-## ✅ CHECKLIST ПЕРЕД НАЧАЛОМ
+A backend experiment must prove Graphiti semantic/search/temporal parity before any switch. Fractal keeps one active durable graph authority at a time.
 
-- [ ] Docker installed
-- [ ] Python 3.10+ installed
-- [ ] OpenAI API key готов
-- [ ] 9 дней календаря забронировано
-- [ ] Все документы скачаны/прочитаны
-- [ ] Текстовый редактор открыт (VSCode)
-- [ ] Terminal готов
+## 🦞 OpenClaw pattern adoption
 
----
+`OPENCLAW_ADOPTED_PATTERNS.md` records a bounded 2026-08-24 adoption of memory ideas from OpenClaw:
 
-## 🚀 НАЧНИ СЕЙЧАС
+- adaptive pre-reply recall;
+- deterministic promotion scoring + `promote-explain` style visibility;
+- structural exclusion of `untrusted` / `system` candidates from promotion;
+- staged consolidation as **dry-run preview**, not an automatic writer;
+- read-only `memory-status` diagnostics;
+- preview-first external import into isolated `imports` namespace.
 
-```bash
-# Шаг 1: Открой Quick_Start_30min.md
-# Шаг 2: Следуй инструкциям
-# Шаг 3: Docker запустится → Neo4j запустится → первый граф создастся
-# Шаг 4: День 2
+It also records what was deliberately **not** copied: gateway/channels, multi-agent runtime, plugin marketplace, Markdown/SQLite as Fractal memory authority, and scheduled durable promotion before real recall telemetry exists.
 
-# You've got this! ✨
-```
+## 🧭 Как читать старый материал правильно
 
----
+1. Сначала проверь дату и historical marker.
+2. Не копируй старый код без сверки с текущими interfaces.
+3. Старое имя модели/версии воспринимай как snapshot эпохи.
+4. Для текущей модели смотри `core/model_policy.py`.
+5. Для текущей архитектуры смотри root `README.md` и CI.
+6. Для современных adjacent/research technologies смотри `TECHNOLOGY_EVOLUTION.md`.
+7. Для causal/provenance/GDS/backend alternatives смотри `DERIVED_GRAPH_AND_BACKENDS.md`.
+8. Для текущего memory-lifecycle слоя смотри `OPENCLAW_ADOPTED_PATTERNS.md`.
+9. Не превращай historical/future-work список в автоматически обязательный backlog.
+10. Forum/Reddit evidence считай operator signal, а не спецификацией.
 
-## 📞 БЫСТРЫЕ ССЫЛКИ
-
-| Вопрос | Ответ |
-|--------|--------|
-| Как начать? | Quick_Start_30min.md |
-| Что делать в День N? | Day_N_*.md |
-| Как работает функция X? | Graphiti_Full_Spec.md |
-| Ошибка на День N? | Master_Project_Plan.md → Troubleshooting |
-| Какой timeline? | Master_Project_Plan.md → Timeline |
-| Структура проекта? | Master_Project_Plan.md → Project Structure |
-
----
-
-## 💡 ФИЛОСОФИЯ ДОКУМЕНТОВ
-
-Каждый документ написан для конкретного дня/задачи:
-- ✅ Не переусложнены
-- ✅ Копипастный код работает как есть
-- ✅ Примеры конкретны
-- ✅ Чеклист на каждый день
-- ✅ Clear success criteria
-
-**Не пропускай дни, следуй плану, выдаёшь код каждый день.**
-
----
-
-**Удачи! Ты это сделаешь! 🚀**
+Так проект сохраняет память о собственном развитии, но старые документы больше не конкурируют с текущей архитектурой. 🧠📜

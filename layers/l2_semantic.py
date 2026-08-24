@@ -1,81 +1,84 @@
 import asyncio
 import logging
-from collections import defaultdict
 
 from core import get_graphiti_client
 
 logger = logging.getLogger(__name__)
 
+
 async def trigger_community_build(graphiti):
-    """
-    Background task to rebuild communities (Graphiti native clustering).
-    This should be called periodically, not on every request.
-    """
+    """Rebuild Graphiti communities; intended for scheduled maintenance, not requests."""
     try:
         logger.info("Starting L2 community build...")
         await graphiti.build_communities()
         logger.info("L2 community build completed.")
-    except Exception as e:
-        logger.error(f"Failed to build communities: {e}")
+    except Exception as exc:
+        logger.error("Failed to build communities: %s", exc)
+        raise
 
 
-async def get_l2_semantic_context(graphiti, entity_name: str) -> str:
-    """
-    L2: Retrieve community summaries (Graphiti Native).
-    Uses pre-calculated community summaries to provide structural context.
-    """
+async def get_l2_semantic_context_with_sources(graphiti, entity_name: str) -> tuple[str | None, list[str]]:
+    """Retrieve L2 community context together with exact source community UUIDs."""
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
-        return "Graphiti driver not found for L2 context."
+        return "Graphiti driver not found for L2 context.", []
 
-    # 1. Find communities relevant to the entity (via membership or text match)
-    # Graphiti structure: (Entity)-[:IN_COMMUNITY]->(Community) or similar.
-    # Checking docs/schema: usually (:Entity)-[:MEMBER_OF]->(:Community) or similar.
-    # Let's assume standard Graphiti schema for communities.
-    # If not sure, we can search for nodes with label 'Community'.
-    
     query = """
     MATCH (e:Entity)
     WHERE toLower(e.name) CONTAINS toLower($name)
-    MATCH (e)-[:IN_COMMUNITY]->(c:Community)
-    RETURN DISTINCT c.uuid as uuid, c.name as name, c.summary as summary, c.level as level
-    ORDER BY c.level ASC
+      AND coalesce(e.deleted, false) = false
+    MATCH (c:Community)-[:HAS_MEMBER]->(e)
+    WHERE coalesce(c.deleted, false) = false
+    RETURN DISTINCT c.uuid AS uuid,
+           c.name AS name,
+           c.summary AS summary,
+           c.level AS level
+    ORDER BY coalesce(c.level, 0) ASC
     LIMIT 5
     """
-    
+
     try:
-        if hasattr(driver, 'execute_query'):
+        if hasattr(driver, "execute_query"):
             res = await driver.execute_query(query, name=entity_name)
             records = res.records
         else:
             async with driver.session() as session:
                 res = await session.run(query, name=entity_name)
                 records = await res.list()
-    except Exception as e:
-        logger.warning(f"L2 community query failed: {e}. Are communities built?")
-        return "L2 Context: No community structure found (try running build_communities)."
+    except Exception as exc:
+        logger.warning("L2 community query failed: %s", exc)
+        return "L2 Context: community structure unavailable; run build_communities and retry.", []
 
     if not records:
-        return None
+        return None, []
 
-    summary_text = f"🧠 L2 Semantic Context (Communities) for '{entity_name}':\n\n"
-    
+    lines = [f"🧠 L2 Semantic Context (Communities) for '{entity_name}':", ""]
+    source_ids: list[str] = []
     for rec in records:
-        c_name = rec['name'] or "Unnamed Community"
-        c_sum = rec['summary'] or "No summary available."
-        c_level = rec.get('level', '?')
-        summary_text += f"=== Community: {c_name} (Level {c_level}) ===\n{c_sum}\n\n"
+        c_uuid = rec["uuid"]
+        if c_uuid:
+            source_ids.append(str(c_uuid))
+        c_name = rec["name"] or "Unnamed Community"
+        c_sum = rec["summary"] or "No summary available."
+        c_level = rec.get("level") if hasattr(rec, "get") else rec["level"]
+        if c_level is None:
+            c_level = "?"
+        lines.append(f"=== Community: {c_name} (Level {c_level}) ===")
+        lines.append(c_sum)
+        lines.append("")
 
-    return summary_text
+    return "\n".join(lines).rstrip(), source_ids
+
+
+async def get_l2_semantic_context(graphiti, entity_name: str) -> str | None:
+    """Backward-compatible context-only wrapper."""
+    context, _ = await get_l2_semantic_context_with_sources(graphiti, entity_name)
+    return context
 
 
 async def test_l2():
     graphiti_client = get_graphiti_client()
     graphiti = await graphiti_client.ensure_ready()
-    
-    # Optional: trigger build if needed for test (commented out for speed)
-    # await trigger_community_build(graphiti)
-    
     context = await get_l2_semantic_context(graphiti, "Sergey")
     print(context)
 

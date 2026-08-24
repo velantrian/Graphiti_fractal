@@ -1,6 +1,8 @@
 # Neo4j database files (should not be committed)
 neo4j/data/
 neo4j/logs/
+neo4j/import/
+neo4j/plugins/
 
 # Python
 __pycache__/
@@ -31,12 +33,13 @@ Thumbs.db
 # Embedding cache
 .embedding_cache.json
 
-# Test artifacts
+# Test / runtime artifacts
 .pytest_cache/
 .coverage
 htmlcov/
-.embedding_cache.json
+*.log
 
-# Generated Artifacts
+# Generated artifacts
 architecture_manifest.md
 project_structure.json
+static/graph_data.json

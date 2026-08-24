@@ -1,130 +1,147 @@
-"""
-Chat persistence utilities for atomic turn index allocation and safe chat storage.
+"""Chat persistence primitives.
+
+The database counter is authoritative for turn ordering. Summary source windows
+are read back from persisted episodes, never reconstructed from RAM or synthetic
+UUIDs.
 """
 
-from typing import Optional
+from __future__ import annotations
+
+import asyncio
 import logging
+from time import monotonic
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-async def ensure_counter_constraint(graphiti):
-    """
-    Ensure unique constraint exists on ChatTurnCounter nodes.
-    This prevents duplicate counters and improves performance.
-    """
-    driver = graphiti.driver
-    try:
-        # Create constraint if it doesn't exist (idempotent)
-        constraint_query = """
+async def ensure_counter_constraint(graphiti) -> None:
+    await graphiti.driver.execute_query(
+        """
         CREATE CONSTRAINT chat_turn_counter_unique IF NOT EXISTS
         FOR (c:ChatTurnCounter)
         REQUIRE (c.user_id, c.conversation_id) IS UNIQUE
         """
-        await driver.execute_query(constraint_query)
-        logger.debug("ChatTurnCounter constraint ensured")
-    except Exception as e:
-        # Constraint might already exist or Neo4j version doesn't support IF NOT EXISTS
-        # This is non-critical, log and continue
-        logger.debug(f"Could not create ChatTurnCounter constraint (may already exist): {e}")
+    )
 
 
 async def allocate_turn_index(graphiti, user_id: str, conversation_id: str) -> int:
-    """
-    Atomically allocate next turn index for a conversation in Neo4j.
-    
-    This ensures unique turn indices even under concurrent requests from
-    multiple processes/containers.
-    
-    Args:
-        graphiti: Graphiti instance
-        user_id: User identifier
-        conversation_id: Conversation identifier
-        
-    Returns:
-        Next turn index (1-based)
-    """
-    driver = graphiti.driver
-    
-    # Ensure constraint exists (idempotent, called once per conversation typically)
+    """Atomically allocate a unique 1-based turn index or fail closed."""
     await ensure_counter_constraint(graphiti)
-    
-    query = """
-    MERGE (c:ChatTurnCounter {
-        user_id: $user_id,
-        conversation_id: $conversation_id
-    })
-    ON CREATE SET c.value = 0
-    SET c.value = c.value + 1
-    RETURN c.value AS turn_index
-    """
-    
-    try:
-        result = await driver.execute_query(
-            query,
-            user_id=user_id,
-            conversation_id=conversation_id
-        )
-        
-        if result.records:
-            turn_index = result.records[0]["turn_index"]
-            logger.debug(
-                f"Allocated turn_index={turn_index} for user={user_id}, conversation={conversation_id}"
-            )
-            return turn_index
-        else:
-            logger.error("Failed to allocate turn_index - no records returned", extra={
-                "user_id": user_id,
-                "conversation_id": conversation_id
-            })
-            return 1  # Fallback
-    except Exception as e:
-        logger.error(
-            f"Error allocating turn_index: {e}",
-            extra={
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "error_type": type(e).__name__
-            },
-            exc_info=e
-        )
-        return 1  # Fallback
+    result = await graphiti.driver.execute_query(
+        """
+        MERGE (c:ChatTurnCounter {user_id:$user_id, conversation_id:$conversation_id})
+        ON CREATE SET c.value = 0
+        SET c.value = c.value + 1
+        RETURN c.value AS turn_index
+        """,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if not result.records:
+        raise RuntimeError("turn index allocation returned no record")
+    turn_index = result.records[0]["turn_index"]
+    if not isinstance(turn_index, int) or turn_index < 1:
+        raise RuntimeError(f"invalid turn index allocated: {turn_index!r}")
+    return turn_index
 
 
 async def get_conversation_turn_count(graphiti, user_id: str, conversation_id: str) -> int:
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {
+            episode_kind:'chat_turn', conversation_id:$conversation_id
+        })
+        WHERE coalesce(e.deleted, false) = false
+        RETURN count(e) AS turn_count
+        """,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    return int(result.records[0]["turn_count"]) if result.records else 0
+
+
+async def fetch_persisted_turn_window(
+    graphiti,
+    *,
+    user_id: str,
+    conversation_id: str,
+    end_turn_index: int,
+    window_size: int = 10,
+    wait_timeout: float = 20.0,
+    poll_interval: float = 0.2,
+) -> list[dict[str, Any]]:
+    """Read an exact persisted turn window, waiting briefly for earlier async writes.
+
+    For end_turn_index=20 and window_size=10 the requested range is 11..20.
+    An incomplete window is returned only after timeout; callers should not build
+    a summary from it.
     """
-    Get current turn count for a conversation (for summary logic).
-    
-    Args:
-        graphiti: Graphiti instance
-        user_id: User identifier
-        conversation_id: Conversation identifier
-        
-    Returns:
-        Number of chat_turn episodes for this conversation
-    """
-    driver = graphiti.driver
-    
+    start_turn_index = max(1, end_turn_index - window_size + 1)
+    expected_count = end_turn_index - start_turn_index + 1
+    deadline = monotonic() + max(0.0, wait_timeout)
+
     query = """
-    MATCH (e:Episodic {
-        episode_kind: "chat_turn",
-        conversation_id: $conversation_id
+    MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {
+        episode_kind:'chat_turn', conversation_id:$conversation_id
     })
-    WHERE EXISTS((:User {user_id: $user_id})-[:AUTHORED]->(e))
-    RETURN count(e) AS turn_count
+    WHERE e.turn_index >= $start_turn_index
+      AND e.turn_index <= $end_turn_index
+      AND coalesce(e.deleted, false) = false
+    RETURN e.uuid AS uuid,
+           coalesce(e.content, e.episode_body, '') AS content,
+           e.turn_index AS turn_index
+    ORDER BY e.turn_index ASC
     """
-    
-    try:
-        result = await driver.execute_query(
+
+    while True:
+        result = await graphiti.driver.execute_query(
             query,
             user_id=user_id,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            start_turn_index=start_turn_index,
+            end_turn_index=end_turn_index,
         )
-        
-        if result.records:
-            return result.records[0]["turn_count"]
-        return 0
-    except Exception as e:
-        logger.error(f"Error getting conversation turn count: {e}", exc_info=e)
-        return 0
+        turns = [
+            {
+                "uuid": record["uuid"],
+                "content": record["content"] or "",
+                "turn_index": record["turn_index"],
+            }
+            for record in result.records
+        ]
+        if len(turns) == expected_count:
+            return turns
+        if monotonic() >= deadline:
+            logger.warning(
+                "Persisted summary window incomplete: conversation=%s expected=%d got=%d range=%d-%d",
+                conversation_id,
+                expected_count,
+                len(turns),
+                start_turn_index,
+                end_turn_index,
+            )
+            return turns
+        await asyncio.sleep(poll_interval)
 
+
+async def mark_turns_summarized(
+    graphiti,
+    *,
+    turn_uuids: list[str],
+    summary_uuid: str,
+) -> int:
+    if not turn_uuids:
+        return 0
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (e:Episodic)
+        WHERE e.uuid IN $turn_uuids
+        SET e.summarized = true,
+            e.summary_uuid = $summary_uuid
+        RETURN count(e) AS updated
+        """,
+        turn_uuids=turn_uuids,
+        summary_uuid=summary_uuid,
+    )
+    return int(result.records[0]["updated"]) if result.records else 0

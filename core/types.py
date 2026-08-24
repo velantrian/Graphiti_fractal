@@ -1,21 +1,12 @@
-"""
-Type definitions for the application.
-
-Centralizes all TypedDict and dataclass definitions.
-"""
+"""Central application types."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional, TypedDict
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Any, Dict, List, Optional, TypedDict
 
-
-# ============================================================================
-# Enums
-# ============================================================================
 
 class MemoryType(str, Enum):
-    """Memory layer types."""
     PERSONAL = "personal"
     PROJECT = "project"
     KNOWLEDGE = "knowledge"
@@ -23,7 +14,6 @@ class MemoryType(str, Enum):
 
 
 class EpisodeKind(str, Enum):
-    """Types of episodic memory entries."""
     CHAT_TURN = "chat_turn"
     CHAT_SUMMARY = "chat_summary"
     DOCUMENT = "document"
@@ -31,7 +21,6 @@ class EpisodeKind(str, Enum):
 
 
 class JobStage(str, Enum):
-    """Upload job stages."""
     PENDING = "pending"
     INGEST = "ingest"
     RATE_LIMITED = "rate_limited"
@@ -40,12 +29,7 @@ class JobStage(str, Enum):
     ERROR = "error"
 
 
-# ============================================================================
-# TypedDicts for API responses
-# ============================================================================
-
 class EpisodeDict(TypedDict, total=False):
-    """Episode data structure."""
     uuid: str
     content: str
     name: str
@@ -56,24 +40,18 @@ class EpisodeDict(TypedDict, total=False):
     episode_kind: str
     source_description: str
     created_at: Optional[str]
-    is_expanded: bool
-    hop: int
 
 
 class EntityDict(TypedDict, total=False):
-    """Entity data structure."""
     uuid: str
     name: str
     summary: str
     score: float
     type: str
     group_id: str
-    is_expanded: bool
-    hop: int
 
 
 class EdgeDict(TypedDict, total=False):
-    """Edge/relationship data structure."""
     uuid: str
     fact: str
     subject: Optional[str]
@@ -83,12 +61,9 @@ class EdgeDict(TypedDict, total=False):
     score: float
     type: str
     group_id: str
-    is_expanded: bool
-    hop: int
 
 
 class CommunityDict(TypedDict, total=False):
-    """Community data structure."""
     uuid: str
     name: str
     summary: str
@@ -98,7 +73,6 @@ class CommunityDict(TypedDict, total=False):
 
 
 class TimingProfile(TypedDict, total=False):
-    """Timing profile for operations."""
     chunking_time: float
     embedding_calls: int
     embedding_time: float
@@ -107,7 +81,6 @@ class TimingProfile(TypedDict, total=False):
 
 
 class JobTiming(TypedDict, total=False):
-    """Job timing information."""
     job_created_at: Optional[datetime]
     upload_request_started_at: Optional[datetime]
     ingest_started_at: Optional[datetime]
@@ -116,7 +89,6 @@ class JobTiming(TypedDict, total=False):
 
 
 class UploadJobStatus(TypedDict, total=False):
-    """Upload job status structure."""
     stage: str
     total_chunks: Optional[int]
     processed_chunks: int
@@ -130,33 +102,27 @@ class UploadJobStatus(TypedDict, total=False):
     attempt: int
 
 
-class IngestResult(TypedDict):
-    """Result of text ingestion."""
+class IngestResult(TypedDict, total=False):
     status: str
     added: int
+    skipped: int
     chunks: int
     elapsed: float
     warnings: List[str]
 
 
 class RememberResult(TypedDict, total=False):
-    """Result of remember operation."""
     status: str
     added: int
+    skipped: int
     chunks: int
     elapsed: float
     warnings: List[str]
-    skipped: bool
     reason: str
 
 
-# ============================================================================
-# Dataclasses for internal use
-# ============================================================================
-
 @dataclass
 class SearchResult:
-    """Structured result from memory search."""
     episodes: List[EpisodeDict] = field(default_factory=list)
     entities: List[EntityDict] = field(default_factory=list)
     edges: List[EdgeDict] = field(default_factory=list)
@@ -169,7 +135,6 @@ class SearchResult:
 
 @dataclass
 class ContextResult:
-    """Structured context for LLM queries."""
     text: str
     token_estimate: int
     sources: Dict[str, int] = field(default_factory=dict)
@@ -177,7 +142,6 @@ class ContextResult:
 
 @dataclass
 class ConversationMessage:
-    """Single conversation message."""
     role: str
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
@@ -185,50 +149,36 @@ class ConversationMessage:
 
 @dataclass
 class ConversationTurn:
-    """Complete conversation turn (user + assistant)."""
     user: str
     assistant: str
     turn_index: int = 0
 
 
-@dataclass 
+@dataclass
 class CacheEntry:
-    """Cache entry with TTL support."""
     value: Any
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    
+
     def is_expired(self, ttl_hours: int) -> bool:
-        """Check if entry has expired."""
-        from datetime import timedelta
-        now = datetime.now(timezone.utc)
         created = self.created_at
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        return (now - created) > timedelta(hours=ttl_hours)
+        return datetime.now(timezone.utc) - created > timedelta(hours=ttl_hours)
 
 
 @dataclass
 class EmbeddingCacheEntry:
-    """Embedding cache entry."""
     value: List[float] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    
+
     def is_expired(self, ttl_hours: int) -> bool:
-        """Check if entry has expired."""
-        from datetime import timedelta
-        now = datetime.now(timezone.utc)
         created = self.created_at
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        return (now - created) > timedelta(hours=ttl_hours)
+        return datetime.now(timezone.utc) - created > timedelta(hours=ttl_hours)
 
-
-# ============================================================================
-# Experience types
-# ============================================================================
 
 class ToolCallDict(TypedDict, total=False):
-    """Tool call data structure."""
     tool: str
     command: Optional[str]
     args: Optional[str]
@@ -239,7 +189,6 @@ class ToolCallDict(TypedDict, total=False):
 
 
 class TestRunDict(TypedDict, total=False):
-    """Test run data structure."""
     framework: str
     command: Optional[str]
     passed: bool
@@ -248,7 +197,6 @@ class TestRunDict(TypedDict, total=False):
 
 
 class ErrorEventDict(TypedDict, total=False):
-    """Error event data structure."""
     error_type: str
     message: Optional[str]
     stack: Optional[str]
@@ -256,12 +204,7 @@ class ErrorEventDict(TypedDict, total=False):
     line: Optional[int]
 
 
-# ============================================================================
-# Graph types
-# ============================================================================
-
 class GraphNodeDict(TypedDict, total=False):
-    """Generic graph node."""
     uuid: str
     name: str
     summary: str
@@ -272,7 +215,6 @@ class GraphNodeDict(TypedDict, total=False):
 
 
 class GraphEdgeDict(TypedDict, total=False):
-    """Generic graph edge."""
     uuid: str
     source_node_uuid: str
     target_node_uuid: str

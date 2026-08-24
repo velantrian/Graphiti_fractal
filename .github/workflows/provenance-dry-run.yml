@@ -1,0 +1,49 @@
+name: Legacy Provenance Dry-Run (Opt-In)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provenance-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NEO4J_URI: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_URI }}
+      NEO4J_USER: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_USER }}
+      NEO4J_PASSWORD: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_PASSWORD }}
+    steps:
+      - name: Require explicit legacy database secrets
+        shell: bash
+        run: |
+          test -n "$NEO4J_URI" || { echo 'FRACTAL_PROVENANCE_NEO4J_URI secret is required'; exit 2; }
+          test -n "$NEO4J_USER" || { echo 'FRACTAL_PROVENANCE_NEO4J_USER secret is required'; exit 2; }
+          test -n "$NEO4J_PASSWORD" || { echo 'FRACTAL_PROVENANCE_NEO4J_PASSWORD secret is required'; exit 2; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run provenance preview only
+        run: |
+          python scripts/provenance_migration.py | tee provenance-preview.json
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance-preview
+          path: provenance-preview.json
+          if-no-files-found: error
+          retention-days: 7

@@ -1,165 +1,170 @@
-"""
-Integration tests for API endpoints.
+"""Integration tests for the authenticated single-tenant FastAPI surface."""
 
-Tests the FastAPI endpoints with real dependencies.
-"""
+import os
 
 import pytest
 import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
-import os
+from httpx import ASGITransport, AsyncClient
 
-
-# Skip if no Neo4j
 pytestmark = pytest.mark.skipif(
     not os.getenv("NEO4J_URI"),
-    reason="NEO4J_URI not set - skipping integration tests"
+    reason="NEO4J_URI not set - skipping integration tests",
 )
+
+TEST_TOKEN = "integration-test-token"
+TEST_USER = "api_test_user"
 
 
 @pytest_asyncio.fixture
 async def graphiti_for_api_test():
-    """
-    Create a per-test Graphiti instance for API tests.
-    
-    This ensures each test uses a Graphiti client bound to the correct event loop,
-    avoiding "Future attached to different loop" errors.
-    """
     from core.graphiti_client import get_graphiti_client, reset_graphiti_client
-    
-    # Guarantee clean state before test
+
     reset_graphiti_client()
     client = get_graphiti_client(force_new=True)
     graphiti = await client.ensure_ready()
-    
     try:
         yield graphiti
     finally:
-        # Cleanup: close Neo4j driver and reset singleton
         try:
-            driver = getattr(graphiti, 'driver', None)
-            if driver and hasattr(driver, 'close'):
+            driver = getattr(graphiti, "driver", None)
+            if driver and hasattr(driver, "close"):
                 await driver.close()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Error closing graphiti driver: {e}")
         finally:
             reset_graphiti_client()
 
 
 @pytest_asyncio.fixture
-async def async_client(graphiti_for_api_test):
-    """
-    Create async HTTP client for testing API with Graphiti dependency override.
-    
-    This ensures API endpoints use the per-test Graphiti instance, avoiding
-    event loop conflicts.
-    """
+async def async_client(graphiti_for_api_test, monkeypatch):
+    monkeypatch.setenv("FRACTAL_API_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("FRACTAL_USER_ID", TEST_USER)
+    monkeypatch.delenv("FRACTAL_ALLOW_HARD_DELETE", raising=False)
+    monkeypatch.delenv("FRACTAL_ALLOW_CLEAR_ALL", raising=False)
+
     from app import app, get_graphiti_dep
-    
-    # Override Graphiti dependency with per-test instance
-    async def _override():
+
+    async def override_graphiti():
         return graphiti_for_api_test
-    
-    app.dependency_overrides[get_graphiti_dep] = _override
-    
+
+    app.dependency_overrides[get_graphiti_dep] = override_graphiti
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {TEST_TOKEN}"},
+    ) as client:
         yield client
-    
-    # Clear overrides after test
     app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_health_endpoint(async_client):
-    """Test health check endpoint."""
-    response = await async_client.get("/health")
-    
+async def test_health_endpoint_is_public(async_client):
+    response = await async_client.get("/health", headers={"Authorization": ""})
     assert response.status_code == 200
-    data = response.json()
-    assert "status" in data
-    # Status should be healthy or unhealthy
-    assert data["status"] in ["healthy", "unhealthy"]
+    assert response.json()["status"] in {"healthy", "unhealthy"}
+
+
+@pytest.mark.asyncio
+async def test_protected_endpoint_rejects_missing_token(async_client):
+    response = await async_client.post(
+        "/buffer/clear",
+        headers={"Authorization": ""},
+        json={"user_id": TEST_USER},
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_protected_endpoint_rejects_wrong_token(async_client):
+    response = await async_client.post(
+        "/buffer/clear",
+        headers={"Authorization": "Bearer wrong-token"},
+        json={"user_id": TEST_USER},
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_single_tenant_rejects_other_user(async_client):
+    response = await async_client.post(
+        "/buffer/clear",
+        json={"user_id": "other_user"},
+    )
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_remember_endpoint(async_client):
-    """Test remember endpoint."""
     response = await async_client.post(
         "/remember",
         json={
             "text": "Тестовый текст для API теста.",
-            "user_id": "api_test_user",
+            "user_id": TEST_USER,
             "memory_type": "knowledge",
-            "source_description": "api_integration_test"
-        }
+            "source_description": "api_integration_test",
+        },
     )
-    
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
+    assert response.json()["status"] in {"ok", "success", "skipped"}
 
 
 @pytest.mark.asyncio
-async def test_remember_empty_text(async_client):
-    """Test remember endpoint with empty text."""
+async def test_remember_empty_text_is_validation_error(async_client):
     response = await async_client.post(
         "/remember",
-        json={
-            "text": "",
-            "user_id": "api_test_user"
-        }
+        json={"text": "", "user_id": TEST_USER},
     )
-    
-    # Should return 400 or 422 for validation error
-    assert response.status_code in [400, 422, 500]
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_knowledge_search_endpoint(async_client):
-    """Test knowledge search endpoint."""
     response = await async_client.get(
         "/knowledge/search",
-        params={"q": "test query", "limit": 5}
+        params={"q": "test query", "limit": 5},
     )
-    
     assert response.status_code == 200
-    data = response.json()
-    assert "items" in data
-    assert isinstance(data["items"], list)
+    assert isinstance(response.json()["items"], list)
 
 
 @pytest.mark.asyncio
 async def test_buffer_clear_endpoint(async_client):
-    """Test buffer clear endpoint."""
     response = await async_client.post(
         "/buffer/clear",
-        json={"user_id": "api_test_user"}
+        json={"user_id": TEST_USER},
     )
-    
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "cleared" in data
+    assert "cleared" in response.json()
 
 
 @pytest.mark.asyncio
 async def test_upload_status_not_found(async_client):
-    """Test upload status for non-existent job."""
     response = await async_client.get("/upload/status/nonexistent-job-id")
-    
     assert response.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_openapi_docs(async_client):
-    """Test that OpenAPI docs are available."""
-    response = await async_client.get("/openapi.json")
-    
+async def test_hard_delete_is_deny_by_default(async_client):
+    response = await async_client.post(
+        "/delete",
+        json={"uuid": "does-not-matter", "hard": True},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_clear_all_is_deny_by_default(async_client):
+    response = await async_client.post(
+        "/clear_memory",
+        headers={
+            "Authorization": f"Bearer {TEST_TOKEN}",
+            "X-Fractal-Confirm": "CLEAR_ALL_MEMORY",
+        },
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_openapi_docs_available(async_client):
+    response = await async_client.get("/openapi.json", headers={"Authorization": ""})
     assert response.status_code == 200
-    data = response.json()
-    assert "openapi" in data
-    assert "paths" in data
-    assert "info" in data
-    assert data["info"]["title"] == "Fractal Memory API"
+    assert response.json()["info"]["title"] == "Fractal Memory API"

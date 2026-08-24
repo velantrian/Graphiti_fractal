@@ -1,6 +1,6 @@
-graphiti_core>=0.24.3
+graphiti_core==0.29.3
 python-dotenv>=1.0.0
-neo4j>=5.15.0
+neo4j>=5.26.0,<6.0.0
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pydantic>=2.4.0
