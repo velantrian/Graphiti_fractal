@@ -6,7 +6,7 @@ Fractal Memory — локальная single-tenant система памяти 
 
 ```text
 Web UI ─┐
-HTTP API ├─> MemoryOps ─> Graphiti ─> Neo4j
+HTTP API ├─> MemoryOps ─> Graphiti ─> Neo4j 5.26 LTS
 MCP stdio┤       │             │
 CLI ─────┘       │             └─ explicit OpenAI model policy
                  ├─ canonical ingest: knowledge/ingest.py
@@ -24,32 +24,31 @@ CLI ─────┘       │             └─ explicit OpenAI model policy
 - post-processing эпизодов адресуется по точному UUID, а не по совпадающему тексту;
 - hard delete и full clear выключены по умолчанию;
 - embedding failure не подменяется нулевым вектором;
-- упоминание AI-модели в исторических документах не означает, что она является текущим runtime default или поддерживаемым provider adapter.
+- упоминание AI-модели/технологии в historical/research документации не означает runtime support или adoption.
 
 ## 📦 Baseline
 
 - Python: **3.10+** (always-on CI: 3.10 и 3.12)
 - `graphiti_core==0.29.3`
-- Neo4j: `>=5.26,<6`
+- Neo4j: **5.26 LTS**, Docker pinned to `5.26.29-community`
 - FastAPI + Uvicorn
+
+Neo4j pin обновлён с плавающего `5.26-community` до `5.26.29-community` как patch-level security hardening внутри той же LTS-линии. Переход на другую major/calendar-version family требует отдельной Graphiti compatibility проверки.
 
 ## 🤖 AI model policy
 
 **Current-policy snapshot: 2026-08-24.** Активные defaults централизованы в `core/model_policy.py`, чтобы чат и внутренний Graphiti ingestion не расходились по скрытым model defaults.
 
-| Workload | Default |
-|---|---|
-| Interactive chat | `gpt-5.6-terra` |
-| General / summary synthesis | `gpt-5.6-luna` |
-| Graphiti main extraction/reasoning | `gpt-5.6-terra` |
-| Graphiti small-model prompts | `gpt-5.6-luna` |
-| Embeddings | `text-embedding-3-small` |
+| Workload | Default | Role |
+|---|---|---|
+| Interactive chat | `gpt-5.6-terra` | основной hosted answer worker |
+| Graphiti extraction/reasoning | `gpt-5.6-terra` | entity/relation extraction и structured reasoning |
+| General / summary synthesis | `gpt-5.6-luna` | дешёвый bounded synthesis lane |
+| Graphiti small-model prompts | `gpt-5.6-luna` | small structured prompt lane |
+| Embeddings | `text-embedding-3-small` | semantic vector representation |
+| Frontier escalation | `gpt-5.6-sol` via env | сложные review/research/coding задачи, opt-in |
 
-Terra используется как сбалансированный основной уровень, Luna — для более дешёвых bounded summary/small-model workload. Более мощную модель можно выбрать через env без изменения кода.
-
-Текущий first-class provider path в Fractal — **OpenAI**. Claude, Gemini, DeepSeek, Qwen, Grok и другие семейства могут упоминаться в документации как часть истории/экосистемы, но такое упоминание **не означает наличие runtime adapter**.
-
-История переходов от GPT-4 / GPT-4o mini и параллельное развитие Claude, Gemini, DeepSeek, Qwen и Grok сохранены в [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md). Старые названия не удаляются из historical Day-документов: они остаются временными снимками развития проекта.
+Текущий first-class provider path — **OpenAI**. Claude, Gemini, DeepSeek, Qwen и Grok документированы не просто по названиям, а по их реальным ролям/архитектурным особенностям в [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md). Там же отдельно разобраны **MoE, KV cache, prefix/prompt caching** и граница между inference cache и durable memory.
 
 > Embedding model намеренно не меняется автоматически вместе с chat/LLM model: такая замена меняет identity векторного индекса и должна быть отдельным reindex/migration решением.
 
@@ -66,6 +65,29 @@ EMBEDDING_MODEL=text-embedding-3-small
 ```
 
 Приоритет локального chat/summary выбора: `<CONTEXT>_OPENAI_MODEL` → `OPENAI_MODEL` → `core/model_policy.py`.
+
+## 🧱 Technology-role map
+
+Fractal не считает все AI/data технологии взаимозаменяемыми:
+
+| Technology | Role | Status here |
+|---|---|---|
+| Graphiti | temporal/episodic knowledge-graph memory semantics | **ACTIVE** |
+| Neo4j | durable property-graph persistence | **ACTIVE** |
+| SQLite | embedded relational/local operational state | **DEFERRED** |
+| PostgreSQL | relational transactional/product state | **ADJACENT** |
+| pgvector | vectors inside PostgreSQL | **ADJACENT** |
+| classic RAG | retrieve context → generate | **CONCEPTUAL BASELINE** |
+| GraphRAG | graph/community-aware local/global retrieval | **RESEARCH** |
+| KAG | knowledge-structured/hybrid reasoning | **RESEARCH** |
+| CAG | reuse bounded corpus through long context/KV state | **RESEARCH** |
+| KV/prefix/prompt cache | inference prefill/compute reuse | **INFERENCE LAYER** |
+
+Подробная evidence-backed карта, current versions, история и решения `ACTIVE / ADJACENT / RESEARCH / DEFERRED` находятся в [`docs/TECHNOLOGY_EVOLUTION.md`](docs/TECHNOLOGY_EVOLUTION.md).
+
+Ключевая граница:
+
+> **retrieval ≠ evidence; cache ≠ persistence; graph ≠ truth; newer technology ≠ required dependency.**
 
 ## 🚀 Быстрый запуск
 
@@ -166,6 +188,8 @@ RAM conversation buffer используется только как кратк�
 - **L1** — недавние episodic results из canonical scoped retrieval с реальным `--hours` window.
 - **L2** — Graphiti Communities через `(:Community)-[:HAS_MEMBER]->(:Entity)`.
 - **L3** — bounded LLM synthesis из L2 context; отдельный legacy direct-Cypher consolidator удалён.
+
+GraphRAG/KAG/CAG не являются дополнительными active pipelines. Их идеи допускаются только как отдельные измеримые research experiments поверх существующих boundaries.
 
 ```bash
 python main.py l1 --query "Fractal Memory" --hours 24
@@ -283,10 +307,11 @@ Green core CI означает только прохождение этих ко
 
 Этот `README.md` описывает **current runtime contract**.
 
-- [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md) — current model-policy explanation + historical evolution record.
+- [`docs/AI_MODEL_EVOLUTION.md`](docs/AI_MODEL_EVOLUTION.md) — роли GPT/Claude/Gemini/DeepSeek/Qwen/Grok, MoE, cache/inference architecture и model history.
+- [`docs/TECHNOLOGY_EVOLUTION.md`](docs/TECHNOLOGY_EVOLUTION.md) — роли/история Graphiti, Neo4j, SQLite, PostgreSQL, pgvector, RAG, GraphRAG, KAG, CAG и KV/prefix cache.
 - `docs/Day_*`, старые master plans и refactoring notes — исторические материалы развития проекта.
 
-Исторические документы полезны как история решений, включая старые названия моделей вроде GPT-4/GPT-4o mini, но не являются authoritative описанием текущего runtime. При конфликте ориентируйся на README + `core/model_policy.py` + текущий код + CI contracts.
+Исторические документы полезны как история решений, но не являются authoritative описанием текущего runtime. При конфликте ориентируйся на README + `core/model_policy.py` + текущий код + CI contracts.
 
 ## ⚠️ Known bounded limitations
 
@@ -295,4 +320,5 @@ Green core CI означает только прохождение этих ко
 - post-processing после `Graphiti.add_episode()` не является одной Neo4j transaction с внутренней Graphiti ingestion;
 - concurrent exact-duplicate race между pre-check и завершением Graphiti write полностью не устранён;
 - first-class provider path в этом репозитории пока OpenAI-only;
+- GraphRAG/KAG/CAG/PostgreSQL/pgvector/local-MoE являются research/adjacent technologies, не скрытыми active dependencies;
 - LLM/Neo4j integration tier требует внешние сервисы и не входит в always-on core CI.
