@@ -1,155 +1,251 @@
-# Fractal Memory v2 — Graphiti-first (единый entrypoint)
+# 🧠 Fractal Memory — Graphiti-native local memory service
 
-Проект использует Graphiti как единственную точку входа к Neo4j и собирает три слоя памяти (L1–L3) с визуализацией и бенчмарками. Все операции запускаются через один CLI `main.py`.
+Fractal Memory — локальная single-tenant система памяти для AI-agent/assistant поверх **Graphiti + Neo4j**. Проект не строит второй graph engine: Graphiti отвечает за графовую/temporal модель, а Fractal добавляет bounded ingestion, namespace-scoped retrieval, chat persistence, HTTP/MCP/CLI surfaces и L1–L3 views.
 
-## Структура
-- `core/` — обёртки Graphiti, кастомные сущности.
-- `layers/` — L1/L2/L3 построение контекста.
-- `queries/` — стратегии поиска, quality check, context builder.
-- `visualization/` — экспорт графа и HTML c D3.js.
-- `benchmarks/` — скрипты производительности.
-- `tests/` — smoke-тесты импорта/структуры.
+## 🧭 Current architecture
 
-## Требования
-- Python 3.10+
-- Docker Neo4j с включёнными индексами
-- Переменные окружения: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `OPENAI_API_KEY`, опционально `NEO4J_DATABASE` (см. `.env.example`)
-
-## Установка
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+```text
+Web UI ─┐
+HTTP API ├─> MemoryOps ─> Graphiti ─> Neo4j
+MCP stdio┤       │
+CLI ─────┘       ├─ canonical ingest: knowledge/ingest.py
+                 └─ scoped retrieval: one search per group_id -> app-layer fusion
 ```
 
-## Основные команды
+Основные инварианты:
+
+- один локальный владелец задаётся `FRACTAL_USER_ID`;
+- HTTP data routes закрыты Bearer-token `FRACTAL_API_TOKEN`;
+- `personal`, `project`, `knowledge`, `experience` — отдельные `group_id` namespaces;
+- multi-namespace retrieval выполняет отдельный Graphiti search в каждом namespace и объединяет результаты на уровне приложения;
+- cross-namespace `SAME_AS` bridges не создаются и не используются active retrieval path;
+- text ingestion проходит через один Graphiti-native pipeline (`knowledge/ingest.py`);
+- post-processing эпизодов адресуется по точному UUID, а не по совпадающему тексту;
+- hard delete и full clear выключены по умолчанию;
+- embedding failure не подменяется нулевым вектором.
+
+## 📦 Baseline
+
+- Python: **3.10+** (always-on CI: 3.10 и 3.12)
+- `graphiti_core==0.29.3`
+- Neo4j: `>=5.26,<6`
+- FastAPI + Uvicorn
+
+## 🚀 Быстрый запуск
+
 ```bash
-# Инициализация индексов/констрейнтов
-python main.py setup
+cp .env.example .env
+# Заполни NEO4J_PASSWORD, OPENAI_API_KEY, FRACTAL_API_TOKEN.
 
-# Загрузить демо-эпизоды и сущности
-python main.py seed
-
-# Отчёт по качеству графа
-python main.py quality
-
-# Демонстрация стратегий поиска
-python main.py search-demo
-
-# Контекст для сущности
-python main.py context "Fractal Memory" --size full
-
-# Слои памяти
-python main.py l1 --query "Fractal Memory" --hours 24
-python main.py l2 "Sergey"  # Uses Graphiti Communities
-python main.py l3 "Fractal Memory"  # Uses LLM Synthesis
-
-# Ingest Architecture (Self-Awareness)
-python scripts/ingest_manifest.py
-
-# Визуализация и бенчмарки
-python main.py viz-export --output visualization/graph_data.json
-python main.py benchmark
-
-# Очистка графа
-python main.py clear
-
-# Web API + статический чат
-python -m uvicorn app:app --host 0.0.0.0 --port 8000
-# UI: http://localhost:8000/static/index.html
-```
-
-## MCP (Cursor) — локальный запуск на Windows (stdio)
-Важно: **stdio MCP запускается на том компьютере, где запущен Cursor**. Поэтому если Cursor у тебя на Windows‑ПК, то и MCP‑процесс будет стартовать на Windows (даже если раньше ты открывал проект по SSH).
-
-### Как подключить MCP в Cursor
-- **1) Подготовь окружение в корне проекта**:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-- **2) Укажи Cursor запуск через `run_mcp_server.cmd`**:
-  - Файл‑шаблон: `mcp.json.example`
-  - В Cursor → **Tools & MCP** → Add MCP Server → stdio:
-    - `command`: `cmd.exe`
-    - `args`: `["/c", "C:\\PATH\\TO\\Graphiti_fractal\\run_mcp_server.cmd"]`
-
-### Нужно ли держать PowerShell открытым?
-- **Нет**, в обычной работе **не нужно**. MCP‑процесс поднимает и контролирует **сам Cursor**.
-- Вручную запускать `run_mcp_server.cmd` имеет смысл только для быстрой диагностики “стартует ли сервер”.
-
-HTML для D3.js: `visualization/visualization.html` (использует `visualization/graph_data.json`).
-
-## Docker (Neo4j + app)
-```bash
-# собрать контейнеры
 docker compose build
-
-# поднять Neo4j и app-контейнер (app ждёт, можно exec внутрь)
 docker compose up -d
+```
 
-# войти в app-контейнер и выполнить команды
-docker compose exec app bash
+Docker публикует сервисы только на localhost:
+
+- Web/API: `http://127.0.0.1:8000`
+- Neo4j Browser: `http://127.0.0.1:7474`
+- Bolt: `127.0.0.1:7687`
+
+Открой `http://127.0.0.1:8000/`. UI попросит `FRACTAL_API_TOKEN` и хранит его только в `sessionStorage` текущей вкладки.
+
+### Локальный Python
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python main.py setup
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+## 🔐 Environment
+
+Минимально необходимые значения:
+
+```env
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<strong-password>
+OPENAI_API_KEY=<key>
+FRACTAL_API_TOKEN=<long-random-token>
+FRACTAL_USER_ID=sergey
+```
+
+Destructive operations остаются выключенными:
+
+```env
+FRACTAL_ALLOW_HARD_DELETE=0
+FRACTAL_ALLOW_CLEAR_ALL=0
+```
+
+Для HTTP API передавай:
+
+```text
+Authorization: Bearer <FRACTAL_API_TOKEN>
+```
+
+`/health`, корневой UI и static visualization доступны без токена; data-bearing routes требуют токен.
+
+## 🧠 Memory model
+
+| Namespace | Назначение |
+|---|---|
+| `personal` | локальная память владельца/диалога |
+| `project` | архитектура, проекты, технические решения |
+| `knowledge` | общие знания и документы |
+| `experience` | структурированный опыт выполнения задач |
+
+`MemoryOps.search_memory()` не делает общий unscoped query. Для нескольких namespaces выполняются отдельные bounded searches, после чего результаты объединяются и сортируются в приложении.
+
+### Ingestion
+
+`knowledge/ingest.py` — единственный canonical text-ingest path:
+
+```text
+text
+ -> semantic chunks
+ -> namespace-scoped exact duplicate check
+ -> Graphiti.add_episode()
+ -> exact episode UUID
+ -> fingerprint / authorship / optional embedding by UUID
+```
+
+Одинаковый текст в разных `group_id` не считается автоматически одним и тем же memory object.
+
+## 💬 Chat persistence
+
+`SimpleChatAgent` имеет один answer path.
+
+После ответа turn сохраняется best-effort background task через общий task registry. `turn_index` выделяется атомарно в Neo4j и не имеет fallback `1` при ошибке. На каждом 10-м turn summary строится только после чтения **10 реально persisted chat_turn UUIDs**; эти UUID затем явно отмечаются как summarized.
+
+RAM conversation buffer используется только как краткий L0 context и не является источником идентичности persisted turns.
+
+## 🪜 L1 / L2 / L3
+
+- **L1** — недавние episodic results из canonical scoped retrieval с реальным `--hours` window.
+- **L2** — Graphiti Communities через `(:Community)-[:HAS_MEMBER]->(:Entity)`.
+- **L3** — bounded LLM synthesis из L2 context; отдельный legacy direct-Cypher consolidator удалён.
+
+```bash
+python main.py l1 --query "Fractal Memory" --hours 24
+python main.py l2 "Graphiti"
+python main.py l3-build "Graphiti"
+python main.py l3 "Graphiti"
+```
+
+## 🛠️ CLI
+
+```bash
 python main.py setup
 python main.py seed
 python main.py quality
-# запустить веб-API
-python -m uvicorn app:app --host 0.0.0.0 --port 8000
-# открыть http://localhost:8000/static/index.html
+python main.py search-demo
+python main.py context "Graphiti" --size full
+python main.py benchmark
 ```
 
-Порты:
-- Neo4j Browser: http://localhost:7474 (bolt 7687)
-- Web chat: http://localhost:8000/static/index.html
+Destructive/cleanup commands fail safer:
 
-Данные Neo4j сохраняются в `./neo4j/data`.
+```bash
+# Только dry-run:
+python main.py dedupe-entities
+python main.py dedupe-episodes
 
-## Maintenance Scripts
-Скрипты для обслуживания графа и исправления данных:
+# Явно применить soft-delete/merge:
+python main.py dedupe-entities --apply
+python main.py dedupe-episodes --apply
 
-*   `scripts/audit_authorship.py` — Проверка целостности связей авторства (`[:AUTHORED]`) и идентификации (`[:IS]`).
-*   `scripts/backfill_authored_edges.py` — Автоматическое создание связей авторства для эпизодов.
-*   `scripts/seed_identity.py` — Создание семантической сущности пользователя.
-*   `scripts/generate_project_map.py` — Анализ структуры проекта (создает JSON карту).
-*   `scripts/json_to_markdown_manifest.py` — Конвертация карты проекта в Markdown манифест.
-*   `scripts/ingest_manifest.py` — Загрузка манифеста архитектуры в память (Self-Awareness).
+# Hard purge уже soft-deleted episodes — только явно:
+python main.py dedupe-episodes --apply --purge-deleted-days 7
 
-## Связность графа (Namespacing & Search)
-Проект использует строгую изоляцию данных через `group_id` (Namespaces):
-- `personal`: Личные факты о пользователе.
-- `project`: Техническая информация о проекте (код, архитектура).
-- `knowledge`: Общие знания.
-- `experience`: Опыт выполнения задач.
-
-**Важно**: Мы отказались от автоматического создания связей `[:SAME_AS]` между разными `group_id`.
-Вместо "сшивки" графа используется **Multi-Namespace Search**: агент ищет информацию одновременно во всех нужных группах и объединяет результаты на уровне приложения (RRF Hybrid Search).
-
-### Полезные Cypher-запросы для мониторинга:
-
-**А. Статистика по группам (Namespaces):**
-```cypher
-MATCH (e:Entity)
-RETURN e.group_id, count(e) as count
-ORDER BY count DESC
+# Полная очистка требует точного подтверждения:
+python main.py clear --confirm CLEAR_ALL_MEMORY
 ```
 
-**Б. Топ "мостовых" сущностей:**
-```cypher
-MATCH (e:Entity)-[r:SAME_AS]-(other)
-RETURN e.name, e.group_id, count(r) as connections, collect(other.group_id) as linked_groups
-ORDER BY connections DESC
-LIMIT 10
+## 🔌 MCP
+
+Локальный stdio server:
+
+```bash
+python -m mcp_server
 ```
 
-**В. Проверка cross-layer retrieval (1-hop):**
-```cypher
-MATCH (e:Entity {name: "Graphiti"}) 
-MATCH (e)-[:SAME_AS]-(neighbor)
-OPTIONAL MATCH (neighbor)-[r:RELATES_TO]->(target)
-RETURN e.group_id, neighbor.group_id, type(r), target.name
-LIMIT 20
+Windows/Cursor может использовать `run_mcp_server.cmd` и `mcp.json.example`.
+
+Current MCP tools:
+
+- `memory.search_knowledge`
+- `memory.search_experience`
+- `memory.remember`
+- `memory.upload`
+- `memory.delete`
+
+MCP writes всегда относятся к настроенному `FRACTAL_USER_ID`; клиент не выбирает произвольного владельца. Hard delete требует отдельного `FRACTAL_ALLOW_HARD_DELETE=1`.
+
+## 🕸️ Visualization
+
+```bash
+python main.py viz-export
 ```
 
-Для полной диагностики используйте `python scripts/graph_health.py`.
+Генерируется ignored runtime-artifact `static/graph_data.json`. Viewer доступен через UI или `http://127.0.0.1:8000/visualization/visualization.html`.
+
+## 🧪 Tests / CI
+
+Always-on CI запускается на Python 3.10 и 3.12 и проверяет:
+
+- compile active Python surface;
+- MCP initialize + exact tool contract;
+- fail-closed API auth;
+- namespace-safe dedupe contracts;
+- embedding fail-closed behavior;
+- buffer clear contract;
+- normalization/entities/experience hash unit tests.
+
+```bash
+pytest -q \
+  tests/test_mcp_smoke.py \
+  tests/test_security_contract.py \
+  tests/test_dedupe_contract.py \
+  tests/test_embedding_fail_closed.py \
+  tests/test_buffer_clear_feature.py \
+  tests/test_normalization.py \
+  tests/test_entities.py \
+  tests/test_experience_hash.py
+```
+
+Real Neo4j/OpenAI ingestion tests являются отдельным opt-in tier:
+
+```bash
+RUN_LLM_INGEST_TESTS=1 pytest -q tests/integration/test_chat_persistence.py
+```
+
+Green core CI означает только прохождение этих контрактов; он не заменяет live Neo4j/OpenAI integration validation.
+
+## 🧹 Repository policy
+
+Не коммитятся:
+
+- `__pycache__`, `.pyc`;
+- `.vscode`, local env/venv;
+- Neo4j data/log/import/plugins;
+- runtime `.log`;
+- embedding cache;
+- generated graph JSON.
+
+Ручные HTTP smoke tools находятся в `scripts/`, а не в `tests/`, чтобы pytest не собирал их как тестовые функции.
+
+## 📚 Documentation status
+
+Этот `README.md` описывает **current runtime contract**.
+
+Файлы `docs/Day_*`, старые master plans и refactoring notes — исторические материалы развития проекта. Они полезны как история решений, но не являются authoritative описанием текущего runtime. При конфликте ориентируйся на README + текущий код + CI contracts.
+
+## ⚠️ Known bounded limitations
+
+- сервис намеренно single-tenant/local, не multi-user SaaS;
+- upload-job status хранится process-local и исчезает после restart;
+- post-processing после `Graphiti.add_episode()` не является одной Neo4j transaction с внутренней Graphiti ingestion;
+- concurrent exact-duplicate race между pre-check и завершением Graphiti write полностью не устранён;
+- LLM/Neo4j integration tier требует внешние сервисы и не входит в always-on core CI.
