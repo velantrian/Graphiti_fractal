@@ -49,7 +49,14 @@ async def require_api_token(authorization: str | None = Header(default=None)) ->
         raise HTTPException(status_code=401, detail="invalid or missing bearer token")
 
 
-def _owner(requested_user_id: str) -> str:
+def _owner(requested_user_id: str | None = None) -> str:
+    """Use the configured owner unless a caller explicitly supplies an identity.
+
+    Explicit identity remains useful for API clients and tests, but it may never
+    select a different tenant. Browser UI and MCP do not need to know the owner id.
+    """
+    if requested_user_id is None:
+        return get_instance_user_id()
     try:
         return require_instance_user_id(requested_user_id)
     except PermissionError as exc:
@@ -127,7 +134,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
-    user_id: str = Field(..., min_length=1)
+    user_id: str | None = Field(default=None, min_length=1)
 
 
 class ChatResponse(BaseModel):
@@ -137,14 +144,14 @@ class ChatResponse(BaseModel):
 
 
 class BufferClearRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
+    user_id: str | None = Field(default=None, min_length=1)
 
 
 class RememberRequest(BaseModel):
     text: str = Field(..., min_length=1)
     source_description: str | None = None
     memory_type: Literal["personal", "project", "knowledge", "experience"] | None = None
-    user_id: str = Field(..., min_length=1)
+    user_id: str | None = Field(default=None, min_length=1)
 
 
 class DeleteRequest(BaseModel):
@@ -276,9 +283,9 @@ async def upload_file(
     file: UploadFile = File(...),
     source_description: str = Form("uploaded_file"),
     memory_type: Literal["personal", "project", "knowledge", "experience"] = Form("knowledge"),
-    user_id: str = Form(...),
+    user_id: str | None = Form(None),
 ):
-    user_id = _owner(user_id)
+    owner = _owner(user_id)
     raw = await file.read()
     max_upload_bytes = int(os.getenv("FRACTAL_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
     if not raw:
@@ -298,7 +305,7 @@ async def upload_file(
         job["timing"]["upload_request_started_at"] = datetime.now(timezone.utc)
 
     spawn(
-        run_ingest_job(job_id, content, source_description, memory_type, user_id),
+        run_ingest_job(job_id, content, source_description, memory_type, owner),
         name=f"upload:{job_id}",
     )
     return {"job_id": job_id}
@@ -471,7 +478,6 @@ async def diagnose_memory_conflicts(entity_name: str, limit: int = 20):
     )
     return {
         "entity_name": entity_name,
-        "owner": get_instance_user_id(),
         "entities_found": [
             {
                 "name": record["entity_name"],
