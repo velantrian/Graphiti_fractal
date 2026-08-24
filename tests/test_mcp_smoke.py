@@ -67,6 +67,11 @@ def test_mcp_initialize_and_tools_contract():
         names = {tool["name"] for tool in tools}
         assert names == EXPECTED_TOOLS
         assert len(tools) == len(EXPECTED_TOOLS)
+
+        by_name = {tool["name"]: tool for tool in tools}
+        for write_tool in ("memory.remember", "memory.upload"):
+            properties = by_name[write_tool]["inputSchema"].get("properties", {})
+            assert "user_id" not in properties, "MCP must not allow caller-selected owner identity"
     finally:
         process.terminate()
         process.wait(timeout=5)
