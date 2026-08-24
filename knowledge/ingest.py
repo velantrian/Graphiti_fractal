@@ -7,6 +7,13 @@ from time import perf_counter
 from core.config import get_config
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
+from core.ingest_atomicity import (
+    acquire_ingest_claim,
+    finalize_episode_identity,
+    mark_ingest_claim_episode_created,
+    mark_ingest_claim_failed,
+    release_ingest_claim,
+)
 from core.text_utils import fingerprint, split_into_semantic_chunks
 
 logger = logging.getLogger(__name__)
@@ -290,12 +297,12 @@ async def ingest_text_document(
 ) -> dict:
     """Canonical Graphiti-native text ingestion path.
 
-    Documents are split into bounded semantic chunks. Each chunk is written once
-    through Graphiti, then post-processing is addressed strictly by the returned
-    episode UUID. Exact duplicate checks are scoped to the target group_id.
+    A unique Fractal ingest claim is acquired before Graphiti writes. This closes
+    concurrent same-group/fingerprint races at the app boundary. Graphiti still
+    owns its internal transaction; after it returns the exact episode UUID,
+    fingerprint/group/authorship are finalized atomically in one Cypher query.
     """
     from api.jobs import update_upload_job
-    from core.authorship import attach_author
     from core.rate_limit_retry import with_rate_limit_retry
     from core.safe_graphiti import filter_graphiti_results
 
@@ -343,9 +350,22 @@ async def ingest_text_document(
             if total_chunks > 1
             else source_description
         )
+        claim_token: str | None = None
+        episode_uuid: str | None = None
 
         try:
             if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id):
+                skipped_count += 1
+                if job_id:
+                    update_upload_job(job_id, processed_chunks=index, stage="ingest")
+                continue
+
+            claim_token = await acquire_ingest_claim(
+                graphiti,
+                group_id=group_id,
+                fingerprint=chunk_fp,
+            )
+            if not claim_token:
                 skipped_count += 1
                 if job_id:
                     update_upload_job(job_id, processed_chunks=index, stage="ingest")
@@ -381,23 +401,20 @@ async def ingest_text_document(
                 raise RuntimeError("Graphiti add_episode returned no episode UUID")
             episode_uuid = str(episode_uuid)
 
-            await set_fingerprint(
+            await mark_ingest_claim_episode_created(
                 graphiti,
-                chunk_fp,
+                group_id=group_id,
+                fingerprint=chunk_fp,
+                token=claim_token,
+                episode_uuid=episode_uuid,
+            )
+            await finalize_episode_identity(
+                graphiti,
                 episode_uuid=episode_uuid,
                 group_id=group_id,
-            )
-
-            if user_id:
-                await attach_author(episode_uuid, user_id)
-
-            # Graphiti receives group_id during add_episode. Reassert by UUID only;
-            # never update all episodes sharing the same text.
-            await set_group_id(
-                graphiti,
-                None,
-                group_id,
-                episode_uuid=episode_uuid,
+                fingerprint=chunk_fp,
+                claim_token=claim_token,
+                user_id=user_id,
             )
 
             try:
@@ -420,6 +437,25 @@ async def ingest_text_document(
 
             added_count += 1
         except Exception as exc:  # noqa: BLE001
+            if claim_token:
+                try:
+                    if episode_uuid:
+                        await mark_ingest_claim_failed(
+                            graphiti,
+                            group_id=group_id,
+                            fingerprint=chunk_fp,
+                            token=claim_token,
+                            error_type=type(exc).__name__,
+                        )
+                    else:
+                        await release_ingest_claim(
+                            graphiti,
+                            group_id=group_id,
+                            fingerprint=chunk_fp,
+                            token=claim_token,
+                        )
+                except Exception:  # preserve original ingest error
+                    logger.exception("Failed to settle ingest claim after chunk error")
             logger.exception("Ingest chunk %d/%d failed", index, total_chunks)
             errors.append(f"Chunk {index}: {type(exc).__name__}: {exc}")
 
