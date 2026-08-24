@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.embedder.client import EmbedderClient
+from graphiti_core.llm_client import LLMConfig, OpenAIClient
 from neo4j.exceptions import ClientError
 
 from core.config import get_config
@@ -53,10 +54,20 @@ class GraphitiClient:
     """Lazy Graphiti wrapper with idempotent schema initialization."""
 
     def __init__(self, uri: str, user: str, password: str):
+        config = get_config()
+        llm_client = OpenAIClient(
+            config=LLMConfig(
+                api_key=config.llm.openai_api_key or None,
+                model=config.llm.graphiti_openai_model,
+                small_model=config.llm.graphiti_openai_small_model,
+            ),
+            reasoning=config.llm.graphiti_openai_reasoning_effort,
+        )
         self._graphiti = Graphiti(
             uri=uri,
             user=user,
             password=password,
+            llm_client=llm_client,
             embedder=CustomEmbedder(),
         )
         self._ready = False
