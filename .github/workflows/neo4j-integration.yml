@@ -23,8 +23,21 @@ jobs:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: fractal-test-password
     steps:
-      - name: Checkout
+      - name: Checkout exact validation target
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify exact validation target
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "expected $EXPECTED_SHA but checked out $ACTUAL_SHA"
+            exit 2
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
