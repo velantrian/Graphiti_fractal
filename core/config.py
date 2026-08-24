@@ -7,6 +7,7 @@ All application settings in one place with validation.
 import logging
 import os
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -75,6 +76,12 @@ class MemorySettings(BaseSettings):
     project_group_id: str = Field(default="project", alias="PROJECT_GROUP_ID")
     knowledge_group_id: str = Field(default="knowledge", alias="KNOWLEDGE_GROUP_ID")
     experience_group_id: str = Field(default="experience", alias="EXPERIENCE_GROUP_ID")
+
+    # Pre-reply retrieval policy. AUTO skips only clearly trivial turns.
+    recall_mode: Literal["off", "auto", "always"] = Field(
+        default="auto",
+        alias="FRACTAL_MEMORY_RECALL",
+    )
 
     chat_save_episodes: bool = Field(default=False, alias="CHAT_SAVE_EPISODES")
     chat_save_bot_episodes: bool = Field(default=False, alias="CHAT_SAVE_BOT_EPISODES")
