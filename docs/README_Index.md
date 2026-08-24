@@ -4,7 +4,7 @@
 >
 > Этот индекс сохраняет исходный путь разработки Fractal Memory и старые Day-by-Day документы как историю эволюции проекта. Он **не является инструкцией для текущего runtime**.
 >
-> Для current state используй root `README.md`; для ролей/истории AI — `AI_MODEL_EVOLUTION.md`; для storage/retrieval/graph/cache evolution — `TECHNOLOGY_EVOLUTION.md`.
+> Для current state используй root `README.md`; для ролей/истории AI — `AI_MODEL_EVOLUTION.md`; для storage/retrieval/graph/cache evolution — `TECHNOLOGY_EVOLUTION.md`; для OpenClaw-derived memory lifecycle patterns — `OPENCLAW_ADOPTED_PATTERNS.md`.
 
 ## 🕰️ Зачем оставлены старые документы
 
@@ -20,6 +20,7 @@
 | Текущая AI model policy | `../core/model_policy.py` |
 | Роли + история AI/MoE/cache | `AI_MODEL_EVOLUTION.md` |
 | Storage/graph/retrieval/cache technology map | `TECHNOLOGY_EVOLUTION.md` |
+| OpenClaw-derived recall/promotion/import/diagnostic patterns | `OPENCLAW_ADOPTED_PATTERNS.md` |
 | Текущая конфигурация | `../core/config.py` + `../.env.example` |
 | Реальные contracts | `../tests/` + `../.github/workflows/ci.yml` |
 | Реализация L1/L2/L3 | `../layers/` |
@@ -65,7 +66,7 @@
 
 ## 🤖 История и роли AI
 
-`AI_MODEL_EVOLUTION.md` теперь фиксирует не только поколения GPT/Claude/Gemini/DeepSeek/Qwen/Grok, но и **зачем конкретные семейства/tiers могут использоваться**, а также:
+`AI_MODEL_EVOLUTION.md` фиксирует не только поколения GPT/Claude/Gemini/DeepSeek/Qwen/Grok, но и **зачем конкретные семейства/tiers могут использоваться**, а также:
 
 - MoE как sparse model architecture;
 - total vs active parameters;
@@ -94,6 +95,19 @@
 
 Current runtime update from this audit is deliberately small: Neo4j stays on compatible **5.26 LTS** but Docker is pinned to fresh patch **5.26.29-community**. Other modern technologies remain documented/evaluated until a concrete requirement justifies implementation.
 
+## 🦞 OpenClaw pattern adoption
+
+`OPENCLAW_ADOPTED_PATTERNS.md` records a bounded 2026-08-24 adoption of memory ideas from OpenClaw:
+
+- adaptive pre-reply recall;
+- deterministic promotion scoring + `promote-explain` style visibility;
+- structural exclusion of `untrusted` / `system` candidates from promotion;
+- staged consolidation as **dry-run preview**, not an automatic writer;
+- read-only `memory-status` diagnostics;
+- preview-first external import into isolated `imports` namespace.
+
+It also records what was deliberately **not** copied: gateway/channels, multi-agent runtime, plugin marketplace, Markdown/SQLite as Fractal memory authority, and scheduled durable promotion before real recall telemetry exists.
+
 ## 🧭 Как читать старый материал правильно
 
 1. Сначала проверь дату и historical marker.
@@ -102,7 +116,8 @@ Current runtime update from this audit is deliberately small: Neo4j stays on com
 4. Для текущей модели смотри `core/model_policy.py`.
 5. Для текущей архитектуры смотри root `README.md` и CI.
 6. Для современных adjacent/research technologies смотри `TECHNOLOGY_EVOLUTION.md`.
-7. Не превращай historical/future-work список в автоматически обязательный backlog.
-8. Forum/Reddit evidence считай operator signal, а не спецификацией.
+7. Для текущего memory-lifecycle слоя смотри `OPENCLAW_ADOPTED_PATTERNS.md`.
+8. Не превращай historical/future-work список в автоматически обязательный backlog.
+9. Forum/Reddit evidence считай operator signal, а не спецификацией.
 
 Так проект сохраняет память о собственном развитии, но старые документы больше не конкурируют с текущей архитектурой. 🧠📜
