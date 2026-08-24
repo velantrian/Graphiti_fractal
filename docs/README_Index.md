@@ -1,195 +1,87 @@
-# 📚 ДОКУМЕНТАЦИЯ: Fractal Memory v2 на Graphiti
+# 📚 Fractal Memory — Historical Documentation Index
 
-## 🎯 Начни отсюда
+> **Status: HISTORICAL / NON-AUTHORITATIVE**
+>
+> Этот индекс сохраняет исходный путь разработки Fractal Memory и старые Day-by-Day документы как историю эволюции проекта. Он **не является инструкцией для текущего runtime**.
+>
+> Для текущего состояния используй корневой `README.md`, текущий код и CI contracts. Для эволюции AI-моделей см. `AI_MODEL_EVOLUTION.md`.
 
-Тебе нужно 9 дней и следующие документы:
+## 🕰️ Зачем оставлены старые документы
 
-### 🚀 **INSTANT START** (30 минут)
-**Файл:** `Quick_Start_30min.md`
-- Запуск Neo4j через Docker
-- Python setup
-- Первый рабочий граф за 30 минут
-- Проверка в Neo4j Browser
+Ранние документы фиксируют, как проект развивался: от первоначальной 9-дневной схемы и custom entity экспериментов до текущей Graphiti-native архитектуры. Поэтому старые API-примеры, предположения, benchmark-цели и названия моделей **не стираются задним числом**.
 
-**Результат:** 3 узла в графе, стабильное соединение
+В частности, историческое упоминание **GPT-4** в `Day_2_Custom_Entities.md` остаётся временным снимком своего этапа. Оно не означает, что GPT-4 является сегодняшним default. Аналогично любые старые упоминания других AI-моделей следует читать в контексте даты документа.
 
----
+## ✅ Current authoritative entrypoints
 
-### 📋 **ПОЛНАЯ СПЕЦИФИКАЦИЯ** (Справочник)
-**Файл:** `Graphiti_Full_Spec.md`
-- Полный 9-дневный план (этапы 1-3)
-- Все операции Graphiti API
-- Конфигурация параметров
-- Технические требования
-- Антипаттерны
+| Что нужно | Источник |
+|---|---|
+| Текущая архитектура/runtime contract | `../README.md` |
+| Текущая AI model policy | `../core/model_policy.py` |
+| История моделей AI | `AI_MODEL_EVOLUTION.md` |
+| Текущая конфигурация | `../core/config.py` + `../.env.example` |
+| Реальные contracts | `../tests/` + `../.github/workflows/ci.yml` |
+| Реализация L1/L2/L3 | `../layers/` |
+| Canonical ingest | `../knowledge/ingest.py` |
+| Scoped memory/retrieval | `../core/memory_ops.py` |
 
-**Используй:** как справочник при возникновении вопросов
+## 📜 Historical development trail
 
----
+### Day 2 — Custom Entities
+`Day_2_Custom_Entities.md`
 
-### 📅 **ДЕНЬ 1: Setup** (4 часа)
-**Файл:** `Quick_Start_30min.md`
-- Docker + Python + первый эпизод
-- ✅ Цель: 3+ узла в Neo4j
+Сохраняет первоначальный эксперимент с custom entity types и старый GPT-4-era пример. Полезен для понимания происхождения идей, но код/API оттуда нельзя считать текущим без сверки.
 
----
+### Day 3–4 — Visualization & Queries
+`Day_3_4_Visualization_Queries.md`
 
-### 📅 **ДЕНЬ 2: Custom Entities** (6 часов)
-**Файл:** `Day_2_Custom_Entities.md`
-- 4 Pydantic модели (Project, Concept, Decision, Team)
-- Добавление 3 эпизодов разных типов
-- Проверка автоэкстракции сущностей
-- ✅ Цель: 15-20 узлов, кастомные типы работают
+История ранних Cypher/search/context-builder подходов. Современный retrieval path находится в текущем коде и использует bounded per-namespace search.
 
----
+### Day 5–7 — Fractal Layers
+`Day_5_7_Fractal_Layers.md`
 
-### 📅 **ДЕНЬ 3-4: Visualization & Queries** (9 часов)
-**Файл:** `Day_3_4_Visualization_Queries.md`
-- Neo4j Browser Cypher запросы
-- Проверка качества данных (дубликаты)
-- Стратегии поиска (keyword, hybrid, relationship, temporal)
-- Context builder для LLM
-- ✅ Цель: Визуально подтверждено, поиск работает
+История ранних L1/L2/L3 концепций. Документ уже содержит historical warning; текущие L2/L3 существенно отличаются и используют Graphiti Communities + bounded LLM synthesis.
 
----
+### Day 8–9 — Visualization & Performance
+`Day_8_9_Visualization_Performance.md`
 
-### 📅 **ДЕНЬ 5-7: Fractal Layers** (15 часов)
-**Файл:** `Day_5_7_Fractal_Layers.md`
-- L1: Recent episode consolidation
-- L2: Semantic relationship patterns
-- L3: Fractal hierarchies & abstractions
-- ✅ Цель: 3-слойная архитектура работает
+Исторические цели визуализации и performance-профилирования. Не воспринимать старые числа как текущие гарантии/SLO.
 
----
+### Master Project Plan
+`Master_Project_Plan.md`
 
-### 📅 **ДЕНЬ 8-9: Visualization & Performance** (9 часов)
-**Файл:** `Day_8_9_Visualization_Performance.md`
-- D3.js интерактивный граф
-- Graph export to JSON
-- Performance benchmarking
-- ✅ Цель: Интерактивная UI + metrics
+Исходный 9-дневный план. Сохраняется как архитектурная летопись, а не как актуальный backlog.
 
----
+### Testing / refactoring notes
 
-### 🗺️ **МАСТЕР-ПЛАН** (Overview)
-**Файл:** `Master_Project_Plan.md`
-- Полный timeline на 9 дней
-- Структура проекта
-- Success metrics на каждый день
-- Troubleshooting
-- Next phases (неделя 2+)
+- `TESTING_AND_SIMPLE_AGENT.md`
+- `HANDS_ON_TESTING.md`
+- `REFACTORING_CHANGELOG.md`
+- `GRAPH_CONNECTIVITY.md`
+- `memory_ops.md`
 
----
+Использовать для истории решений и отладки старых состояний; при конфликте с current README/code/contracts побеждает current state.
 
-## 📂 КАК ИСПОЛЬЗОВАТЬ ДОКУМЕНТЫ
+## 🤖 История AI-моделей
 
-### Сценарий 1: Только начинаю
-```
-1. Прочитай Quick_Start_30min.md (10 минут)
-2. Следи инструкциям (30 минут)
-3. Проверь результат в Neo4j Browser
-4. Переходи на День 2
-```
+Отдельная страница `AI_MODEL_EVOLUTION.md` хранит две независимые части:
 
-### Сценарий 2: Застрял на дне N
-```
-1. Открой соответствующий файл (День N)
-2. Прочитай стратегию дня
-3. Скопируй код в свой проект
-4. Запусти и проверь чеклист
-5. Если ошибка → смотри Master_Project_Plan.md Troubleshooting
-```
+1. **Current policy snapshot** — активные Fractal defaults на указанную дату.
+2. **Historical evolution** — GPT, Claude, Gemini, DeepSeek, Qwen, Grok и другие поколения как история развития экосистемы.
 
-### Сценарий 3: Нужна информация о функции
-```
-1. Открой Graphiti_Full_Spec.md
-2. Найди раздел "QUICK REFERENCE: API METHODS"
-3. Скопируй метод и адаптируй под свой код
-```
+Ключевое правило:
 
----
+> **Model mentioned ≠ provider supported ≠ runtime default.**
 
-## 🔑 КЛЮЧЕВЫЕ ФАЙЛЫ ПО КАТЕГОРИЯМ
+Сегодня first-class provider path Fractal Memory — OpenAI. Историческое присутствие Claude/Gemini/DeepSeek/Qwen/Grok в документации не создаёт их runtime adapter автоматически.
 
-### Для Setup
-- Quick_Start_30min.md
+## 🧭 Как читать старый материал правильно
 
-### Для Разработки (по дням)
-- Day_2_Custom_Entities.md
-- Day_3_4_Visualization_Queries.md
-- Day_5_7_Fractal_Layers.md
-- Day_8_9_Visualization_Performance.md
+1. Сначала проверь дату и historical marker.
+2. Не копируй старый код без сверки с текущими interfaces.
+3. Старое имя модели воспринимай как snapshot эпохи.
+4. Для текущей модели смотри `core/model_policy.py`.
+5. Для текущей архитектуры смотри root `README.md` и CI.
+6. Не превращай исторический future-work список в автоматически обязательный backlog.
 
-### Для Справки
-- Graphiti_Full_Spec.md (тех. детали)
-- Master_Project_Plan.md (timeline + structure)
-
-### Для Отладки
-- Master_Project_Plan.md → Troubleshooting
-
----
-
-## 📊 ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ ПО ДНЯМ
-
-| День | Результат | Файл |
-|------|-----------|------|
-| 1 | 3+ узла в граве, поиск работает | Quick_Start |
-| 2 | 15-20 узлов, кастомные типы | Day_2 |
-| 3-4 | Cypher queries работают, контекст собирается | Day_3-4 |
-| 5-7 | L1-L3 слои реализованы | Day_5-7 |
-| 8-9 | Интерактивный граф + performance report | Day_8-9 |
-
----
-
-## ✅ CHECKLIST ПЕРЕД НАЧАЛОМ
-
-- [ ] Docker installed
-- [ ] Python 3.10+ installed
-- [ ] OpenAI API key готов
-- [ ] 9 дней календаря забронировано
-- [ ] Все документы скачаны/прочитаны
-- [ ] Текстовый редактор открыт (VSCode)
-- [ ] Terminal готов
-
----
-
-## 🚀 НАЧНИ СЕЙЧАС
-
-```bash
-# Шаг 1: Открой Quick_Start_30min.md
-# Шаг 2: Следуй инструкциям
-# Шаг 3: Docker запустится → Neo4j запустится → первый граф создастся
-# Шаг 4: День 2
-
-# You've got this! ✨
-```
-
----
-
-## 📞 БЫСТРЫЕ ССЫЛКИ
-
-| Вопрос | Ответ |
-|--------|--------|
-| Как начать? | Quick_Start_30min.md |
-| Что делать в День N? | Day_N_*.md |
-| Как работает функция X? | Graphiti_Full_Spec.md |
-| Ошибка на День N? | Master_Project_Plan.md → Troubleshooting |
-| Какой timeline? | Master_Project_Plan.md → Timeline |
-| Структура проекта? | Master_Project_Plan.md → Project Structure |
-
----
-
-## 💡 ФИЛОСОФИЯ ДОКУМЕНТОВ
-
-Каждый документ написан для конкретного дня/задачи:
-- ✅ Не переусложнены
-- ✅ Копипастный код работает как есть
-- ✅ Примеры конкретны
-- ✅ Чеклист на каждый день
-- ✅ Clear success criteria
-
-**Не пропускай дни, следуй плану, выдаёшь код каждый день.**
-
----
-
-**Удачи! Ты это сделаешь! 🚀**
+Так проект сохраняет память о собственном развитии, но старые документы больше не конкурируют с текущей архитектурой. 🧠📜
