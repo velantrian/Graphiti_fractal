@@ -1,9 +1,14 @@
 import argparse
 import asyncio
+import json
+from pathlib import Path
 
 from benchmarks.benchmark import run_benchmark
 from core import get_graphiti_client
 from core.instance import get_instance_user_id
+from core.memory_doctor import collect_memory_status
+from core.memory_import import apply_import_plan, build_import_plan
+from core.memory_lifecycle import PromotionSignals, explain_promotion, plan_consolidation
 from core.memory_ops import MemoryOps
 from core.migrations import apply_migrations
 from layers.l1_consolidation import get_l1_context
@@ -149,6 +154,47 @@ async def cmd_dedupe_episodes(args):
     )
 
 
+async def cmd_memory_status(args):
+    status = await collect_memory_status(await ensure_graphiti(), deep=args.deep)
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+
+
+async def cmd_memory_import(args):
+    plan = build_import_plan(args.path, source_type=args.source_type)
+    if not args.apply:
+        public = {key: value for key, value in plan.items() if key != "_payload"}
+        print(json.dumps(public, ensure_ascii=False, indent=2))
+        return
+    graphiti = await ensure_graphiti()
+    memory = MemoryOps(graphiti, get_instance_user_id())
+    result = await apply_import_plan(memory, plan, apply=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+async def cmd_memory_promote_explain(args):
+    explanation = explain_promotion(
+        PromotionSignals(
+            relevance=args.relevance,
+            frequency=args.frequency,
+            query_diversity=args.query_diversity,
+            recency=args.recency,
+            consolidation=args.consolidation,
+            conceptual_richness=args.conceptual_richness,
+        ),
+        origin_class=args.origin_class,
+        recall_count=args.recall_count,
+        unique_queries=args.unique_queries,
+    )
+    print(json.dumps(explanation, ensure_ascii=False, indent=2))
+
+
+async def cmd_memory_consolidate_preview(args):
+    path = Path(args.path).expanduser().resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    candidates = payload if isinstance(payload, list) else payload.get("candidates", [])
+    print(json.dumps(plan_consolidation(candidates), ensure_ascii=False, indent=2))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Fractal Memory / Graphiti CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -209,6 +255,39 @@ def build_parser():
         help="Только вместе с --apply: hard-delete soft-deleted старше N дней",
     )
     dedupe_episodes.set_defaults(func=cmd_dedupe_episodes)
+
+    memory_status = subparsers.add_parser("memory-status", help="Read-only memory diagnostics")
+    memory_status.add_argument(
+        "--deep",
+        action="store_true",
+        help="Probe provider-backed semantic retrieval; may make external provider calls",
+    )
+    memory_status.set_defaults(func=cmd_memory_status)
+
+    memory_import = subparsers.add_parser("memory-import", help="Preview/apply isolated external memory import")
+    memory_import.add_argument("path")
+    memory_import.add_argument("--source-type", default="auto")
+    memory_import.add_argument("--apply", action="store_true", help="Without this flag no writes occur")
+    memory_import.set_defaults(func=cmd_memory_import)
+
+    promote = subparsers.add_parser("memory-promote-explain", help="Explain deterministic promotion gates")
+    promote.add_argument("--origin-class", choices=["owner", "agent_derived", "untrusted", "system"], default="owner")
+    promote.add_argument("--recall-count", type=int, default=0)
+    promote.add_argument("--unique-queries", type=int, default=0)
+    promote.add_argument("--relevance", type=float, default=0.0)
+    promote.add_argument("--frequency", type=float, default=0.0)
+    promote.add_argument("--query-diversity", type=float, default=0.0)
+    promote.add_argument("--recency", type=float, default=0.0)
+    promote.add_argument("--consolidation", type=float, default=0.0)
+    promote.add_argument("--conceptual-richness", type=float, default=0.0)
+    promote.set_defaults(func=cmd_memory_promote_explain)
+
+    consolidate = subparsers.add_parser(
+        "memory-consolidate-preview",
+        help="Plan collect -> patterns -> promotion from a JSON candidate file; never writes",
+    )
+    consolidate.add_argument("path")
+    consolidate.set_defaults(func=cmd_memory_consolidate_preview)
 
     return parser
 
