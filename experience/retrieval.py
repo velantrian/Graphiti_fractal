@@ -1,10 +1,83 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from core.config import get_config
 
 
 def _experience_group_id() -> str:
     return get_config().memory.experience_group_id
+
+
+def _normalized_names(values: Iterable[str] | None) -> set[str] | None:
+    if values is None:
+        return None
+    return {str(value).strip().lower() for value in values if str(value).strip()}
+
+
+def assess_pattern_applicability(
+    pattern: dict,
+    *,
+    available_tools: Iterable[str] | None = None,
+    forbidden_tools: Iterable[str] | None = None,
+) -> dict:
+    """Return a deterministic environment-applicability assessment.
+
+    This is deliberately narrow: it only reasons about tools recorded on the
+    prior TaskRun. It does not claim semantic, causal, or epistemic validity.
+    """
+    required = _normalized_names(pattern.get("tools") or pattern.get("tool_chain") or []) or set()
+    available = _normalized_names(available_tools)
+    forbidden = _normalized_names(forbidden_tools) or set()
+
+    missing = sorted(required - available) if available is not None else []
+    blocked = sorted(required & forbidden)
+    constrained = available is not None or forbidden_tools is not None
+    applicable = not missing and not blocked
+
+    return {
+        "applicable": applicable,
+        "constrained": constrained,
+        "required_tools": sorted(required),
+        "missing_tools": missing,
+        "forbidden_tools": blocked,
+        "reason": (
+            "tool requirements satisfied"
+            if applicable and constrained
+            else "no environment constraint supplied"
+            if applicable
+            else "environment mismatch"
+        ),
+    }
+
+
+def filter_success_patterns_for_environment(
+    patterns: Iterable[dict],
+    *,
+    available_tools: Iterable[str] | None = None,
+    forbidden_tools: Iterable[str] | None = None,
+) -> list[dict]:
+    """Filter prior success observations before reuse in a constrained environment.
+
+    When no environment constraint is supplied, legacy behavior is preserved.
+    When a constraint is supplied, inapplicable patterns fail closed and every
+    returned row carries an explicit applicability receipt.
+    """
+    constrained = available_tools is not None or forbidden_tools is not None
+    rows: list[dict] = []
+    for raw in patterns:
+        row = dict(raw)
+        assessment = assess_pattern_applicability(
+            row,
+            available_tools=available_tools,
+            forbidden_tools=forbidden_tools,
+        )
+        if constrained and not assessment["applicable"]:
+            continue
+        if constrained:
+            row["applicability"] = assessment
+        rows.append(row)
+    return rows
 
 
 async def get_success_patterns(
@@ -13,8 +86,15 @@ async def get_success_patterns(
     task_type: str | None,
     context_hash: str | None,
     limit: int = 5,
+    available_tools: Iterable[str] | None = None,
+    forbidden_tools: Iterable[str] | None = None,
 ):
-    """Return recent successful TaskRun records in a matching experience context."""
+    """Return recent successful TaskRun records in a matching experience context.
+
+    `status='success'` remains an observed outcome, not a validated lesson. When
+    environment constraints are supplied, recorded tool requirements are checked
+    before a pattern is returned for reuse.
+    """
     result = await graphiti.driver.execute_query(
         """
         MATCH (tr:TaskRun)
@@ -43,7 +123,11 @@ async def get_success_patterns(
         ctx=context_hash,
         limit=max(1, min(limit, 50)),
     )
-    return [dict(record) for record in result.records]
+    return filter_success_patterns_for_environment(
+        (dict(record) for record in result.records),
+        available_tools=available_tools,
+        forbidden_tools=forbidden_tools,
+    )
 
 
 async def get_antipatterns(
