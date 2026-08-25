@@ -134,10 +134,30 @@ class SearchResult:
 
 
 @dataclass
+class ContextReceipt:
+    """Non-authoritative receipt for the context actually exposed to the model."""
+
+    status: str = "OK"
+    requested_mode: str = "auto"
+    effective_mode: str = "local"
+    reason: str = ""
+    source_ids: List[str] = field(default_factory=list)
+    source_counts: Dict[str, int] = field(default_factory=dict)
+    query_sha256: str = ""
+    context_sha256: str = ""
+    max_tokens: int = 0
+    token_estimate: int = 0
+    truncated: bool = False
+    authoritative: bool = False
+    writes_performed: bool = False
+
+
+@dataclass
 class ContextResult:
     text: str
     token_estimate: int
     sources: Dict[str, int] = field(default_factory=dict)
+    receipt: Optional[ContextReceipt] = None
 
 
 @dataclass

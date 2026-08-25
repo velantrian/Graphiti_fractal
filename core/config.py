@@ -82,6 +82,14 @@ class MemorySettings(BaseSettings):
         default="auto",
         alias="FRACTAL_MEMORY_RECALL",
     )
+    # Hard fail-soft budget for pre-reply memory retrieval. A timeout degrades
+    # recall only; it must never block the model reply path.
+    recall_timeout_seconds: float = Field(
+        default=2.5,
+        gt=0.0,
+        le=30.0,
+        alias="FRACTAL_RECALL_TIMEOUT_SECONDS",
+    )
 
     chat_save_episodes: bool = Field(default=False, alias="CHAT_SAVE_EPISODES")
     chat_save_bot_episodes: bool = Field(default=False, alias="CHAT_SAVE_BOT_EPISODES")

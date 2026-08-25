@@ -7,6 +7,7 @@ persisted chat_turn episodes with real UUIDs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -15,8 +16,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 from core.chat_persistence import allocate_turn_index, fetch_persisted_turn_window, mark_turns_summarized
 from core.config import get_config
+from core.context_guard import build_context_receipt, degraded_context, persist_recall_guard_metadata
 from core.conversation_buffer import get_user_conversation_buffer
 from core.graphiti_client import get_write_semaphore
+from core.graphrag_policy import plan_retrieval
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
@@ -27,7 +30,7 @@ from core.task_registry import spawn
 from core.text_utils import is_correction_text
 
 if TYPE_CHECKING:
-    from core.types import ContextResult
+    from core.types import ContextReceipt, ContextResult
 
 logger = logging.getLogger(__name__)
 
@@ -71,16 +74,78 @@ class SimpleChatAgent:
             conversation_buffer = get_user_conversation_buffer(self.memory.user_id)
             conversation_id = conversation_buffer.conversation_id
             recall_enabled, recall_reason = should_recall(user_message, config.memory.recall_mode)
+            context_result: ContextResult
+
             if recall_enabled:
-                context_result = await self.memory.build_context_for_query(
-                    user_message, scopes=["personal", "project", "knowledge", "experience"],
-                    max_tokens=2000, include_episodes=True, include_entities=True,
-                )
-                user_content = f"Context from memory:\n{context_result.text}\n\nUser question: {user_message}"
+                try:
+                    context_result = await asyncio.wait_for(
+                        self.memory.build_context_for_query(
+                            user_message,
+                            scopes=["personal", "project", "knowledge", "experience"],
+                            max_tokens=2000,
+                            include_episodes=True,
+                            include_entities=True,
+                        ),
+                        timeout=config.memory.recall_timeout_seconds,
+                    )
+                    plan = plan_retrieval(user_message, "auto")
+                    context_result.receipt = build_context_receipt(
+                        query=user_message,
+                        context=context_result,
+                        requested_mode=plan.requested_mode.value,
+                        effective_mode=plan.effective_mode.value,
+                        reason=plan.reason,
+                        status="OK",
+                        max_tokens=2000,
+                    )
+                except asyncio.TimeoutError:
+                    context_result = degraded_context(
+                        query=user_message,
+                        status="DEGRADED_TIMEOUT",
+                        reason=f"recall exceeded {config.memory.recall_timeout_seconds:.3f}s",
+                        max_tokens=2000,
+                    )
+                    logger.warning(
+                        "Memory recall timed out; continuing without memory",
+                        extra={"user_id": self.memory.user_id, "conversation_id": conversation_id},
+                    )
+                except Exception as exc:  # recall failure must not block reply
+                    context_result = degraded_context(
+                        query=user_message,
+                        status="DEGRADED_ERROR",
+                        reason=type(exc).__name__,
+                        max_tokens=2000,
+                    )
+                    logger.warning(
+                        "Memory recall failed; continuing without memory: %s",
+                        type(exc).__name__,
+                        extra={"user_id": self.memory.user_id, "conversation_id": conversation_id},
+                    )
+
+                if context_result.text:
+                    user_content = f"Context from memory:\n{context_result.text}\n\nUser question: {user_message}"
+                else:
+                    user_content = f"User question: {user_message}"
             else:
-                context_result = ContextResult(text="", token_estimate=0, sources={"episodes": 0, "entities": 0, "edges": 0, "communities": 0})
+                context_result = degraded_context(
+                    query=user_message,
+                    status="SKIPPED",
+                    reason=recall_reason,
+                    max_tokens=2000,
+                )
                 user_content = f"User question: {user_message}"
-            logger.debug("Memory recall decision", extra={"user_id": self.memory.user_id, "conversation_id": conversation_id, "recall_mode": config.memory.recall_mode, "recall_enabled": recall_enabled, "recall_reason": recall_reason})
+
+            logger.debug(
+                "Memory recall decision",
+                extra={
+                    "user_id": self.memory.user_id,
+                    "conversation_id": conversation_id,
+                    "recall_mode": config.memory.recall_mode,
+                    "recall_enabled": recall_enabled,
+                    "recall_reason": recall_reason,
+                    "context_status": context_result.receipt.status if context_result.receipt else "UNKNOWN",
+                },
+            )
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_buffer.get_recent_messages(6))
             messages.append({"role": "user", "content": user_content})
@@ -89,15 +154,37 @@ class SimpleChatAgent:
                 raise RuntimeError("LLM returned an empty response")
             conversation_text = f"User: {user_message}\nAssistant: {response}"
             conversation_buffer.add_turn(user_message, response)
-            spawn(self._persist_turn_pipeline(conversation_id=conversation_id, conversation_text=conversation_text), name=f"chat-persist:{self.memory.user_id}:{conversation_id}")
-            logger.info("Chat answer completed", extra={"user_id": self.memory.user_id, "conversation_id": conversation_id, "duration_ms": (perf_counter() - started) * 1000, "memory_recall": recall_enabled})
+            spawn(
+                self._persist_turn_pipeline(
+                    conversation_id=conversation_id,
+                    conversation_text=conversation_text,
+                    context_receipt=context_result.receipt,
+                ),
+                name=f"chat-persist:{self.memory.user_id}:{conversation_id}",
+            )
+            logger.info(
+                "Chat answer completed",
+                extra={
+                    "user_id": self.memory.user_id,
+                    "conversation_id": conversation_id,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                    "memory_recall": recall_enabled,
+                    "context_status": context_result.receipt.status if context_result.receipt else "UNKNOWN",
+                },
+            )
             return response, conversation_text, context_result
         except Exception:
             logger.exception("Chat agent core error")
             fallback = "Извините, произошла ошибка при обработке запроса. Попробуйте ещё раз."
             return fallback, f"User: {user_message}\nAssistant: {fallback}", None
 
-    async def _persist_turn_pipeline(self, *, conversation_id: str, conversation_text: str) -> None:
+    async def _persist_turn_pipeline(
+        self,
+        *,
+        conversation_id: str,
+        conversation_text: str,
+        context_receipt: "ContextReceipt | None" = None,
+    ) -> None:
         graphiti = self.memory.graphiti
         try:
             turn_index = await allocate_turn_index(graphiti, self.memory.user_id, conversation_id)
@@ -106,6 +193,11 @@ class SimpleChatAgent:
             from knowledge.ingest import update_episode_metadata
             await attach_author(turn_uuid, self.memory.user_id)
             await update_episode_metadata(graphiti, turn_uuid, {"conversation_id": conversation_id, "turn_index": turn_index, "episode_kind": "chat_turn", "is_correction": is_correction_text(conversation_text), "summarized": False})
+            await persist_recall_guard_metadata(
+                graphiti,
+                episode_uuid=turn_uuid,
+                context_receipt=context_receipt,
+            )
             if turn_index % 10 == 0:
                 await self._create_persisted_summary(conversation_id=conversation_id, end_turn_index=turn_index)
         except Exception:
@@ -156,7 +248,7 @@ class SimpleChatAgent:
                 logger.exception("Long chat document persistence failed")
         spawn(store_document(), name=f"chat-document:{self.memory.user_id}")
         get_user_conversation_buffer(self.memory.user_id).add_turn(f"[LONG TEXT DOCUMENT: {len(text)} chars]", response)
-        empty_context = ContextResult(text="", token_estimate=0, sources=[])
+        empty_context = ContextResult(text="", token_estimate=0, sources={})
         return response, f"User: [Long Text]\nAssistant: {response}", empty_context
 
 
