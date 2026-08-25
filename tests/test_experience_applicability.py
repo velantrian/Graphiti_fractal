@@ -1,6 +1,7 @@
 import asyncio
 
 from experience.retrieval import (
+    SUCCESS_PATTERN_PAGE_SIZE,
     assess_pattern_applicability,
     filter_success_patterns_for_environment,
     get_success_patterns,
@@ -14,10 +15,7 @@ def test_legacy_behavior_is_preserved_without_environment_constraints():
 
 def test_missing_required_tool_fails_closed_when_environment_is_supplied():
     patterns = [{"run_id": "run-1", "tools": ["browser", "shell"]}]
-    result = filter_success_patterns_for_environment(
-        patterns,
-        available_tools={"shell"},
-    )
+    result = filter_success_patterns_for_environment(patterns, available_tools={"shell"})
     assert result == []
 
 
@@ -65,6 +63,7 @@ def test_applicable_pattern_returns_explicit_receipt():
     assert receipt["required_tools"] == ["browser"]
     assert receipt["missing_tools"] == []
     assert receipt["forbidden_tools"] == []
+    assert receipt["reason"] == "recorded tool requirements compatible with supplied constraints"
 
 
 def test_tool_chain_is_used_when_tools_collection_is_absent():
@@ -74,6 +73,21 @@ def test_tool_chain_is_used_when_tools_collection_is_absent():
     )
     assert result["applicable"] is True
     assert result["required_tools"] == ["github", "pytest"]
+
+
+def test_tools_and_tool_chain_are_unioned_for_guard_decision():
+    result = assess_pattern_applicability(
+        {
+            "run_id": "run-1",
+            "tools": [f"tool-{i}" for i in range(10)],
+            "tool_chain": [f"tool-{i}" for i in range(11)],
+        },
+        available_tools=[f"tool-{i}" for i in range(11)],
+        forbidden_tools=["tool-10"],
+    )
+    assert result["applicable"] is False
+    assert "tool-10" in result["required_tools"]
+    assert result["forbidden_tools"] == ["tool-10"]
 
 
 def test_normalization_deduplicates_case_and_whitespace():
@@ -116,11 +130,13 @@ class _FakeResult:
 class _FakeDriver:
     def __init__(self, records):
         self.records = records
-        self.last_limit = None
+        self.calls = []
 
     async def execute_query(self, _query, **kwargs):
-        self.last_limit = kwargs["limit"]
-        return _FakeResult(self.records[: self.last_limit])
+        offset = kwargs.get("offset", 0)
+        limit = kwargs["limit"]
+        self.calls.append({"offset": offset, "limit": limit})
+        return _FakeResult(self.records[offset : offset + limit])
 
 
 class _FakeGraphiti:
@@ -128,14 +144,13 @@ class _FakeGraphiti:
         self.driver = _FakeDriver(records)
 
 
-def test_constrained_retrieval_overfetches_then_truncates_after_filter(monkeypatch):
+def test_constrained_retrieval_paginates_until_applicable_row_found(monkeypatch):
     monkeypatch.setattr("experience.retrieval._experience_group_id", lambda: "experience")
     records = [
         _FakeRecord(run_id=f"bad-{i}", tools=["shell"], tool_chain=["shell"])
-        for i in range(5)
+        for i in range(SUCCESS_PATTERN_PAGE_SIZE + 1)
     ] + [
-        _FakeRecord(run_id="good-6", tools=["browser"], tool_chain=["browser"]),
-        _FakeRecord(run_id="good-7", tools=["browser"], tool_chain=["browser"]),
+        _FakeRecord(run_id="good-52", tools=["browser"], tool_chain=["browser"])
     ]
     graphiti = _FakeGraphiti(records)
 
@@ -149,5 +164,29 @@ def test_constrained_retrieval_overfetches_then_truncates_after_filter(monkeypat
         )
     )
 
-    assert graphiti.driver.last_limit == 50
-    assert [row["run_id"] for row in result] == ["good-6"]
+    assert [row["run_id"] for row in result] == ["good-52"]
+    assert graphiti.driver.calls == [
+        {"offset": 0, "limit": SUCCESS_PATTERN_PAGE_SIZE},
+        {"offset": SUCCESS_PATTERN_PAGE_SIZE, "limit": SUCCESS_PATTERN_PAGE_SIZE},
+    ]
+
+
+def test_unconstrained_retrieval_keeps_single_bounded_page(monkeypatch):
+    monkeypatch.setattr("experience.retrieval._experience_group_id", lambda: "experience")
+    records = [
+        _FakeRecord(run_id=f"run-{i}", tools=["browser"], tool_chain=["browser"])
+        for i in range(10)
+    ]
+    graphiti = _FakeGraphiti(records)
+
+    result = asyncio.run(
+        get_success_patterns(
+            graphiti,
+            task_type=None,
+            context_hash=None,
+            limit=3,
+        )
+    )
+
+    assert [row["run_id"] for row in result] == ["run-0", "run-1", "run-2"]
+    assert graphiti.driver.calls == [{"offset": 0, "limit": 3}]
