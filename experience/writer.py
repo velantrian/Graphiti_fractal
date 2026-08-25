@@ -9,8 +9,37 @@ from core.config import get_config
 from .models import ExperienceIngestRequest
 
 
+EXPERIENCE_PROVENANCE_VERSION = "experience-provenance-v0"
+TOOL_PROVENANCE_VERSION = "tool-provenance-v0"
+
+
 def _norm(value: str) -> str:
     return " ".join((value or "").strip().lower().split())
+
+
+def _clean_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _canonical_string_list(values) -> list[str]:
+    return sorted({str(value).strip() for value in values or [] if str(value).strip()})
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _json_digest(value) -> str:
+    return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def compute_context_hash(req: ExperienceIngestRequest) -> str:
@@ -26,6 +55,100 @@ def compute_context_hash(req: ExperienceIngestRequest) -> str:
 
 def _tool_chain(req: ExperienceIngestRequest) -> list[str]:
     return [_norm(call.tool) for call in req.tool_calls if call.tool]
+
+
+def _args_digest(args) -> str | None:
+    if args is None:
+        return None
+    return _json_digest(args)
+
+
+def build_experience_provenance_envelope(req: ExperienceIngestRequest) -> dict:
+    """Build a deterministic, non-authoritative provenance envelope.
+
+    The envelope records what the caller supplied about a historical run. It does
+    not infer trust, correctness, applicability, permissions, or promotion state.
+    Raw tool arguments and outputs are deliberately excluded; only an args digest
+    is included for lineage comparison.
+    """
+    run_provenance = req.provenance
+    tool_entries: list[dict] = []
+
+    for index, call in enumerate(req.tool_calls):
+        tool_provenance = call.provenance
+        tool_entries.append(
+            {
+                "index": index,
+                "tool": _clean_optional(call.tool),
+                "provenance_version": (
+                    tool_provenance.version if tool_provenance else TOOL_PROVENANCE_VERSION
+                ),
+                "provenance_state": (
+                    tool_provenance.provenance_state if tool_provenance else "unknown"
+                ),
+                "canonical_tool_id": (
+                    _clean_optional(tool_provenance.canonical_tool_id)
+                    if tool_provenance
+                    else None
+                ),
+                "tool_version": (
+                    _clean_optional(tool_provenance.tool_version) if tool_provenance else None
+                ),
+                "tool_schema_digest": (
+                    _clean_optional(tool_provenance.tool_schema_digest)
+                    if tool_provenance
+                    else None
+                ),
+                "capabilities": _canonical_string_list(
+                    tool_provenance.capabilities if tool_provenance else []
+                ),
+                "permission_scope": _canonical_string_list(
+                    tool_provenance.permission_scope if tool_provenance else []
+                ),
+                "trace_id": (
+                    _clean_optional(tool_provenance.trace_id) if tool_provenance else None
+                ),
+                "parent_span_id": (
+                    _clean_optional(tool_provenance.parent_span_id)
+                    if tool_provenance
+                    else None
+                ),
+                "args_sha256": _args_digest(call.args),
+                "exit_code": call.exit_code,
+            }
+        )
+
+    return {
+        "version": run_provenance.version if run_provenance else EXPERIENCE_PROVENANCE_VERSION,
+        "provenance_state": (
+            run_provenance.provenance_state if run_provenance else "unknown"
+        ),
+        "provider": _clean_optional(run_provenance.provider) if run_provenance else None,
+        "model": _clean_optional(run_provenance.model) if run_provenance else None,
+        "runtime_id": _clean_optional(run_provenance.runtime_id) if run_provenance else None,
+        "os_name": _clean_optional(run_provenance.os_name) if run_provenance else None,
+        "environment_id": (
+            _clean_optional(run_provenance.environment_id) if run_provenance else None
+        ),
+        "capability_profile_hash": (
+            _clean_optional(run_provenance.capability_profile_hash)
+            if run_provenance
+            else None
+        ),
+        "trace_id": _clean_optional(run_provenance.trace_id) if run_provenance else None,
+        "parent_span_id": (
+            _clean_optional(run_provenance.parent_span_id) if run_provenance else None
+        ),
+        "repo": _clean_optional(req.repo),
+        "branch": _clean_optional(req.branch),
+        "commit": _clean_optional(req.commit),
+        "tool_calls": tool_entries,
+        "authoritative": False,
+    }
+
+
+def provenance_envelope_digest(req: ExperienceIngestRequest) -> str:
+    return _json_digest(build_experience_provenance_envelope(req))
 
 
 def _truncate(text: str | None, limit: int = 4000) -> str | None:
@@ -52,6 +175,11 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         for key, value in sorted((req.stack or {}).items(), key=lambda item: str(item[0]))
     ]
 
+    provenance_envelope = build_experience_provenance_envelope(req)
+    provenance_json = _canonical_json(provenance_envelope)
+    provenance_digest = sha256(provenance_json.encode("utf-8")).hexdigest()
+    run_provenance = req.provenance
+
     driver = graphiti.driver
     await driver.execute_query(
         """
@@ -75,7 +203,19 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             tr.duration_ms=$duration_ms,
             tr.context_hash=$context_hash,
             tr.tool_chain=$tool_chain,
-            tr.tool_chain_hash=$tool_chain_hash
+            tr.tool_chain_hash=$tool_chain_hash,
+            tr.provenance_version=$provenance_version,
+            tr.provenance_state=$provenance_state,
+            tr.provenance_digest=$provenance_digest,
+            tr.provenance_json=$provenance_json,
+            tr.provenance_provider=$provenance_provider,
+            tr.provenance_model=$provenance_model,
+            tr.provenance_runtime_id=$provenance_runtime_id,
+            tr.provenance_os_name=$provenance_os_name,
+            tr.provenance_environment_id=$provenance_environment_id,
+            tr.provenance_capability_profile_hash=$provenance_capability_profile_hash,
+            tr.trace_id=$trace_id,
+            tr.parent_span_id=$parent_span_id
         """,
         uuid=run_uuid,
         now=now,
@@ -98,6 +238,20 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         context_hash=context_hash,
         tool_chain=tool_chain,
         tool_chain_hash=tool_chain_hash,
+        provenance_version=provenance_envelope["version"],
+        provenance_state=provenance_envelope["provenance_state"],
+        provenance_digest=provenance_digest,
+        provenance_json=provenance_json,
+        provenance_provider=(run_provenance.provider if run_provenance else None),
+        provenance_model=(run_provenance.model if run_provenance else None),
+        provenance_runtime_id=(run_provenance.runtime_id if run_provenance else None),
+        provenance_os_name=(run_provenance.os_name if run_provenance else None),
+        provenance_environment_id=(run_provenance.environment_id if run_provenance else None),
+        provenance_capability_profile_hash=(
+            run_provenance.capability_profile_hash if run_provenance else None
+        ),
+        trace_id=(run_provenance.trace_id if run_provenance else None),
+        parent_span_id=(run_provenance.parent_span_id if run_provenance else None),
     )
 
     if req.project:
@@ -150,12 +304,23 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
 
     tool_nodes = 0
     for call in req.tool_calls[:100]:
+        tool_provenance = call.provenance
         await driver.execute_query(
             """
             CREATE (t:ToolCall {
               uuid:$uuid, created_at:$now, group_id:$gid, tool:$tool,
               command:$command, args:$args, exit_code:$exit_code,
-              duration_ms:$duration_ms, stdout:$stdout, stderr:$stderr
+              duration_ms:$duration_ms, stdout:$stdout, stderr:$stderr,
+              provenance_version:$provenance_version,
+              provenance_state:$provenance_state,
+              canonical_tool_id:$canonical_tool_id,
+              tool_version:$tool_version,
+              tool_schema_digest:$tool_schema_digest,
+              capabilities:$capabilities,
+              permission_scope:$permission_scope,
+              args_sha256:$args_sha256,
+              trace_id:$trace_id,
+              parent_span_id:$parent_span_id
             })
             WITH t
             MATCH (tr:TaskRun {uuid:$run_uuid})
@@ -172,6 +337,30 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             duration_ms=call.duration_ms,
             stdout=_truncate(call.stdout, 4000),
             stderr=_truncate(call.stderr, 4000),
+            provenance_version=(
+                tool_provenance.version if tool_provenance else TOOL_PROVENANCE_VERSION
+            ),
+            provenance_state=(
+                tool_provenance.provenance_state if tool_provenance else "unknown"
+            ),
+            canonical_tool_id=(
+                tool_provenance.canonical_tool_id if tool_provenance else None
+            ),
+            tool_version=(tool_provenance.tool_version if tool_provenance else None),
+            tool_schema_digest=(
+                tool_provenance.tool_schema_digest if tool_provenance else None
+            ),
+            capabilities=_canonical_string_list(
+                tool_provenance.capabilities if tool_provenance else []
+            ),
+            permission_scope=_canonical_string_list(
+                tool_provenance.permission_scope if tool_provenance else []
+            ),
+            args_sha256=_args_digest(call.args),
+            trace_id=(tool_provenance.trace_id if tool_provenance else None),
+            parent_span_id=(
+                tool_provenance.parent_span_id if tool_provenance else None
+            ),
         )
         tool_nodes += 1
 
@@ -227,6 +416,12 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         "status": "ok",
         "run_id": run_uuid,
         "context_hash": context_hash,
+        "provenance": {
+            "version": provenance_envelope["version"],
+            "digest": provenance_digest,
+            "state": provenance_envelope["provenance_state"],
+            "authoritative": False,
+        },
         "created": {
             "tool_calls": tool_nodes,
             "test_runs": test_nodes,
