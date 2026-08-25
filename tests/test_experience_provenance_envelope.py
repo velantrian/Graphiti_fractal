@@ -145,14 +145,14 @@ def test_ingest_persists_run_and_tool_provenance_as_additive_observations(monkey
         branch="main",
         commit="abc123",
         provenance=ExperienceProvenance(
-            provider="provider-a",
-            model="model-a",
-            runtime_id="python-3.12",
-            os_name="linux",
-            environment_id="env-a",
-            capability_profile_hash="cap-hash",
-            trace_id="trace-run",
-            parent_span_id="span-parent",
+            provider=" provider-a ",
+            model=" model-a ",
+            runtime_id=" python-3.12 ",
+            os_name=" linux ",
+            environment_id=" env-a ",
+            capability_profile_hash=" cap-hash ",
+            trace_id=" trace-run ",
+            parent_span_id=" span-parent ",
             provenance_state="complete",
         ),
         tool_calls=[
@@ -161,13 +161,13 @@ def test_ingest_persists_run_and_tool_provenance_as_additive_observations(monkey
                 args={"query": "safe"},
                 exit_code=0,
                 provenance=ToolCallProvenance(
-                    canonical_tool_id="tool.browser",
-                    tool_version="1.2.3",
-                    tool_schema_digest="schema-sha",
-                    capabilities=["read", "search"],
-                    permission_scope=["network"],
-                    trace_id="trace-tool",
-                    parent_span_id="span-run",
+                    canonical_tool_id=" tool.browser ",
+                    tool_version=" 1.2.3 ",
+                    tool_schema_digest=" schema-sha ",
+                    capabilities=[" read ", "search", "read"],
+                    permission_scope=[" network ", "network"],
+                    trace_id=" trace-tool ",
+                    parent_span_id=" span-run ",
                     provenance_state="complete",
                 ),
             )
@@ -186,8 +186,14 @@ def test_ingest_persists_run_and_tool_provenance_as_additive_observations(monkey
 
     assert run_call["provenance_version"] == "experience-provenance-v0"
     assert run_call["provenance_state"] == "complete"
+    assert run_call["provenance_provider"] == "provider-a"
+    assert run_call["provenance_model"] == "model-a"
+    assert run_call["provenance_runtime_id"] == "python-3.12"
+    assert run_call["provenance_os_name"] == "linux"
     assert run_call["provenance_environment_id"] == "env-a"
     assert run_call["provenance_capability_profile_hash"] == "cap-hash"
+    assert run_call["trace_id"] == "trace-run"
+    assert run_call["parent_span_id"] == "span-parent"
     assert run_call["provenance_digest"]
 
     assert tool_call["provenance_version"] == "tool-provenance-v0"
@@ -196,6 +202,8 @@ def test_ingest_persists_run_and_tool_provenance_as_additive_observations(monkey
     assert tool_call["tool_schema_digest"] == "schema-sha"
     assert tool_call["capabilities"] == ["read", "search"]
     assert tool_call["permission_scope"] == ["network"]
+    assert tool_call["trace_id"] == "trace-tool"
+    assert tool_call["parent_span_id"] == "span-run"
     assert tool_call["args_sha256"]
 
     assert result["provenance"]["authoritative"] is False
