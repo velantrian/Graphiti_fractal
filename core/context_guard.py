@@ -79,9 +79,15 @@ async def persist_recall_guard_metadata(
     """Mark a persisted chat turn as recall-derived by exact UUID.
 
     This metadata never changes truth/confidence/validity. It only records that
-    the assistant response was produced while recalled context was present.
+    the assistant response was produced while non-empty recalled context was
+    present.
     """
-    derived = bool(context_receipt and context_receipt.context_sha256 and context_receipt.status == "OK")
+    derived = bool(
+        context_receipt
+        and context_receipt.status == "OK"
+        and context_receipt.token_estimate > 0
+        and any(int(value) > 0 for value in context_receipt.source_counts.values())
+    )
     digest = context_receipt.context_sha256 if derived and context_receipt else None
     query_hash = context_receipt.query_sha256 if context_receipt else None
     result = await graphiti.driver.execute_query(
