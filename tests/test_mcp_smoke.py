@@ -72,6 +72,12 @@ def test_mcp_initialize_and_tools_contract():
         for write_tool in ("memory.remember", "memory.upload"):
             properties = by_name[write_tool]["inputSchema"].get("properties", {})
             assert "user_id" not in properties, "MCP must not allow caller-selected owner identity"
+
+        experience_properties = by_name["memory.search_experience"]["inputSchema"]["properties"]
+        assert experience_properties["available_tools"]["type"] == ["array", "null"]
+        assert experience_properties["forbidden_tools"]["type"] == ["array", "null"]
+        assert experience_properties["available_tools"]["items"] == {"type": "string"}
+        assert experience_properties["forbidden_tools"]["items"] == {"type": "string"}
     finally:
         process.terminate()
         process.wait(timeout=5)

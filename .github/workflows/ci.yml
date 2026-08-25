@@ -69,6 +69,7 @@ jobs:
             tests/test_graphrag_memory_ops.py \
             tests/test_retrieval_eval.py \
             tests/test_agent_memory_adversarial.py \
+            tests/test_experience_applicability.py \
             tests/test_provenance_contract.py \
             tests/test_provenance_migration.py \
             tests/test_dedupe_contract.py \
