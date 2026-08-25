@@ -178,7 +178,6 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
     provenance_envelope = build_experience_provenance_envelope(req)
     provenance_json = _canonical_json(provenance_envelope)
     provenance_digest = sha256(provenance_json.encode("utf-8")).hexdigest()
-    run_provenance = req.provenance
 
     driver = graphiti.driver
     await driver.execute_query(
@@ -242,16 +241,14 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         provenance_state=provenance_envelope["provenance_state"],
         provenance_digest=provenance_digest,
         provenance_json=provenance_json,
-        provenance_provider=(run_provenance.provider if run_provenance else None),
-        provenance_model=(run_provenance.model if run_provenance else None),
-        provenance_runtime_id=(run_provenance.runtime_id if run_provenance else None),
-        provenance_os_name=(run_provenance.os_name if run_provenance else None),
-        provenance_environment_id=(run_provenance.environment_id if run_provenance else None),
-        provenance_capability_profile_hash=(
-            run_provenance.capability_profile_hash if run_provenance else None
-        ),
-        trace_id=(run_provenance.trace_id if run_provenance else None),
-        parent_span_id=(run_provenance.parent_span_id if run_provenance else None),
+        provenance_provider=provenance_envelope["provider"],
+        provenance_model=provenance_envelope["model"],
+        provenance_runtime_id=provenance_envelope["runtime_id"],
+        provenance_os_name=provenance_envelope["os_name"],
+        provenance_environment_id=provenance_envelope["environment_id"],
+        provenance_capability_profile_hash=provenance_envelope["capability_profile_hash"],
+        trace_id=provenance_envelope["trace_id"],
+        parent_span_id=provenance_envelope["parent_span_id"],
     )
 
     if req.project:
@@ -304,7 +301,7 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
 
     tool_nodes = 0
     for call in req.tool_calls[:100]:
-        tool_provenance = call.provenance
+        tool_entry = provenance_envelope["tool_calls"][tool_nodes]
         await driver.execute_query(
             """
             CREATE (t:ToolCall {
@@ -337,30 +334,16 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             duration_ms=call.duration_ms,
             stdout=_truncate(call.stdout, 4000),
             stderr=_truncate(call.stderr, 4000),
-            provenance_version=(
-                tool_provenance.version if tool_provenance else TOOL_PROVENANCE_VERSION
-            ),
-            provenance_state=(
-                tool_provenance.provenance_state if tool_provenance else "unknown"
-            ),
-            canonical_tool_id=(
-                tool_provenance.canonical_tool_id if tool_provenance else None
-            ),
-            tool_version=(tool_provenance.tool_version if tool_provenance else None),
-            tool_schema_digest=(
-                tool_provenance.tool_schema_digest if tool_provenance else None
-            ),
-            capabilities=_canonical_string_list(
-                tool_provenance.capabilities if tool_provenance else []
-            ),
-            permission_scope=_canonical_string_list(
-                tool_provenance.permission_scope if tool_provenance else []
-            ),
-            args_sha256=_args_digest(call.args),
-            trace_id=(tool_provenance.trace_id if tool_provenance else None),
-            parent_span_id=(
-                tool_provenance.parent_span_id if tool_provenance else None
-            ),
+            provenance_version=tool_entry["provenance_version"],
+            provenance_state=tool_entry["provenance_state"],
+            canonical_tool_id=tool_entry["canonical_tool_id"],
+            tool_version=tool_entry["tool_version"],
+            tool_schema_digest=tool_entry["tool_schema_digest"],
+            capabilities=tool_entry["capabilities"],
+            permission_scope=tool_entry["permission_scope"],
+            args_sha256=tool_entry["args_sha256"],
+            trace_id=tool_entry["trace_id"],
+            parent_span_id=tool_entry["parent_span_id"],
         )
         tool_nodes += 1
 
