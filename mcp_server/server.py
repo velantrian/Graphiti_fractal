@@ -47,6 +47,18 @@ TOOLS: list[Tool] = [
                 "task_type": {"type": ["string", "null"], "default": None},
                 "context_hash": {"type": ["string", "null"], "default": None},
                 "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+                "available_tools": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "default": None,
+                    "description": "Optional target-environment tool set used to fail closed on inapplicable success patterns.",
+                },
+                "forbidden_tools": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "default": None,
+                    "description": "Optional target-environment deny-list for success-pattern reuse.",
+                },
             },
         },
     ),
@@ -211,11 +223,15 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             "context_hash": args.get("context_hash"),
             "limit": _bounded_int(args.get("limit"), default=5, minimum=1, maximum=50),
         }
-        items = (
-            await get_success_patterns(graphiti, **kwargs)
-            if mode == "success"
-            else await get_antipatterns(graphiti, **kwargs)
-        )
+        if mode == "success":
+            items = await get_success_patterns(
+                graphiti,
+                **kwargs,
+                available_tools=args.get("available_tools"),
+                forbidden_tools=args.get("forbidden_tools"),
+            )
+        else:
+            items = await get_antipatterns(graphiti, **kwargs)
         return {"mode": mode, "items": items}
 
     if name == "memory.remember":
