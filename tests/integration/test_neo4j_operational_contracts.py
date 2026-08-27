@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import pytest
@@ -10,6 +11,8 @@ from core.ingest_atomicity import (
     mark_ingest_claim_episode_created,
 )
 from core.recall_telemetry import read_recall_signals, record_recall
+from experience.models import ExperienceIngestRequest, ToolCallEvent
+from experience.writer import ingest_experience
 
 
 class ResultAdapter:
@@ -156,4 +159,55 @@ async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
         assert record["state"] == "COMMITTED"
         assert record["episode_uuid"] == "episode-atomic-1"
     finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_experience_nested_tool_args_use_scalar_representation():
+    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+    user = os.environ.get("NEO4J_USER", "neo4j")
+    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
+    driver = await _connect_with_retry(uri, user, password)
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query(
+            "MATCH (n) WHERE n.group_id = 'experience' DETACH DELETE n"
+        )
+        run_id = "experience-args-integration"
+        request = ExperienceIngestRequest(
+            run_id=run_id,
+            task_type="integration_test",
+            tool_calls=[
+                ToolCallEvent(
+                    tool="shell",
+                    args={"nested": {"key": "value"}, "items": [1, 2, 3]},
+                )
+            ],
+        )
+
+        result = await ingest_experience(graphiti, request)
+        assert result["status"] == "ok"
+        assert result["created"]["tool_calls"] == 1
+
+        stored = await graphiti.driver.execute_query(
+            """
+            MATCH (:TaskRun {uuid:$run_id})-[:HAS_TOOLCALL]->(t:ToolCall)
+            RETURN t.args_json AS args_json, t.args_sha256 AS args_sha256, t.args AS legacy_args
+            """,
+            run_id=run_id,
+        )
+        record = stored.records[0]
+        assert isinstance(record["args_json"], str)
+        assert json.loads(record["args_json"]) == {
+            "items": [1, 2, 3],
+            "nested": {"key": "value"},
+        }
+        assert isinstance(record["args_sha256"], str)
+        assert len(record["args_sha256"]) == 64
+        assert record["legacy_args"] is None
+    finally:
+        await graphiti.driver.execute_query(
+            "MATCH (n) WHERE n.uuid = $run_id OR n.group_id = 'experience' DETACH DELETE n",
+            run_id="experience-args-integration",
+        )
         await driver.close()
