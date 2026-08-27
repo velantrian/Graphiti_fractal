@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from app import FractalStaticFiles, app, require_api_token
+from visualization.visualization_export import CANONICAL_PUBLIC_GRAPH_DATA, validate_export_path
 
 
 @pytest.mark.asyncio
@@ -63,3 +66,18 @@ async def test_public_static_mount_never_serves_graph_data(tmp_path):
     )
 
     assert response.status_code == 404
+
+
+def test_visualization_export_rejects_alternate_public_static_alias():
+    alternate = CANONICAL_PUBLIC_GRAPH_DATA.parent / "owner_graph_export.json"
+    with pytest.raises(ValueError):
+        validate_export_path(str(alternate))
+
+
+def test_visualization_export_allows_only_canonical_public_static_path():
+    assert validate_export_path(str(CANONICAL_PUBLIC_GRAPH_DATA)) == CANONICAL_PUBLIC_GRAPH_DATA
+
+
+def test_visualization_export_allows_non_public_operator_path(tmp_path):
+    operator_path = tmp_path / "owner_graph_export.json"
+    assert validate_export_path(str(operator_path)) == Path(operator_path).resolve()
