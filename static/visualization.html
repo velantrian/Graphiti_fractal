@@ -34,8 +34,12 @@
     <div id="tooltip" class="tooltip" style="display:none"></div>
     <script>
     async function loadAndVisualize() {
-        const response = await fetch('graph_data.json');
-        if (!response.ok) throw new Error('Run: python main.py viz-export');
+        const token = sessionStorage.getItem('fractalApiToken') || '';
+        if (!token) throw new Error('Set the API token in the main Fractal Memory tab first');
+        const response = await fetch('/visualization/graph_data.json', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (!response.ok) throw new Error(response.status === 401 ? 'Invalid API token' : 'Run: python main.py viz-export');
         const data = await response.json();
         document.getElementById('nodeCount').textContent = `Nodes: ${data.nodes.length}`;
         document.getElementById('edgeCount').textContent = `Edges: ${data.edges.length}`;
