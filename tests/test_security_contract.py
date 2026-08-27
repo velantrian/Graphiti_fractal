@@ -1,7 +1,8 @@
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 
-from app import require_api_token
+from app import FractalStaticFiles, app, require_api_token
 
 
 @pytest.mark.asyncio
@@ -29,3 +30,36 @@ async def test_protected_api_rejects_missing_and_wrong_token(monkeypatch):
 async def test_protected_api_accepts_exact_bearer_token(monkeypatch):
     monkeypatch.setenv("FRACTAL_API_TOKEN", "expected-token")
     assert await require_api_token("Bearer expected-token") is None
+
+
+@pytest.mark.asyncio
+async def test_visualization_graph_data_route_requires_bearer_token(monkeypatch):
+    monkeypatch.setenv("FRACTAL_API_TOKEN", "expected-token")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.get("/visualization/graph_data.json")
+        wrong = await client.get(
+            "/visualization/graph_data.json",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        authenticated = await client.get(
+            "/visualization/graph_data.json",
+            headers={"Authorization": "Bearer expected-token"},
+        )
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert authenticated.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_public_static_mount_never_serves_graph_data(tmp_path):
+    (tmp_path / "graph_data.json").write_text('{"secret": true}', encoding="utf-8")
+    static = FractalStaticFiles(directory=tmp_path)
+
+    response = await static.get_response(
+        "graph_data.json",
+        {"type": "http", "method": "GET", "path": "/static/graph_data.json", "headers": []},
+    )
+
+    assert response.status_code == 404
