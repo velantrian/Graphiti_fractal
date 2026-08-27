@@ -57,10 +57,21 @@ def _tool_chain(req: ExperienceIngestRequest) -> list[str]:
     return [_norm(call.tool) for call in req.tool_calls if call.tool]
 
 
-def _args_digest(args) -> str | None:
+def canonical_tool_args(args: dict | None) -> tuple[str | None, str | None]:
+    """Encode structured tool arguments as deterministic Neo4j-safe scalar JSON.
+
+    Tool args are an API-shaped JSON structure. Unexpected Python objects must
+    fail closed instead of being coerced to implementation-dependent strings
+    (unlike `_canonical_json`, this never passes `default=str`).
+    """
     if args is None:
-        return None
-    return _json_digest(args)
+        return None, None
+    encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return encoded, sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _args_digest(args) -> str | None:
+    return canonical_tool_args(args)[1]
 
 
 def build_experience_provenance_envelope(req: ExperienceIngestRequest) -> dict:
@@ -174,6 +185,12 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         f"{key}={value}"
         for key, value in sorted((req.stack or {}).items(), key=lambda item: str(item[0]))
     ]
+
+    # Validate/canonicalize every bounded ToolCall's args before any durable
+    # write begins. A malformed (non-JSON-serializable) args value must fail
+    # closed here — before the TaskRun MERGE — rather than after some parent
+    # state (TaskRun/Project/Repo/File rows) has already been persisted.
+    canonical_tool_calls = [(call, *canonical_tool_args(call.args)) for call in req.tool_calls]
 
     provenance_envelope = build_experience_provenance_envelope(req)
     provenance_json = _canonical_json(provenance_envelope)
@@ -300,13 +317,13 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         )
 
     tool_nodes = 0
-    for call in req.tool_calls[:100]:
+    for call, args_json, args_sha256 in canonical_tool_calls[:100]:
         tool_entry = provenance_envelope["tool_calls"][tool_nodes]
         await driver.execute_query(
             """
             CREATE (t:ToolCall {
               uuid:$uuid, created_at:$now, group_id:$gid, tool:$tool,
-              command:$command, args:$args, exit_code:$exit_code,
+              command:$command, args_json:$args_json, exit_code:$exit_code,
               duration_ms:$duration_ms, stdout:$stdout, stderr:$stderr,
               provenance_version:$provenance_version,
               provenance_state:$provenance_state,
@@ -329,7 +346,7 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             run_uuid=run_uuid,
             tool=call.tool,
             command=call.command,
-            args=call.args,
+            args_json=args_json,
             exit_code=call.exit_code,
             duration_ms=call.duration_ms,
             stdout=_truncate(call.stdout, 4000),
@@ -341,7 +358,7 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             tool_schema_digest=tool_entry["tool_schema_digest"],
             capabilities=tool_entry["capabilities"],
             permission_scope=tool_entry["permission_scope"],
-            args_sha256=tool_entry["args_sha256"],
+            args_sha256=args_sha256,
             trace_id=tool_entry["trace_id"],
             parent_span_id=tool_entry["parent_span_id"],
         )
