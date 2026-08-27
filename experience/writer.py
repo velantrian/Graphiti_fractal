@@ -3,10 +3,33 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import re
+from typing import Any
 from uuid import uuid4
 
 from core.config import get_config
 from .models import ExperienceIngestRequest
+
+
+_REDACTED = "[REDACTED]"
+_SENSITIVE_KEYS = {
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+}
+_BEARER_RE = re.compile(
+    r"(?i)(authorization\s*:\s*bearer\s+)([\"']?)([^\s\"']+)(\2)"
+)
+_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(OPENAI_API_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PASSWORD|PASSWD|SECRET|TOKEN)"
+    r"(\s*=\s*)([\"']?)([^\s\"']+)(\3)"
+)
 
 
 EXPERIENCE_PROVENANCE_VERSION = "experience-provenance-v0"
@@ -57,16 +80,55 @@ def _tool_chain(req: ExperienceIngestRequest) -> list[str]:
     return [_norm(call.tool) for call in req.tool_calls if call.tool]
 
 
+def redact_text(text: str | None) -> str | None:
+    """Redact bounded secret-like forms before durable Experience persistence."""
+    if text is None:
+        return None
+    redacted = _BEARER_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}{match.group(4)}",
+        text,
+    )
+    redacted = _ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}{match.group(3)}"
+            f"{_REDACTED}{match.group(5)}"
+        ),
+        redacted,
+    )
+    return redacted
+
+
+def _redact_value(value: Any, *, key: str | None = None) -> Any:
+    normalized_key = (key or "").strip().lower().replace("-", "_")
+    if normalized_key in _SENSITIVE_KEYS:
+        return _REDACTED
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
 def canonical_tool_args(args: dict | None) -> tuple[str | None, str | None]:
-    """Encode structured tool arguments as deterministic Neo4j-safe scalar JSON.
+    """Encode redacted structured tool arguments as deterministic Neo4j-safe scalar JSON.
 
     Tool args are an API-shaped JSON structure. Unexpected Python objects must
     fail closed instead of being coerced to implementation-dependent strings
-    (unlike `_canonical_json`, this never passes `default=str`).
+    (unlike `_canonical_json`, this never passes `default=str`). Secret-bearing
+    keys/values are redacted before the args are ever serialized or hashed, so
+    no digest or persisted JSON can be used to recover a redacted secret.
     """
     if args is None:
         return None, None
-    encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    safe_args = _redact_value(args)
+    encoded = json.dumps(safe_args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return encoded, sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -167,6 +229,10 @@ def _truncate(text: str | None, limit: int = 4000) -> str | None:
         return None
     cleaned = text.strip()
     return cleaned if len(cleaned) <= limit else cleaned[:limit] + "..."
+
+
+def _safe_text(text: str | None, limit: int) -> str | None:
+    return _truncate(redact_text(text), limit)
 
 
 async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
@@ -345,12 +411,12 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             gid=group_id,
             run_uuid=run_uuid,
             tool=call.tool,
-            command=call.command,
+            command=_safe_text(call.command, 4000),
             args_json=args_json,
             exit_code=call.exit_code,
             duration_ms=call.duration_ms,
-            stdout=_truncate(call.stdout, 4000),
-            stderr=_truncate(call.stderr, 4000),
+            stdout=_safe_text(call.stdout, 4000),
+            stderr=_safe_text(call.stderr, 4000),
             provenance_version=tool_entry["provenance_version"],
             provenance_state=tool_entry["provenance_state"],
             canonical_tool_id=tool_entry["canonical_tool_id"],
@@ -381,10 +447,10 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             gid=group_id,
             run_uuid=run_uuid,
             framework=test_run.framework,
-            command=test_run.command,
+            command=_safe_text(test_run.command, 4000),
             passed=test_run.passed,
             duration_ms=test_run.duration_ms,
-            summary=_truncate(test_run.summary, 2000),
+            summary=_safe_text(test_run.summary, 2000),
         )
         test_nodes += 1
 
@@ -405,8 +471,8 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
             gid=group_id,
             run_uuid=run_uuid,
             error_type=error.error_type,
-            message=_truncate(error.message, 2000),
-            stack=_truncate(error.stack, 8000),
+            message=_safe_text(error.message, 2000),
+            stack=_safe_text(error.stack, 8000),
             file=error.file,
             line=error.line,
         )
