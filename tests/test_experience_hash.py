@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 
 from experience.models import ExperienceIngestRequest, ToolCallEvent
-from experience.writer import canonical_tool_args, compute_context_hash, ingest_experience
+from experience.writer import (
+    canonical_tool_args,
+    compute_context_hash,
+    ingest_experience,
+    redact_text,
+)
 
 
 def test_compute_context_hash_stable():
@@ -86,5 +91,54 @@ def test_invalid_tool_args_fail_closed_before_any_durable_write(monkeypatch):
 
     with pytest.raises(TypeError):
         asyncio.run(ingest_experience(graphiti, req))
+
+
+def test_canonical_tool_args_redacts_sensitive_keys_and_embedded_secrets():
+    args_json, digest = canonical_tool_args(
+        {
+            "password": "hunter2",
+            "nested": {"api_key": "sk-test-secret", "safe": "visible"},
+            "header": "Authorization: Bearer bearer-secret",
+            "quoted_header": 'Authorization: Bearer "quoted-bearer-secret"',
+            "env": "OPENAI_API_KEY=env-secret",
+            "quoted_env": "API_KEY='quoted-env-secret'",
+        }
+    )
+    decoded = json.loads(args_json)
+
+    assert decoded["password"] == "[REDACTED]"
+    assert decoded["nested"]["api_key"] == "[REDACTED]"
+    assert decoded["nested"]["safe"] == "visible"
+    assert "bearer-secret" not in args_json
+    assert "quoted-bearer-secret" not in args_json
+    assert "env-secret" not in args_json
+    assert "quoted-env-secret" not in args_json
+    assert digest and len(digest) == 64
+
+
+def test_redact_text_preserves_labels_quotes_and_safe_text():
+    text = (
+        "Authorization: Bearer abc123 "
+        "Authorization: Bearer \"quoted-bearer\" "
+        "OPENAI_API_KEY=sk-value "
+        "API_KEY='quoted-api-key' "
+        "password = \"quoted-password\" "
+        "safe=value"
+    )
+    redacted = redact_text(text)
+
+    assert "abc123" not in redacted
+    assert "quoted-bearer" not in redacted
+    assert "sk-value" not in redacted
+    assert "quoted-api-key" not in redacted
+    assert "quoted-password" not in redacted
+    assert "safe=value" in redacted
+    assert redacted.count("[REDACTED]") == 5
+    assert 'Bearer "[REDACTED]"' in redacted
+    assert "API_KEY='[REDACTED]'" in redacted
+
+
+def test_redact_text_preserves_none():
+    assert redact_text(None) is None
 
 
