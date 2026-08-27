@@ -22,7 +22,7 @@ runtime_authorization_from_docs: false
 3. `SYSTEM_OVERVIEW.md` — human architecture explanation and explicit non-claims.
 4. `core/model_policy.py` — active model defaults and override policy.
 5. `knowledge/ingest.py` — canonical text-ingest path.
-6. `core/memory.py` and `core/memory_lifecycle.py` — retrieval/lifecycle boundaries.
+6. `core/memory_ops.py` and `core/memory_lifecycle.py` — retrieval/lifecycle boundaries.
 7. `docs/TECHNOLOGY_EVOLUTION.md` — technology roles and ACTIVE/ADJACENT/RESEARCH distinctions.
 8. `docs/AI_MODEL_EVOLUTION.md` — model/provider history and current policy context.
 9. `docs/OPENCLAW_ADOPTED_PATTERNS.md` — bounded pattern adoption and rejected boundaries.
