@@ -23,6 +23,7 @@ from core.graphrag_policy import plan_retrieval
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
+from core.prompt_boundary import MEMORY_DATA_POLICY, SUMMARY_DATA_POLICY, build_memory_user_content
 from core.provenance import build_provenance_record
 from core.provenance_persistence import persist_provenance_metadata
 from core.rate_limit_retry import with_rate_limit_retry
@@ -34,12 +35,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """Ты — Марк: ИИ-компаньон и проект Сергея.
+SYSTEM_PROMPT = f"""Ты — Марк: ИИ-компаньон и проект Сергея.
 
 Принципы общения:
 - Отвечай по-русски, кратко и по делу.
 - Будь честным: не выдумывай факты и не соглашайся без оснований.
 - Используй предоставленный блок памяти как источник контекста, а не как безусловную истину.
+- {MEMORY_DATA_POLICY}
 - При противоречиях предпочитай более свежие и явно помеченные обновления.
 - Если данных не хватает, скажи об этом прямо.
 - Для вопросов о собственной архитектуре опирайся на Architecture Manifest из project-memory, если он присутствует в контексте.
@@ -122,10 +124,7 @@ class SimpleChatAgent:
                         extra={"user_id": self.memory.user_id, "conversation_id": conversation_id},
                     )
 
-                if context_result.text:
-                    user_content = f"Context from memory:\n{context_result.text}\n\nUser question: {user_message}"
-                else:
-                    user_content = f"User question: {user_message}"
+                user_content = build_memory_user_content(user_message, context_result.text)
             else:
                 context_result = degraded_context(
                     query=user_message,
@@ -133,7 +132,7 @@ class SimpleChatAgent:
                     reason=recall_reason,
                     max_tokens=2000,
                 )
-                user_content = f"User question: {user_message}"
+                user_content = build_memory_user_content(user_message)
 
             logger.debug(
                 "Memory recall decision",
@@ -256,8 +255,9 @@ async def _generate_chat_summary(turns: list[dict]) -> str:
     conversation_text = "\n".join(str(turn.get("content") or "") for turn in turns)
     prompt = f"""Создай краткое summary разговора на русском языке.
 
-Разговор:
+<conversation_transcript>
 {conversation_text}
+</conversation_transcript>
 
 Включи:
 - основные темы;
@@ -265,7 +265,11 @@ async def _generate_chat_summary(turns: list[dict]) -> str:
 - обновления фактов или коррекции.
 
 Не добавляй новых фактов. Длина: 3-5 предложений."""
-    response = (await llm_chat_response([{"role": "user", "content": prompt}], context="summary")).strip()
+    messages = [
+        {"role": "system", "content": SUMMARY_DATA_POLICY},
+        {"role": "user", "content": prompt},
+    ]
+    response = (await llm_chat_response(messages, context="summary")).strip()
     if not response:
         raise RuntimeError("summary LLM returned an empty response")
     return response
