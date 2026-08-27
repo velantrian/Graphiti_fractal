@@ -1,4 +1,4 @@
-from knowledge.ingest import fingerprint, normalize_text, split_into_paragraphs
+from core.text_utils import fingerprint, normalize_text, split_into_paragraphs
 
 
 def test_normalize_text_collapses_whitespace_and_lowercases():
@@ -17,5 +17,4 @@ def test_split_into_paragraphs_splits_and_overlaps():
     assert parts[0] == "A" * 50
     assert len(parts) > 2
     assert all(1 <= len(p) <= 1000 for p in parts[1:])
-
 
