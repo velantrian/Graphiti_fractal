@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 static_dir = Path(__file__).parent / "static"
+
+
+class FractalStaticFiles(StaticFiles):
+    """Serve public UI assets without exposing generated owner graph data."""
+
+    async def get_response(self, path: str, scope) -> Response:
+        if path.lstrip("/") == "graph_data.json":
+            return Response(status_code=404)
+        return await super().get_response(path, scope)
 
 
 def _api_token() -> str:
@@ -129,7 +138,7 @@ app = FastAPI(
     version="2.1.0",
     lifespan=lifespan,
 )
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+app.mount("/static", FractalStaticFiles(directory=static_dir), name="static")
 
 
 class ChatRequest(BaseModel):
@@ -173,7 +182,11 @@ async def visualization_view():
     return FileResponse(path)
 
 
-@app.get("/visualization/graph_data.json", include_in_schema=False)
+@app.get(
+    "/visualization/graph_data.json",
+    include_in_schema=False,
+    dependencies=[Depends(require_api_token)],
+)
 async def visualization_data():
     path = static_dir / "graph_data.json"
     if not path.exists():
