@@ -77,4 +77,5 @@ jobs:
             tests/test_buffer_clear_feature.py \
             tests/test_normalization.py \
             tests/test_entities.py \
-            tests/test_experience_hash.py
+            tests/test_experience_hash.py \
+            tests/test_experience_provenance_envelope.py
