@@ -34,8 +34,12 @@
     <div id="tooltip" class="tooltip" style="display:none"></div>
     <script>
     async function loadAndVisualize() {
-        const token = sessionStorage.getItem('fractalApiToken') || '';
-        if (!token) throw new Error('Set the API token in the main Fractal Memory tab first');
+        let token = sessionStorage.getItem('fractalApiToken') || '';
+        if (!token) {
+            token = window.prompt('Enter FRACTAL_API_TOKEN for this visualization tab') || '';
+            if (token) sessionStorage.setItem('fractalApiToken', token);
+        }
+        if (!token) throw new Error('API token is required to load graph data');
         const response = await fetch('/visualization/graph_data.json', {
             headers: { 'Authorization': 'Bearer ' + token }
         });
