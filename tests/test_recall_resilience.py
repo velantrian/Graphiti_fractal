@@ -27,6 +27,11 @@ class _BrokenMemory:
         raise RuntimeError("neo4j unavailable")
 
 
+def _discard_background_task(coro, **_kwargs):
+    coro.close()
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _clear_config_cache(monkeypatch):
     get_config.cache_clear()
@@ -43,7 +48,7 @@ async def test_recall_timeout_degrades_memory_but_still_returns_model_reply(monk
         return "ответ без памяти"
 
     monkeypatch.setattr(chat_module, "llm_chat_response", fake_llm)
-    monkeypatch.setattr(chat_module, "spawn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_module, "spawn", _discard_background_task)
 
     agent = SimpleChatAgent(SimpleNamespace(), _SlowMemory())
     reply, _, context = await agent.answer_core("Что мы обсуждали раньше?")
@@ -60,7 +65,7 @@ async def test_recall_error_degrades_memory_but_still_returns_model_reply(monkey
         return "ответ после ошибки памяти"
 
     monkeypatch.setattr(chat_module, "llm_chat_response", fake_llm)
-    monkeypatch.setattr(chat_module, "spawn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_module, "spawn", _discard_background_task)
 
     agent = SimpleChatAgent(SimpleNamespace(), _BrokenMemory())
     reply, _, context = await agent.answer_core("Напомни прошлое решение")

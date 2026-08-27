@@ -1,8 +1,9 @@
 VENV?=.venv
 PYTHON?=$(VENV)/bin/python
 PIP?=$(VENV)/bin/pip
+CONTRACT_TESTS?=tests/contract_suite.txt
 
-.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
+.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test test-contracts test-collect test-integration migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
 
 venv:
 	python -m venv $(VENV)
@@ -43,8 +44,19 @@ viz:
 benchmark:
 	$(PYTHON) main.py benchmark
 
-test:
-	$(PYTHON) -m pytest -q
+# Default developer signal: the same deterministic contract surface used by CI.
+test: test-contracts
+
+test-contracts:
+	$(PYTHON) -m pytest -q $$(cat $(CONTRACT_TESTS))
+
+# Collection hygiene spans every automated pytest surface without executing live/provider tests.
+test-collect:
+	$(PYTHON) -m pytest --collect-only -q tests
+
+# Requires an explicitly configured isolated Neo4j/Graphiti integration environment.
+test-integration:
+	$(PYTHON) -m pytest -q tests/integration
 
 migrate:
 	$(PYTHON) main.py migrate

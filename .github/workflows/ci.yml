@@ -51,31 +51,8 @@ jobs:
             app.py main.py simple_chat_agent.py \
             api core eval experience knowledge layers mcp_server queries scripts
 
+      - name: Verify automated test collection
+        run: make PYTHON=python test-collect
+
       - name: Run always-on contracts
-        run: |
-          python -m pytest -q \
-            tests/test_mcp_smoke.py \
-            tests/test_security_contract.py \
-            tests/test_instance_contract.py \
-            tests/test_model_policy.py \
-            tests/test_runtime_dependency_policy.py \
-            tests/test_memory_lifecycle.py \
-            tests/test_memory_import.py \
-            tests/test_recall_telemetry_wiring.py \
-            tests/test_context_guard.py \
-            tests/test_recall_resilience.py \
-            tests/test_derived_graph.py \
-            tests/test_graphrag_policy.py \
-            tests/test_graphrag_memory_ops.py \
-            tests/test_retrieval_eval.py \
-            tests/test_agent_memory_adversarial.py \
-            tests/test_experience_applicability.py \
-            tests/test_provenance_contract.py \
-            tests/test_provenance_migration.py \
-            tests/test_dedupe_contract.py \
-            tests/test_embedding_fail_closed.py \
-            tests/test_buffer_clear_feature.py \
-            tests/test_normalization.py \
-            tests/test_entities.py \
-            tests/test_experience_hash.py \
-            tests/test_experience_provenance_envelope.py
+        run: make PYTHON=python test-contracts
