@@ -13,6 +13,7 @@ from core.ingest_atomicity import (
 from core.recall_telemetry import read_recall_signals, record_recall
 from experience.models import ErrorEvent, ExperienceIngestRequest, ToolCallEvent
 from experience.writer import ingest_experience
+from layers.l2_semantic import get_l2_semantic_context_with_sources
 
 
 class ResultAdapter:
@@ -141,6 +142,7 @@ async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
             fingerprint="fp-1",
             claim_token=token,
             user_id="integration-owner",
+            origin_class="owner",
         )
 
         result = await graphiti.driver.execute_query(
@@ -149,6 +151,7 @@ async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
             MATCH (c:FractalIngestClaim {claim_key:'knowledge:fp-1'})
             RETURN e.fingerprint AS fingerprint,
                    e.group_id AS group_id,
+                   e.origin_class AS origin_class,
                    c.state AS state,
                    c.episode_uuid AS episode_uuid
             """
@@ -156,9 +159,84 @@ async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
         record = result.records[0]
         assert record["fingerprint"] == "fp-1"
         assert record["group_id"] == "knowledge"
+        assert record["origin_class"] == "owner"
         assert record["state"] == "COMMITTED"
         assert record["episode_uuid"] == "episode-atomic-1"
     finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_l2_requires_explicit_owner_origin_and_rejects_mixed_provenance():
+    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+    user = os.environ.get("NEO4J_USER", "neo4j")
+    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
+    driver = await _connect_with_retry(uri, user, password)
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.driver.execute_query(
+            """
+            CREATE (c:Community {uuid:'community-owner', group_id:'knowledge', level:0})
+            CREATE (n:Entity {uuid:'entity-owner', name:'Target Entity', group_id:'knowledge'})
+            CREATE (e:Episodic {
+                uuid:'episode-owner',
+                group_id:'knowledge',
+                origin_class:'owner',
+                content:'Owner verified source evidence'
+            })
+            CREATE (c)-[:HAS_MEMBER]->(n)
+            CREATE (e)-[:MENTIONS]->(n)
+            """
+        )
+
+        context, source_ids = await get_l2_semantic_context_with_sources(
+            graphiti,
+            "Target Entity",
+            allowed_group_ids=["knowledge"],
+        )
+        assert context is not None
+        assert "Owner verified source evidence" in context
+        assert "episode-owner" in source_ids
+
+        # Unknown origin is not silently upgraded to trusted merely because it
+        # shares the same Entity/Community and group.
+        await graphiti.driver.execute_query(
+            """
+            MATCH (n:Entity {uuid:'entity-owner'})
+            CREATE (e:Episodic {
+                uuid:'episode-unknown',
+                group_id:'knowledge',
+                content:'Unknown origin must close the gate'
+            })-[:MENTIONS]->(n)
+            """
+        )
+        context, source_ids = await get_l2_semantic_context_with_sources(
+            graphiti,
+            "Target Entity",
+            allowed_group_ids=["knowledge"],
+        )
+        assert context is None
+        assert source_ids == []
+
+        await graphiti.driver.execute_query(
+            "MATCH (e:Episodic {uuid:'episode-unknown'}) DETACH DELETE e"
+        )
+
+        # A durable non-owner taint on a member also closes the entire community,
+        # preventing derived/model output from being laundered through shared Entity identity.
+        await graphiti.driver.execute_query(
+            "MATCH (n:Entity {uuid:'entity-owner'}) SET n.has_non_owner_source=true"
+        )
+        context, source_ids = await get_l2_semantic_context_with_sources(
+            graphiti,
+            "Target Entity",
+            allowed_group_ids=["knowledge"],
+        )
+        assert context is None
+        assert source_ids == []
+    finally:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
         await driver.close()
 
 
