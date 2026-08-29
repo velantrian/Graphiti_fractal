@@ -13,6 +13,7 @@ ProvenanceState = Literal["unknown", "partial", "complete"]
 _REDACTED = "[REDACTED]"
 _SENSITIVE_STACK_KEYS = {
     "authorization",
+    "openai_api_key",
     "api_key",
     "apikey",
     "access_token",
