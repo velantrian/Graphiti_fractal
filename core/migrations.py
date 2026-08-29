@@ -62,23 +62,46 @@ async def ensure_migrations_table(graphiti) -> None:
     )
 
 
-async def applied_migration_ids(graphiti) -> set[str]:
+async def applied_migrations(graphiti) -> dict[str, str | None]:
+    """Return the durable migration ledger as migration_id -> checksum."""
     driver = graphiti.driver
-    res = await driver.execute_query("MATCH (m:Migration) RETURN m.migration_id AS id")
-    return {rec["id"] for rec in res.records}
+    res = await driver.execute_query(
+        "MATCH (m:Migration) RETURN m.migration_id AS id, m.checksum AS checksum"
+    )
+    return {rec["id"]: rec["checksum"] for rec in res.records}
+
+
+async def applied_migration_ids(graphiti) -> set[str]:
+    """Backward-compatible ID-only view of the durable migration ledger."""
+    return set((await applied_migrations(graphiti)).keys())
 
 
 async def apply_migrations(graphiti, *, migrations: Iterable[Migration] | None = None) -> dict:
     """
     Идемпотентно применяет миграции из ./migrations/*.cypher.
     Записывает применённые миграции в узлы (:Migration {migration_id, checksum, applied_at}).
+
+    Applied migration files are immutable: if the same migration_id is present
+    with a different checksum (or a legacy ledger row has no checksum), fail
+    closed before executing any migration statements.
     """
     await ensure_migrations_table(graphiti)
     all_migs = list(migrations) if migrations is not None else load_migrations()
     if not all_migs:
         return {"applied": 0, "skipped": 0, "total": 0}
 
-    applied = await applied_migration_ids(graphiti)
+    applied = await applied_migrations(graphiti)
+
+    for mig in all_migs:
+        if mig.migration_id not in applied:
+            continue
+        recorded_checksum = applied[mig.migration_id]
+        if recorded_checksum != mig.checksum:
+            raise RuntimeError(
+                "migration checksum mismatch for "
+                f"{mig.migration_id}: recorded={recorded_checksum!r} current={mig.checksum!r}"
+            )
+
     driver = graphiti.driver
     applied_count = 0
     skipped = 0
