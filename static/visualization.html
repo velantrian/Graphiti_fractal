@@ -33,6 +33,25 @@
     </div>
     <div id="tooltip" class="tooltip" style="display:none"></div>
     <script>
+    function setTooltipContent(tooltip, label, title) {
+        // Graph labels/summaries are memory data, not trusted HTML. Build the
+        // tooltip with text nodes so stored content cannot execute as markup.
+        tooltip.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = label || '';
+        tooltip.appendChild(strong);
+        tooltip.appendChild(document.createElement('br'));
+        tooltip.appendChild(document.createTextNode(title || ''));
+    }
+
+    function showError(message) {
+        const paragraph = document.createElement('p');
+        paragraph.style.padding = '20px';
+        paragraph.style.color = '#fca5a5';
+        paragraph.textContent = message;
+        document.getElementById('graph').insertAdjacentElement('afterend', paragraph);
+    }
+
     async function loadAndVisualize() {
         let token = sessionStorage.getItem('fractalApiToken') || '';
         if (!token) {
@@ -65,7 +84,7 @@
             labels.attr('x',d=>d.x).attr('y',d=>d.y+d.size+15);
         });
         const tooltip=document.getElementById('tooltip');
-        node.on('mouseover',function(event,d){tooltip.style.display='block';tooltip.innerHTML=`<strong>${d.label}</strong><br>${d.title || ''}`;tooltip.style.left=(event.pageX+10)+'px';tooltip.style.top=(event.pageY+10)+'px';})
+        node.on('mouseover',function(event,d){tooltip.style.display='block';setTooltipContent(tooltip,d.label,d.title);tooltip.style.left=(event.pageX+10)+'px';tooltip.style.top=(event.pageY+10)+'px';})
             .on('mousemove',event=>{tooltip.style.left=(event.pageX+10)+'px';tooltip.style.top=(event.pageY+10)+'px';})
             .on('mouseout',()=>{tooltip.style.display='none';});
     }
@@ -75,9 +94,7 @@
             .on('drag',(event,d)=>{d.fx=event.x;d.fy=event.y;})
             .on('end',(event,d)=>{if(!event.active)simulation.alphaTarget(0);d.fx=null;d.fy=null;});
     }
-    loadAndVisualize().catch(err => {
-        document.getElementById('graph').insertAdjacentHTML('afterend', `<p style="padding:20px;color:#fca5a5">${err.message}</p>`);
-    });
+    loadAndVisualize().catch(err => showError(err.message));
     </script>
 </body>
 </html>
