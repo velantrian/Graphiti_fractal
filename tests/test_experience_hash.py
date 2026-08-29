@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from experience.models import ExperienceIngestRequest, ToolCallEvent
+from experience.models import ErrorEvent, ExperienceIngestRequest, TestRunEvent, ToolCallEvent
 from experience.writer import (
     canonical_tool_args,
     compute_context_hash,
@@ -142,3 +142,46 @@ def test_redact_text_preserves_none():
     assert redact_text(None) is None
 
 
+class _RecordingDriver:
+    def __init__(self):
+        self.calls = []
+
+    async def execute_query(self, query, **kwargs):
+        self.calls.append((query, kwargs))
+        return SimpleNamespace(records=[])
+
+
+class _RecordingGraphiti:
+    def __init__(self):
+        self.driver = _RecordingDriver()
+
+
+def test_same_run_id_reuses_deterministic_child_ids_and_merge_queries(monkeypatch):
+    monkeypatch.setattr(
+        "experience.writer.get_config",
+        lambda: SimpleNamespace(memory=SimpleNamespace(experience_group_id="experience")),
+    )
+    req = ExperienceIngestRequest(
+        run_id="run-idempotent-001",
+        task_type="fix_bug",
+        tool_calls=[ToolCallEvent(tool="shell", command="echo ok", args={"safe": "yes"})],
+        test_runs=[TestRunEvent(framework="pytest", command="pytest -q", passed=True)],
+        errors=[ErrorEvent(error_type="ExampleError", message="bounded")],
+    )
+    graphiti = _RecordingGraphiti()
+
+    asyncio.run(ingest_experience(graphiti, req))
+    asyncio.run(ingest_experience(graphiti, req))
+
+    child_markers = {
+        "ToolCall": "MERGE (t:ToolCall {uuid:$uuid})",
+        "TestRun": "MERGE (t:TestRun {uuid:$uuid})",
+        "ErrorEvent": "MERGE (e:ErrorEvent {uuid:$uuid})",
+    }
+    for label, marker in child_markers.items():
+        writes = [(query, kwargs) for query, kwargs in graphiti.driver.calls if marker in query]
+        assert len(writes) == 2, label
+        assert writes[0][1]["uuid"] == writes[1][1]["uuid"], label
+        assert writes[0][1]["run_uuid"] == "run-idempotent-001"
+        assert f"CREATE (t:{label}" not in writes[0][0]
+        assert f"CREATE (e:{label}" not in writes[0][0]
