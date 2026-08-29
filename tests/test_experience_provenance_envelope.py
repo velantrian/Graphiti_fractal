@@ -181,7 +181,7 @@ def test_ingest_persists_run_and_tool_provenance_as_additive_observations(monkey
         kwargs for query, kwargs in graphiti.driver.calls if "MERGE (tr:TaskRun" in query
     )
     tool_call = next(
-        kwargs for query, kwargs in graphiti.driver.calls if "CREATE (t:ToolCall" in query
+        kwargs for query, kwargs in graphiti.driver.calls if "MERGE (t:ToolCall" in query
     )
 
     assert run_call["provenance_version"] == "experience-provenance-v0"
