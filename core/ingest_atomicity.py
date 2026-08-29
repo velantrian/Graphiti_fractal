@@ -143,6 +143,43 @@ async def mark_ingest_claim_failed(
     )
 
 
+async def classify_episode_origin(
+    graphiti,
+    *,
+    episode_uuid: str,
+    origin_class: str,
+    authoritative_fact: bool = False,
+) -> None:
+    """Classify an exact existing episode and propagate non-owner Entity taint.
+
+    This is for direct Graphiti write paths that cannot use the Fractal ingest
+    claim workflow (for example persisted chat turns/summaries). Unknown origin
+    is never inferred. Non-owner taint is monotonic and therefore fail-closed.
+    """
+    if origin_class not in VALID_ORIGIN_CLASSES:
+        raise ValueError(f"invalid origin_class: {origin_class!r}")
+
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (e:Episodic {uuid:$episode_uuid})
+        SET e.origin_class=$origin_class,
+            e.authoritative_fact=$authoritative_fact
+        WITH e
+        OPTIONAL MATCH (e)-[:MENTIONS]->(n:Entity)
+        FOREACH (_ IN CASE
+            WHEN n IS NULL OR $origin_class = 'owner' THEN []
+            ELSE [1]
+        END | SET n.has_non_owner_source=true)
+        RETURN e.uuid AS uuid
+        """,
+        episode_uuid=episode_uuid,
+        origin_class=origin_class,
+        authoritative_fact=authoritative_fact,
+    )
+    if not result.records:
+        raise LookupError(f"episode not found for origin classification: {episode_uuid}")
+
+
 async def finalize_episode_identity(
     graphiti,
     *,
