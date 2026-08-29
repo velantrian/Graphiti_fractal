@@ -64,6 +64,7 @@ def test_automated_validation_installs_reviewed_constraints():
         ".github/workflows/neo4j-integration.yml",
         ".github/workflows/provider-e2e.yml",
         ".github/workflows/provenance-dry-run.yml",
+        ".github/workflows/external-validation.yml",
     )
     for workflow_path in workflow_paths:
         workflow = (ROOT / workflow_path).read_text(encoding="utf-8")

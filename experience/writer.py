@@ -5,7 +5,7 @@ from hashlib import sha256
 import json
 import re
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from core.config import get_config
 from .models import ExperienceIngestRequest
@@ -63,6 +63,11 @@ def _canonical_json(value) -> str:
 
 def _json_digest(value) -> str:
     return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _child_uuid(run_uuid: str, kind: str, index: int) -> str:
+    """Return a stable UUID for one bounded child position within a TaskRun."""
+    return str(uuid5(NAMESPACE_URL, f"fractal-experience:{run_uuid}:{kind}:{index}"))
 
 
 def compute_context_hash(req: ExperienceIngestRequest) -> str:
@@ -383,30 +388,30 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         )
 
     tool_nodes = 0
-    for call, args_json, args_sha256 in canonical_tool_calls[:100]:
-        tool_entry = provenance_envelope["tool_calls"][tool_nodes]
+    for index, (call, args_json, args_sha256) in enumerate(canonical_tool_calls[:100]):
+        tool_entry = provenance_envelope["tool_calls"][index]
         await driver.execute_query(
             """
-            CREATE (t:ToolCall {
-              uuid:$uuid, created_at:$now, group_id:$gid, tool:$tool,
-              command:$command, args_json:$args_json, exit_code:$exit_code,
-              duration_ms:$duration_ms, stdout:$stdout, stderr:$stderr,
-              provenance_version:$provenance_version,
-              provenance_state:$provenance_state,
-              canonical_tool_id:$canonical_tool_id,
-              tool_version:$tool_version,
-              tool_schema_digest:$tool_schema_digest,
-              capabilities:$capabilities,
-              permission_scope:$permission_scope,
-              args_sha256:$args_sha256,
-              trace_id:$trace_id,
-              parent_span_id:$parent_span_id
-            })
+            MERGE (t:ToolCall {uuid:$uuid})
+            ON CREATE SET t.created_at=$now
+            SET t.group_id=$gid, t.tool=$tool,
+                t.command=$command, t.args_json=$args_json, t.exit_code=$exit_code,
+                t.duration_ms=$duration_ms, t.stdout=$stdout, t.stderr=$stderr,
+                t.provenance_version=$provenance_version,
+                t.provenance_state=$provenance_state,
+                t.canonical_tool_id=$canonical_tool_id,
+                t.tool_version=$tool_version,
+                t.tool_schema_digest=$tool_schema_digest,
+                t.capabilities=$capabilities,
+                t.permission_scope=$permission_scope,
+                t.args_sha256=$args_sha256,
+                t.trace_id=$trace_id,
+                t.parent_span_id=$parent_span_id
             WITH t
             MATCH (tr:TaskRun {uuid:$run_uuid})
             MERGE (tr)-[:HAS_TOOLCALL]->(t)
             """,
-            uuid=str(uuid4()),
+            uuid=_child_uuid(run_uuid, "tool", index),
             now=now,
             gid=group_id,
             run_uuid=run_uuid,
@@ -431,18 +436,19 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         tool_nodes += 1
 
     test_nodes = 0
-    for test_run in req.test_runs[:50]:
+    for index, test_run in enumerate(req.test_runs[:50]):
         await driver.execute_query(
             """
-            CREATE (t:TestRun {
-              uuid:$uuid, created_at:$now, group_id:$gid, framework:$framework,
-              command:$command, passed:$passed, duration_ms:$duration_ms, summary:$summary
-            })
+            MERGE (t:TestRun {uuid:$uuid})
+            ON CREATE SET t.created_at=$now
+            SET t.group_id=$gid, t.framework=$framework,
+                t.command=$command, t.passed=$passed, t.duration_ms=$duration_ms,
+                t.summary=$summary
             WITH t
             MATCH (run:TaskRun {uuid:$run_uuid})
             MERGE (run)-[:HAS_TESTRUN]->(t)
             """,
-            uuid=str(uuid4()),
+            uuid=_child_uuid(run_uuid, "test", index),
             now=now,
             gid=group_id,
             run_uuid=run_uuid,
@@ -455,18 +461,18 @@ async def ingest_experience(graphiti, req: ExperienceIngestRequest) -> dict:
         test_nodes += 1
 
     error_nodes = 0
-    for error in req.errors[:50]:
+    for index, error in enumerate(req.errors[:50]):
         await driver.execute_query(
             """
-            CREATE (e:ErrorEvent {
-              uuid:$uuid, created_at:$now, group_id:$gid, error_type:$error_type,
-              message:$message, stack:$stack, file:$file, line:$line
-            })
+            MERGE (e:ErrorEvent {uuid:$uuid})
+            ON CREATE SET e.created_at=$now
+            SET e.group_id=$gid, e.error_type=$error_type,
+                e.message=$message, e.stack=$stack, e.file=$file, e.line=$line
             WITH e
             MATCH (run:TaskRun {uuid:$run_uuid})
             MERGE (run)-[:FAILED_WITH]->(e)
             """,
-            uuid=str(uuid4()),
+            uuid=_child_uuid(run_uuid, "error", index),
             now=now,
             gid=group_id,
             run_uuid=run_uuid,

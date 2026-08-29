@@ -8,8 +8,55 @@ permissions:
   contents: read
 
 jobs:
-  provider-e2e:
+  provider-e2e-preflight:
     if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      secret_available: ${{ steps.provider-secret.outputs.available }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify exact PR head and external-gate marker
+        id: gate
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "expected $EXPECTED_SHA but checked out $ACTUAL_SHA"
+            exit 2
+          }
+          if git log -1 --pretty=%B | grep -Fq '[external-gate]'; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'External validation requested for this exact head.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'External validation not requested: no [external-gate] marker.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Probe provider secret
+        id: provider-secret
+        shell: bash
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo 'Provider credential preflight: AVAILABLE' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Provider credential preflight: UNAVAILABLE' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  provider-e2e:
+    needs: provider-e2e-preflight
+    if: needs.provider-e2e-preflight.outputs.enabled == 'true' && needs.provider-e2e-preflight.outputs.secret_available == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -32,71 +79,47 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Verify exact PR head and external-gate marker
-        id: gate
+      - name: Verify exact PR head
         shell: bash
         env:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          ACTUAL_SHA="$(git rev-parse HEAD)"
-          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
-            echo "expected $EXPECTED_SHA but checked out $ACTUAL_SHA"
-            exit 2
-          }
-          if git log -1 --pretty=%B | grep -Fq '[external-gate]'; then
-            echo 'enabled=true' >> "$GITHUB_OUTPUT"
-            echo 'External gate marker present.' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'enabled=false' >> "$GITHUB_OUTPUT"
-            echo 'SKIPPED_NO_EXTERNAL_GATE_MARKER' >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Probe provider secret
-        if: steps.gate.outputs.enabled == 'true'
-        id: provider-secret
-        shell: bash
-        run: |
-          if [ -n "$OPENAI_API_KEY" ]; then
-            echo 'available=true' >> "$GITHUB_OUTPUT"
-            echo 'OPENAI_API_KEY: AVAILABLE' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'available=false' >> "$GITHUB_OUTPUT"
-            echo 'Provider E2E: BLOCKED_MISSING_OPENAI_API_KEY' >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Set up Python
-        if: steps.gate.outputs.enabled == 'true' && steps.provider-secret.outputs.available == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints-ci.txt
 
-      - name: Install dependencies
-        if: steps.gate.outputs.enabled == 'true' && steps.provider-secret.outputs.available == 'true'
+      - name: Install reviewed dependency environment
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -c constraints-ci.txt -r requirements.txt
+          python -m pip check
 
       - name: Run bounded provider-backed E2E
-        if: steps.gate.outputs.enabled == 'true' && steps.provider-secret.outputs.available == 'true'
         run: python -m pytest -q tests/e2e/test_provider_backed_memory_e2e.py
 
       - name: Provider acceptance summary
-        if: always() && steps.gate.outputs.enabled == 'true'
+        if: always()
         shell: bash
         run: |
-          if [ "${{ steps.provider-secret.outputs.available }}" != 'true' ]; then
-            echo 'Provider gate verdict: BLOCKED_MISSING_SECRET' >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ job.status }}" = 'success' ]; then
-            echo 'Provider gate verdict: PASS' >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ job.status }}" = 'success' ]; then
+            echo 'Provider gate verdict: PASS (test executed)' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'Provider gate verdict: FAIL' >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  provenance-preview:
+  provenance-preview-preflight:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      secrets_available: ${{ steps.legacy-secrets.outputs.available }}
     env:
       NEO4J_URI: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_URI }}
       NEO4J_USER: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_USER }}
@@ -120,43 +143,64 @@ jobs:
           }
           if git log -1 --pretty=%B | grep -Fq '[external-gate]'; then
             echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo 'Provenance preview requested for this exact head.' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
-            echo 'SKIPPED_NO_EXTERNAL_GATE_MARKER' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Provenance preview not requested: no [external-gate] marker.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Probe legacy Neo4j secrets
-        if: steps.gate.outputs.enabled == 'true'
         id: legacy-secrets
         shell: bash
         run: |
           if [ -n "$NEO4J_URI" ] && [ -n "$NEO4J_USER" ] && [ -n "$NEO4J_PASSWORD" ]; then
             echo 'available=true' >> "$GITHUB_OUTPUT"
-            echo 'Legacy Neo4j credentials: AVAILABLE' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Legacy Neo4j credential preflight: AVAILABLE' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'available=false' >> "$GITHUB_OUTPUT"
-            echo 'Provenance gate: BLOCKED_MISSING_LEGACY_NEO4J_SECRETS' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Legacy Neo4j credential preflight: UNAVAILABLE' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  provenance-preview:
+    needs: provenance-preview-preflight
+    if: needs.provenance-preview-preflight.outputs.enabled == 'true' && needs.provenance-preview-preflight.outputs.secrets_available == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NEO4J_URI: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_URI }}
+      NEO4J_USER: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_USER }}
+      NEO4J_PASSWORD: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_PASSWORD }}
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
       - name: Set up Python
-        if: steps.gate.outputs.enabled == 'true' && steps.legacy-secrets.outputs.available == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints-ci.txt
 
-      - name: Install dependencies
-        if: steps.gate.outputs.enabled == 'true' && steps.legacy-secrets.outputs.available == 'true'
+      - name: Install reviewed dependency environment
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -c constraints-ci.txt -r requirements.txt
+          python -m pip check
 
       - name: Run provenance DRY_RUN only
-        if: steps.gate.outputs.enabled == 'true' && steps.legacy-secrets.outputs.available == 'true'
         run: python scripts/provenance_migration.py | tee provenance-preview.json
 
       - name: Upload provenance preview
-        if: steps.gate.outputs.enabled == 'true' && steps.legacy-secrets.outputs.available == 'true' && success()
         uses: actions/upload-artifact@v4
         with:
           name: provenance-preview-${{ github.event.pull_request.head.sha }}
@@ -165,13 +209,11 @@ jobs:
           retention-days: 7
 
       - name: Provenance acceptance summary
-        if: always() && steps.gate.outputs.enabled == 'true'
+        if: always()
         shell: bash
         run: |
-          if [ "${{ steps.legacy-secrets.outputs.available }}" != 'true' ]; then
-            echo 'Provenance gate verdict: BLOCKED_MISSING_SECRET' >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ job.status }}" = 'success' ]; then
-            echo 'Provenance gate verdict: PASS (DRY_RUN only)' >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ job.status }}" = 'success' ]; then
+            echo 'Provenance gate verdict: PASS (DRY_RUN executed)' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'Provenance gate verdict: FAIL' >> "$GITHUB_STEP_SUMMARY"
           fi
