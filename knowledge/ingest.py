@@ -8,6 +8,7 @@ from core.config import get_config
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
 from core.ingest_atomicity import (
+    VALID_ORIGIN_CLASSES,
     acquire_ingest_claim,
     finalize_episode_identity,
     mark_ingest_claim_episode_created,
@@ -294,13 +295,18 @@ async def ingest_text_document(
     user_id: str | None = None,
     job_id: str | None = None,
     group_id: str | None = None,
+    origin_class: str | None = None,
 ) -> dict:
-    """Canonical Graphiti-native text ingestion path.
+    """Canonical Graphiti-native text ingestion path with durable origin.
 
     A unique Fractal ingest claim is acquired before Graphiti writes. This closes
     concurrent same-group/fingerprint races at the app boundary. Graphiti still
     owns its internal transaction; after it returns the exact episode UUID,
-    fingerprint/group/authorship are finalized atomically in one Cypher query.
+    fingerprint/group/origin/authorship are finalized atomically in one Cypher query.
+
+    When a caller does not state origin explicitly, authenticated owner ingestion
+    (``user_id`` present) is classified as ``owner``; anonymous/internal ingestion
+    fails closed to ``untrusted``.
     """
     from api.jobs import update_upload_job
     from core.rate_limit_retry import with_rate_limit_retry
@@ -311,6 +317,10 @@ async def ingest_text_document(
         raise ValueError("text is empty")
     if not group_id:
         group_id = get_config().memory.knowledge_group_id
+
+    resolved_origin_class = origin_class or ("owner" if user_id else "untrusted")
+    if resolved_origin_class not in VALID_ORIGIN_CLASSES:
+        raise ValueError(f"invalid origin_class: {resolved_origin_class!r}")
 
     chunks = split_into_semantic_chunks(cleaned, max_chunk_size=1500, min_chunk_size=200)
     if not chunks:
@@ -415,6 +425,7 @@ async def ingest_text_document(
                 fingerprint=chunk_fp,
                 claim_token=claim_token,
                 user_id=user_id,
+                origin_class=resolved_origin_class,
             )
 
             try:
@@ -490,9 +501,10 @@ async def ingest_text_document(
         )
 
     logger.info(
-        "Document ingest complete source=%r group=%s added=%d skipped=%d total=%d elapsed=%.3fs",
+        "Document ingest complete source=%r group=%s origin=%s added=%d skipped=%d total=%d elapsed=%.3fs",
         source_description,
         group_id,
+        resolved_origin_class,
         added_count,
         skipped_count,
         total_chunks,
@@ -505,6 +517,7 @@ async def ingest_text_document(
         "chunks": total_chunks,
         "elapsed": elapsed,
         "warnings": warnings,
+        "origin_class": resolved_origin_class,
     }
 
 
