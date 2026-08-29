@@ -2,13 +2,16 @@
 
 This layer does not pretend to make Graphiti's internal write transaction part of
 our transaction. It closes Fractal-side concurrent duplicate races and makes
-post-Graphiti fingerprint/group/authorship finalization atomic.
+post-Graphiti fingerprint/group/authorship/origin finalization atomic.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+
+
+VALID_ORIGIN_CLASSES = {"owner", "agent_derived", "untrusted", "system"}
 
 
 async def ensure_ingest_claim_constraint(graphiti) -> None:
@@ -148,8 +151,17 @@ async def finalize_episode_identity(
     fingerprint: str,
     claim_token: str,
     user_id: str | None,
+    origin_class: str,
 ) -> None:
-    """Atomically finalize app-owned identity metadata and authorship by UUID."""
+    """Atomically finalize app-owned identity, origin, taint, and authorship.
+
+    ``has_non_owner_source`` is a monotonic taint on Entity nodes. A derived or
+    untrusted episode can therefore never silently become trusted merely because
+    Graphiti merges its extracted entity with an owner-derived entity later.
+    """
+    if origin_class not in VALID_ORIGIN_CLASSES:
+        raise ValueError(f"invalid origin_class: {origin_class!r}")
+
     result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic {uuid:$episode_uuid})
@@ -157,12 +169,19 @@ async def finalize_episode_identity(
         WHERE c.episode_uuid=$episode_uuid
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
+            e.origin_class=$origin_class,
             c.state='COMMITTED',
             c.committed_at=datetime()
         FOREACH (_ IN CASE WHEN $user_id IS NULL THEN [] ELSE [1] END |
             MERGE (u:User {user_id:$user_id})
             MERGE (u)-[:AUTHORED]->(e)
         )
+        WITH e
+        OPTIONAL MATCH (e)-[:MENTIONS]->(n:Entity)
+        FOREACH (_ IN CASE
+            WHEN n IS NULL OR $origin_class = 'owner' THEN []
+            ELSE [1]
+        END | SET n.has_non_owner_source=true)
         RETURN e.uuid AS uuid
         """,
         episode_uuid=episode_uuid,
@@ -171,6 +190,7 @@ async def finalize_episode_identity(
         fingerprint=fingerprint,
         group_id=group_id,
         user_id=user_id,
+        origin_class=origin_class,
     )
     if not result.records:
         raise RuntimeError("episode finalization failed: episode or matching ingest claim not found")
