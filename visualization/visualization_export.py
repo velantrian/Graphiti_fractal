@@ -78,34 +78,57 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     except Exception as e:
         logger.error(f"Error exporting nodes: {e}")
 
+    selected_node_uuids = list(nodes_map)
+    if not selected_node_uuids:
+        nodes_data = []
+        return {
+            "nodes": nodes_data,
+            "edges": edges_list,
+            "statistics": {
+                "total_nodes": 0,
+                "total_edges": 0,
+                "node_types": [],
+            },
+        }
+
     query_edges = """
     MATCH (n)-[r]->(m)
     WHERE (n:Entity OR n:Community)
       AND (m:Entity OR m:Community)
       AND n.uuid IS NOT NULL
       AND m.uuid IS NOT NULL
+      AND n.uuid IN $node_uuids
+      AND m.uuid IN $node_uuids
       AND coalesce(n.deleted, false) = false
       AND coalesce(m.deleted, false) = false
     RETURN n.uuid as source, m.uuid as target, type(r) as type, r.fact as fact
-    LIMIT $limit
+    LIMIT $edge_limit
     """
 
     try:
         if hasattr(driver, "execute_query"):
-            res_edges = await driver.execute_query(query_edges, limit=limit * 2)
+            res_edges = await driver.execute_query(
+                query_edges,
+                node_uuids=selected_node_uuids,
+                edge_limit=limit * 2,
+            )
             records_edges = res_edges.records
         else:
             async with driver.session() as session:
-                res_edges = await session.run(query_edges, limit=limit * 2)
+                res_edges = await session.run(
+                    query_edges,
+                    node_uuids=selected_node_uuids,
+                    edge_limit=limit * 2,
+                )
                 records_edges = await res_edges.list()
 
         for rec in records_edges:
             src = rec["source"]
             tgt = rec["target"]
+            # The Cypher query already restricts both endpoints to the exported
+            # node UUID set before LIMIT. Keep this defensive check so malformed
+            # driver results still cannot create dangling D3 links.
             if src in nodes_map and tgt in nodes_map:
-                # D3 forceLink consumes `source` / `target` by default. Keep the
-                # producer schema aligned with the browser consumer instead of
-                # relying on a frontend adapter that can silently drift.
                 edges_list.append(
                     {
                         "source": str(src),
