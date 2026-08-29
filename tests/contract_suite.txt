@@ -25,3 +25,4 @@ tests/test_entities.py
 tests/test_experience_hash.py
 tests/test_experience_stack_redaction.py
 tests/test_experience_provenance_envelope.py
+tests/test_trust_visualization_hardening.py

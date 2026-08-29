@@ -35,7 +35,7 @@ async def test_preview_does_not_touch_memory(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_apply_keeps_imports_namespace_and_untrusted_boundary(tmp_path):
+async def test_apply_keeps_imports_namespace_and_untrusted_boundary(tmp_path, monkeypatch):
     path = tmp_path / "export.jsonl"
     path.write_text(
         '\n'.join([
@@ -47,17 +47,23 @@ async def test_apply_keeps_imports_namespace_and_untrusted_boundary(tmp_path):
     plan = build_import_plan(str(path), source_type="codex")
     calls = []
 
+    async def fake_ingest(graphiti, text, **kwargs):
+        calls.append((graphiti, text, kwargs))
+        return {"added": 1, "skipped": 0, "warnings": [], "origin_class": "untrusted"}
+
+    monkeypatch.setattr("core.memory_import.ingest_text_document", fake_ingest)
+
     class Memory:
-        async def ingest_pipeline(self, text, **kwargs):
-            calls.append((text, kwargs))
-            return {"added": 1, "skipped": 0, "warnings": []}
+        graphiti = object()
+        user_id = "owner"
 
     result = await apply_import_plan(Memory(), plan, apply=True)
     assert result["mode"] == "APPLIED"
     assert result["promotion_authorized"] is False
     assert result["added"] == 2
-    assert all(kwargs["group_id"] == IMPORT_GROUP_ID for _, kwargs in calls)
-    assert all(kwargs["source_description"].startswith("external_import:codex:") for _, kwargs in calls)
+    assert all(kwargs["group_id"] == IMPORT_GROUP_ID for _, _, kwargs in calls)
+    assert all(kwargs["origin_class"] == "untrusted" for _, _, kwargs in calls)
+    assert all(kwargs["source_description"].startswith("external_import:codex:") for _, _, kwargs in calls)
 
 
 @pytest.mark.asyncio

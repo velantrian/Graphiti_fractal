@@ -34,13 +34,7 @@ def validate_export_path(filename: str) -> Path:
 
 
 async def export_graph_for_vis(graphiti, limit: int = 500):
-    """
-    Export graph structure for D3.js/Cytoscape visualization using direct Cypher.
-
-    Fetches:
-    - Nodes: Entity, Episodic, Community
-    - Edges: RELATES_TO, SAME_AS, MENTIONS, BELONGS_TO
-    """
+    """Export the bounded active Entity/Community graph for the authenticated D3 view."""
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
         logger.error("Graphiti driver not found for export")
@@ -49,12 +43,11 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     nodes_map = {}
     edges_list = []
 
-    # 1. Fetch Nodes (Entities & Communities)
-    # We limit to Entities and Communities to keep visualization clean,
-    # optionally Episodic if needed (but usually too many).
     query_nodes = """
     MATCH (n)
-    WHERE (n:Entity OR n:Community) AND n.uuid IS NOT NULL
+    WHERE (n:Entity OR n:Community)
+      AND n.uuid IS NOT NULL
+      AND coalesce(n.deleted, false) = false
     RETURN n.uuid as uuid, n.name as name, labels(n) as labels, n.group_id as group_id, n.summary as summary
     LIMIT $limit
     """
@@ -71,17 +64,11 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
         for rec in records_nodes:
             uuid = rec["uuid"]
             labels = rec["labels"]
-            node_type = "Entity"
-            if "Community" in labels:
-                node_type = "Community"
-            elif "Episodic" in labels:
-                node_type = "Episodic"
-            elif "User" in labels:
-                node_type = "User"
+            node_type = "Community" if "Community" in labels else "Entity"
 
             nodes_map[uuid] = {
                 "id": str(uuid),
-                "label": rec["name"] or f"{node_type}:{uuid[:4]}",
+                "label": rec["name"] or f"{node_type}:{str(uuid)[:4]}",
                 "title": rec["summary"] or "",
                 "type": node_type,
                 "group": rec["group_id"] or "default",
@@ -91,34 +78,61 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     except Exception as e:
         logger.error(f"Error exporting nodes: {e}")
 
-    # 2. Fetch Edges
-    # We only fetch edges where both source and target are in our fetched nodes map
+    selected_node_uuids = list(nodes_map)
+    if not selected_node_uuids:
+        nodes_data = []
+        return {
+            "nodes": nodes_data,
+            "edges": edges_list,
+            "statistics": {
+                "total_nodes": 0,
+                "total_edges": 0,
+                "node_types": [],
+            },
+        }
+
     query_edges = """
     MATCH (n)-[r]->(m)
-    WHERE n.uuid IS NOT NULL AND m.uuid IS NOT NULL
+    WHERE (n:Entity OR n:Community)
+      AND (m:Entity OR m:Community)
+      AND n.uuid IS NOT NULL
+      AND m.uuid IS NOT NULL
+      AND n.uuid IN $node_uuids
+      AND m.uuid IN $node_uuids
+      AND coalesce(n.deleted, false) = false
+      AND coalesce(m.deleted, false) = false
     RETURN n.uuid as source, m.uuid as target, type(r) as type, r.fact as fact
-    LIMIT $limit
+    LIMIT $edge_limit
     """
 
     try:
         if hasattr(driver, "execute_query"):
-            res_edges = await driver.execute_query(query_edges, limit=limit * 2)
+            res_edges = await driver.execute_query(
+                query_edges,
+                node_uuids=selected_node_uuids,
+                edge_limit=limit * 2,
+            )
             records_edges = res_edges.records
         else:
             async with driver.session() as session:
-                res_edges = await session.run(query_edges, limit=limit * 2)
+                res_edges = await session.run(
+                    query_edges,
+                    node_uuids=selected_node_uuids,
+                    edge_limit=limit * 2,
+                )
                 records_edges = await res_edges.list()
 
         for rec in records_edges:
             src = rec["source"]
             tgt = rec["target"]
-
-            # Filter edges to only those connecting nodes we have
+            # The Cypher query already restricts both endpoints to the exported
+            # node UUID set before LIMIT. Keep this defensive check so malformed
+            # driver results still cannot create dangling D3 links.
             if src in nodes_map and tgt in nodes_map:
                 edges_list.append(
                     {
-                        "from": str(src),
-                        "to": str(tgt),
+                        "source": str(src),
+                        "target": str(tgt),
                         "label": rec["type"],
                         "title": rec["fact"] or "",
                         "arrows": "to",

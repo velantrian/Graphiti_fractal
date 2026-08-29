@@ -20,6 +20,7 @@ from core.context_guard import build_context_receipt, degraded_context, persist_
 from core.conversation_buffer import get_user_conversation_buffer
 from core.graphiti_client import get_write_semaphore
 from core.graphrag_policy import plan_retrieval
+from core.ingest_atomicity import classify_episode_origin
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
@@ -213,6 +214,15 @@ class SimpleChatAgent:
         episode_uuid = _episode_uuid(result)
         if not episode_uuid:
             raise RuntimeError(f"{op_name} returned no episode UUID")
+        # Chat turns combine owner text with model output, and summaries are model
+        # synthesis. Classify both conservatively as agent-derived before any later
+        # L2 pass can treat their extracted entities as trusted owner evidence.
+        await classify_episode_origin(
+            graphiti,
+            episode_uuid=episode_uuid,
+            origin_class="agent_derived",
+            authoritative_fact=False,
+        )
         return episode_uuid
 
     async def _create_persisted_summary(self, *, conversation_id: str, end_turn_index: int) -> None:
