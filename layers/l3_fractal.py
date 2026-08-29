@@ -7,9 +7,9 @@ import logging
 from core import get_graphiti_client
 from core.instance import get_instance_user_id
 from core.llm import llm_chat_response
-from core.memory_ops import MemoryOps
 from core.provenance import build_provenance_record
 from core.provenance_persistence import persist_provenance_metadata
+from knowledge.ingest import ingest_text_document, resolve_group_id
 from layers.l2_semantic import get_l2_semantic_context_with_sources
 
 logger = logging.getLogger(__name__)
@@ -23,12 +23,7 @@ inferences. Model-generated synthesis is derived evidence, never Canon or owner 
 
 
 async def _mark_l3_derived_origin(graphiti, episode_uuid: str) -> None:
-    """Fail closed by durably tainting the L3 episode and every entity it mentions.
-
-    Entity nodes can be shared by multiple episodes. Therefore we do not overwrite an
-    entity's single origin label; instead ``has_non_owner_source`` is monotonic taint.
-    Any later L2 pass excludes a community containing a tainted member.
-    """
+    """Repair/confirm monotonic derived taint for an L3 episode and its entities."""
     result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic {uuid:$uuid})
@@ -88,10 +83,13 @@ async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = Non
         profile = profile[:1397].rstrip() + "..."
 
     owner = user_id or get_instance_user_id()
-    result = await MemoryOps(graphiti, owner).ingest_pipeline(
+    result = await ingest_text_document(
+        graphiti,
         profile,
         source_description=f"l3_profile:{entity_name}",
-        memory_type="knowledge",
+        user_id=owner,
+        group_id=resolve_group_id("knowledge"),
+        origin_class="agent_derived",
     )
     if result.get("status") != "ok":
         raise RuntimeError(f"L3 profile ingest failed: {result}")
@@ -116,8 +114,8 @@ async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = Non
         raise RuntimeError("L3 profile did not resolve to exactly one persisted episode")
 
     episode_uuid = uuids[0]
-    # Taint first. If provenance persistence fails afterwards, the graph remains
-    # conservative and cannot feed the derived artifact back into trusted L2.
+    # Canonical ingest already classifies new L3 data as agent_derived. Re-apply
+    # here so deduplicated legacy L3 episodes are repaired before provenance work.
     await _mark_l3_derived_origin(graphiti, episode_uuid)
 
     provenance = build_provenance_record(
