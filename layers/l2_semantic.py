@@ -3,7 +3,6 @@ import logging
 from collections.abc import Sequence
 
 from core import get_graphiti_client
-from core.instance import get_instance_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +55,20 @@ async def get_l2_semantic_context_with_sources(
 ) -> tuple[str | None, list[str]]:
     """Retrieve fail-closed owner-derived L2 context with exact source UUIDs.
 
-    Community nodes are used only as structural grouping. Their generated
-    summaries are deliberately not trusted as semantic input. The rendered L2
-    context comes from source Episodic content whose provenance is either
-    explicitly ``origin_class=owner`` or a legacy owner-authored episode with no
-    origin_class. Missing origin without owner authorship is denied.
+    Community nodes are structural grouping only; generated Community summaries
+    are not treated as trusted semantic input. Every rendered source must be an
+    Episodic node with explicit ``origin_class='owner'`` in the same group.
+    Missing/unknown origin is therefore denied rather than inferred as trusted.
 
-    Any current non-owner provenance, cross-group provenance, or durable
-    ``has_non_owner_source`` taint on a member excludes the whole community.
+    ``has_non_owner_source`` is monotonic Entity taint. If Graphiti ever merges a
+    derived/untrusted source into an otherwise owner-derived Entity, the whole
+    community is excluded from L2 instead of laundering the mixed provenance.
     """
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
         return "Graphiti driver not found for L2 context.", []
 
     allowed_groups = _normalize_allowed_groups(allowed_group_ids)
-    owner_id = get_instance_user_id()
     query = """
     MATCH (matched:Entity)
     WHERE toLower(matched.name) CONTAINS toLower($name)
@@ -89,15 +87,12 @@ async def get_l2_semantic_context_with_sources(
       AND member.group_id = c.group_id
     OPTIONAL MATCH (source:Episodic)-[:MENTIONS]->(member)
     WHERE coalesce(source.deleted, false) = false
-    OPTIONAL MATCH (owner:User {user_id:$owner_id})-[:AUTHORED]->(source)
     WITH c, member,
          [p IN collect(DISTINCT {
              uuid: source.uuid,
              group_id: source.group_id,
              origin_class: source.origin_class,
-             source_description: source.source_description,
-             content: coalesce(source.content, source.episode_body, ''),
-             owner_authored: owner IS NOT NULL
+             content: coalesce(source.content, source.episode_body, '')
          }) WHERE p.uuid IS NOT NULL] AS provenance
     WITH c, collect({
         uuid: member.uuid,
@@ -109,14 +104,7 @@ async def get_l2_semantic_context_with_sources(
         AND size(member.provenance) > 0
         AND all(p IN member.provenance WHERE
             p.group_id = c.group_id
-            AND (
-                p.origin_class = 'owner'
-                OR (
-                    p.origin_class IS NULL
-                    AND p.owner_authored = true
-                    AND NOT coalesce(p.source_description, '') STARTS WITH 'l3_profile:'
-                )
-            )
+            AND p.origin_class = 'owner'
         )
     )
     RETURN c.uuid AS uuid,
@@ -131,7 +119,6 @@ async def get_l2_semantic_context_with_sources(
                 query,
                 name=entity_name,
                 allowed_groups=allowed_groups,
-                owner_id=owner_id,
             )
             records = res.records
         else:
@@ -140,7 +127,6 @@ async def get_l2_semantic_context_with_sources(
                     query,
                     name=entity_name,
                     allowed_groups=allowed_groups,
-                    owner_id=owner_id,
                 )
                 records = await res.list()
     except Exception as exc:
