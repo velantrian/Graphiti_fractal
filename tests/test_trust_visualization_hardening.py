@@ -25,7 +25,11 @@ class RecordingDriver:
 
 
 class VisualizationDriver:
+    def __init__(self):
+        self.calls = []
+
     async def execute_query(self, query, **params):
+        self.calls.append((query, params))
         if "RETURN n.uuid as uuid" in query:
             return SimpleNamespace(
                 records=[
@@ -45,6 +49,12 @@ class VisualizationDriver:
                     },
                 ]
             )
+        assert params["node_uuids"] == ["node-a", "node-b"]
+        assert params["edge_limit"] == 20
+        assert "n.uuid IN $node_uuids" in query
+        assert "m.uuid IN $node_uuids" in query
+        assert query.index("n.uuid IN $node_uuids") < query.index("LIMIT $edge_limit")
+        assert query.index("m.uuid IN $node_uuids") < query.index("LIMIT $edge_limit")
         return SimpleNamespace(
             records=[
                 {
@@ -236,8 +246,9 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
 
 
 @pytest.mark.asyncio
-async def test_visualization_export_uses_d3_edge_contract():
-    graphiti = SimpleNamespace(driver=VisualizationDriver())
+async def test_visualization_export_uses_d3_edge_contract_and_prelimit_node_set():
+    driver = VisualizationDriver()
+    graphiti = SimpleNamespace(driver=driver)
 
     data = await export_graph_for_vis(graphiti, limit=10)
 
@@ -248,6 +259,7 @@ async def test_visualization_export_uses_d3_edge_contract():
     assert edge["target"] == "node-b"
     assert "from" not in edge
     assert "to" not in edge
+    assert len(driver.calls) == 2
 
 
 def test_visualization_queries_filter_deleted_nodes_and_irrelevant_edges_before_limit():
@@ -256,6 +268,9 @@ def test_visualization_queries_filter_deleted_nodes_and_irrelevant_edges_before_
     assert "coalesce(m.deleted, false) = false" in source
     assert "(n:Entity OR n:Community)" in source
     assert "(m:Entity OR m:Community)" in source
+    assert "n.uuid IN $node_uuids" in source
+    assert "m.uuid IN $node_uuids" in source
+    assert "LIMIT $edge_limit" in source
 
 
 def test_visualization_does_not_render_graph_data_with_inner_html():
