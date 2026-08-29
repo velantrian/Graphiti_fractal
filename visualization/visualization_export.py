@@ -34,13 +34,7 @@ def validate_export_path(filename: str) -> Path:
 
 
 async def export_graph_for_vis(graphiti, limit: int = 500):
-    """
-    Export graph structure for D3.js/Cytoscape visualization using direct Cypher.
-
-    Fetches:
-    - Nodes: Entity, Episodic, Community
-    - Edges: RELATES_TO, SAME_AS, MENTIONS, BELONGS_TO
-    """
+    """Export the bounded Entity/Community graph for the authenticated D3 view."""
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
         logger.error("Graphiti driver not found for export")
@@ -49,9 +43,6 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     nodes_map = {}
     edges_list = []
 
-    # 1. Fetch Nodes (Entities & Communities)
-    # We limit to Entities and Communities to keep visualization clean,
-    # optionally Episodic if needed (but usually too many).
     query_nodes = """
     MATCH (n)
     WHERE (n:Entity OR n:Community) AND n.uuid IS NOT NULL
@@ -71,17 +62,11 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
         for rec in records_nodes:
             uuid = rec["uuid"]
             labels = rec["labels"]
-            node_type = "Entity"
-            if "Community" in labels:
-                node_type = "Community"
-            elif "Episodic" in labels:
-                node_type = "Episodic"
-            elif "User" in labels:
-                node_type = "User"
+            node_type = "Community" if "Community" in labels else "Entity"
 
             nodes_map[uuid] = {
                 "id": str(uuid),
-                "label": rec["name"] or f"{node_type}:{uuid[:4]}",
+                "label": rec["name"] or f"{node_type}:{str(uuid)[:4]}",
                 "title": rec["summary"] or "",
                 "type": node_type,
                 "group": rec["group_id"] or "default",
@@ -91,8 +76,6 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     except Exception as e:
         logger.error(f"Error exporting nodes: {e}")
 
-    # 2. Fetch Edges
-    # We only fetch edges where both source and target are in our fetched nodes map
     query_edges = """
     MATCH (n)-[r]->(m)
     WHERE n.uuid IS NOT NULL AND m.uuid IS NOT NULL
@@ -112,13 +95,14 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
         for rec in records_edges:
             src = rec["source"]
             tgt = rec["target"]
-
-            # Filter edges to only those connecting nodes we have
             if src in nodes_map and tgt in nodes_map:
+                # D3 forceLink consumes `source` / `target` by default. Keep the
+                # producer schema aligned with the browser consumer instead of
+                # relying on a frontend adapter that can silently drift.
                 edges_list.append(
                     {
-                        "from": str(src),
-                        "to": str(tgt),
+                        "source": str(src),
+                        "target": str(tgt),
                         "label": rec["type"],
                         "title": rec["fact"] or "",
                         "arrows": "to",
