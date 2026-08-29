@@ -34,7 +34,7 @@ def validate_export_path(filename: str) -> Path:
 
 
 async def export_graph_for_vis(graphiti, limit: int = 500):
-    """Export the bounded Entity/Community graph for the authenticated D3 view."""
+    """Export the bounded active Entity/Community graph for the authenticated D3 view."""
     driver = getattr(graphiti, "driver", None) or getattr(graphiti, "_driver", None)
     if not driver:
         logger.error("Graphiti driver not found for export")
@@ -45,7 +45,9 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
 
     query_nodes = """
     MATCH (n)
-    WHERE (n:Entity OR n:Community) AND n.uuid IS NOT NULL
+    WHERE (n:Entity OR n:Community)
+      AND n.uuid IS NOT NULL
+      AND coalesce(n.deleted, false) = false
     RETURN n.uuid as uuid, n.name as name, labels(n) as labels, n.group_id as group_id, n.summary as summary
     LIMIT $limit
     """
@@ -78,7 +80,12 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
 
     query_edges = """
     MATCH (n)-[r]->(m)
-    WHERE n.uuid IS NOT NULL AND m.uuid IS NOT NULL
+    WHERE (n:Entity OR n:Community)
+      AND (m:Entity OR m:Community)
+      AND n.uuid IS NOT NULL
+      AND m.uuid IS NOT NULL
+      AND coalesce(n.deleted, false) = false
+      AND coalesce(m.deleted, false) = false
     RETURN n.uuid as source, m.uuid as target, type(r) as type, r.fact as fact
     LIMIT $limit
     """
