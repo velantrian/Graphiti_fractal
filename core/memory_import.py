@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from knowledge.ingest import ingest_text_document
+
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
 MAX_IMPORT_ENTRIES = 5000
 IMPORT_GROUP_ID = "imports"
@@ -127,11 +129,15 @@ async def apply_import_plan(memory, plan: dict, *, apply: bool = False) -> dict:
         f"{str(plan.get('source_sha256', ''))[:16]}"
     )
     for text in plan.get("_payload", []):
-        result = await memory.ingest_pipeline(
+        # Bypass the owner-default convenience wrapper so import provenance is
+        # classified before Graphiti entity finalization, not repaired afterwards.
+        result = await ingest_text_document(
+            memory.graphiti,
             text,
             source_description=source,
-            memory_type="knowledge",
+            user_id=memory.user_id,
             group_id=IMPORT_GROUP_ID,
+            origin_class="untrusted",
         )
         added += int(result.get("added", 0))
         skipped += int(result.get("skipped", 0))

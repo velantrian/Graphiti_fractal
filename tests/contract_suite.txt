@@ -24,3 +24,4 @@ tests/test_normalization.py
 tests/test_entities.py
 tests/test_experience_hash.py
 tests/test_experience_provenance_envelope.py
+tests/test_trust_visualization_hardening.py
