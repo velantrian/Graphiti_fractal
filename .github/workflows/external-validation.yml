@@ -90,11 +90,15 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints-ci.txt
 
-      - name: Install dependencies
+      - name: Install reviewed dependency environment
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -c constraints-ci.txt -r requirements.txt
+          python -m pip check
 
       - name: Run bounded provider-backed E2E
         run: python -m pytest -q tests/e2e/test_provider_backed_memory_e2e.py
@@ -183,11 +187,15 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints-ci.txt
 
-      - name: Install dependencies
+      - name: Install reviewed dependency environment
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -c constraints-ci.txt -r requirements.txt
+          python -m pip check
 
       - name: Run provenance DRY_RUN only
         run: python scripts/provenance_migration.py | tee provenance-preview.json
