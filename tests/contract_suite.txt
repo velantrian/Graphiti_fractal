@@ -16,6 +16,7 @@ tests/test_agent_memory_adversarial.py
 tests/test_experience_applicability.py
 tests/test_provenance_contract.py
 tests/test_provenance_migration.py
+tests/test_migration_checksum.py
 tests/test_dedupe_contract.py
 tests/test_embedding_fail_closed.py
 tests/test_buffer_clear_feature.py
