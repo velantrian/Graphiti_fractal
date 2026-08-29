@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import layers.l3_fractal as l3
+from core.ingest_atomicity import classify_episode_origin
 from layers.l2_semantic import (
     DEFAULT_L2_GROUP_IDS,
     _normalize_allowed_groups,
@@ -142,6 +143,30 @@ async def test_l2_renders_verified_episode_evidence_not_community_summary():
     assert "first" not in context
     assert "second" not in context
     assert source_ids == ["community-1", "episode-1"]
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_derived_episode_classification_is_explicit_and_taints_entities():
+    driver = RecordingDriver(records=[{"uuid": "chat-episode"}])
+    graphiti = SimpleNamespace(driver=driver)
+
+    await classify_episode_origin(
+        graphiti,
+        episode_uuid="chat-episode",
+        origin_class="agent_derived",
+        authoritative_fact=False,
+    )
+
+    assert len(driver.calls) == 1
+    query, params = driver.calls[0]
+    assert params == {
+        "episode_uuid": "chat-episode",
+        "origin_class": "agent_derived",
+        "authoritative_fact": False,
+    }
+    assert "e.origin_class=$origin_class" in query
+    assert "e.authoritative_fact=$authoritative_fact" in query
+    assert "n.has_non_owner_source=true" in query
 
 
 @pytest.mark.asyncio
