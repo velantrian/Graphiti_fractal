@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, field_validator
+
+from .redaction import redact_value
 
 
 Status = Literal["success", "failure", "partial", "timeout", "aborted"]
@@ -74,20 +77,22 @@ class ErrorEvent(BaseModel):
 
 
 class ExperienceIngestRequest(BaseModel):
-    # Task/run identity
     run_id: str | None = Field(default=None, description="uuid (если есть). Если нет — создадим новый.")
     task_type: str = Field(default="generic")
     goal: str | None = None
 
-    # Context
     project: str | None = None
     repo: str | None = None
     branch: str | None = None
     commit: str | None = None
-    stack: dict[str, Any] | None = None  # python/node версии, фреймворк и т.п.
+    stack: dict[str, Any] | None = None
     affected_files: list[str] = Field(default_factory=list)
 
-    # Timeline + result
+    @field_validator("stack", mode="before")
+    @classmethod
+    def redact_stack_secrets(cls, value):
+        return redact_value(value)
+
     started_at: datetime | None = None
     ended_at: datetime | None = None
     status: Status = "success"
@@ -95,12 +100,9 @@ class ExperienceIngestRequest(BaseModel):
     quality_score: float | None = None
     duration_ms: int | None = None
 
-    # Details
     tool_calls: list[ToolCallEvent] = Field(default_factory=list)
     test_runs: list[TestRunEvent] = Field(default_factory=list)
     errors: list[ErrorEvent] = Field(default_factory=list)
-
-    # Optional additive provenance contract. Omission preserves legacy callers.
     provenance: ExperienceProvenance | None = None
 
 
