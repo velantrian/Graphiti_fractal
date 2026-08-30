@@ -22,6 +22,7 @@ tests/test_migration_checksum.py
 tests/test_dedupe_contract.py
 tests/test_embedding_fail_closed.py
 tests/test_buffer_clear_feature.py
+tests/test_conversation_buffer_contract.py
 tests/test_normalization.py
 tests/test_entities.py
 tests/test_experience_hash.py

@@ -121,7 +121,11 @@ class AppSettings(BaseSettings):
 
     write_semaphore_limit: int = Field(default=2, alias="WRITE_SEMAPHORE_LIMIT")
 
-    conversation_buffer_max_messages: int = Field(default=12, alias="CONVERSATION_BUFFER_MAX_MESSAGES")
+    conversation_buffer_max_messages: int = Field(
+        default=12,
+        ge=1,
+        alias="CONVERSATION_BUFFER_MAX_MESSAGES",
+    )
     recent_memories_max_size: int = Field(default=20, alias="RECENT_MEMORIES_MAX_SIZE")
 
     rate_limit_max_attempts: int = Field(default=12, alias="RATE_LIMIT_MAX_ATTEMPTS")
