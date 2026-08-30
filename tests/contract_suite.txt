@@ -8,6 +8,8 @@ tests/test_memory_import.py
 tests/test_recall_telemetry_wiring.py
 tests/test_context_guard.py
 tests/test_recall_resilience.py
+tests/test_recall_scope_failure_truth.py
+tests/test_recall_context_fidelity.py
 tests/test_derived_graph.py
 tests/test_graphrag_policy.py
 tests/test_graphrag_memory_ops.py

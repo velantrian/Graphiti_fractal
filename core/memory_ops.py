@@ -197,6 +197,17 @@ class MemoryOps:
             return_exceptions=True,
         )
 
+        failed_scopes = [
+            scope
+            for scope, result in zip(resolved_scopes, raw_results)
+            if isinstance(result, Exception)
+        ]
+        if resolved_scopes and len(failed_scopes) == len(resolved_scopes):
+            raise RuntimeError(
+                "memory retrieval failed for all requested scopes: "
+                + ", ".join(failed_scopes)
+            )
+
         episodes: dict[str, dict] = {}
         entities: dict[str, dict] = {}
         edges: dict[str, dict] = {}
@@ -302,6 +313,7 @@ class MemoryOps:
             entities=ranked(entities),
             edges=ranked(edges),
             communities=ranked(communities),
+            failed_scopes=failed_scopes,
         )
         result.total_episodes = len(result.episodes)
         result.total_entities = len(result.entities)
@@ -315,6 +327,7 @@ class MemoryOps:
                 "effective_mode": plan.effective_mode.value,
                 "reason": plan.reason,
                 "scopes": resolved_scopes,
+                "failed_scopes": failed_scopes,
             },
         )
         return result
@@ -343,84 +356,133 @@ class MemoryOps:
             retrieval_mode=retrieval_mode,
         )
 
-        retrieved_ids = [
-            item["uuid"]
-            for collection in (result.episodes, result.entities, result.edges, result.communities)
-            for item in collection
-            if item.get("uuid")
-        ]
-        if retrieved_ids:
-            try:
-                await record_recall(
-                    self.graphiti,
-                    user_id=self.user_id,
-                    query=query,
-                    object_uuids=retrieved_ids,
-                )
-            except Exception as exc:  # telemetry must never break retrieval
-                logger.warning("Recall telemetry failed closed from answer path: %s", type(exc).__name__)
+        rows: dict[str, list[tuple[str, str]]] = {
+            "episodes": [],
+            "entities": [],
+            "edges": [],
+            "communities": [],
+        }
 
-        sections: list[str] = []
-        sources = {"episodes": 0, "entities": 0, "edges": 0, "communities": 0}
-
-        useful_episodes = []
         for episode in result.episodes:
             kind = episode.get("episode_kind", "")
             if kind == "chat_turn" and not episode.get("is_correction", False):
                 continue
             content = (episode.get("content") or "").strip()
-            if not content:
+            source_id = str(episode.get("uuid") or "").strip()
+            if not content or not source_id:
                 continue
             label = "Предыдущие обсуждения" if kind == "chat_summary" else "Память"
             if episode.get("is_correction"):
                 label = "Обновление"
-            useful_episodes.append(f"- {label}: {content[:600]}")
-            if len(useful_episodes) >= 4:
+            rows["episodes"].append((f"- {label}: {content[:600]}", source_id))
+            if len(rows["episodes"]) >= 4:
                 break
-        if useful_episodes:
-            sections.append("## Эпизоды\n" + "\n".join(useful_episodes))
-            sources["episodes"] = len(useful_episodes)
 
-        entity_lines = []
         for entity in result.entities[:5]:
             name = (entity.get("name") or "").strip()
-            if not name:
+            source_id = str(entity.get("uuid") or "").strip()
+            if not name or not source_id:
                 continue
             summary = (entity.get("summary") or "").strip()
-            entity_lines.append(f"- {name}" + (f": {summary[:300]}" if summary else ""))
-        if entity_lines:
-            sections.append("## Сущности\n" + "\n".join(entity_lines))
-            sources["entities"] = len(entity_lines)
+            rows["entities"].append(
+                (f"- {name}" + (f": {summary[:300]}" if summary else ""), source_id)
+            )
 
-        fact_lines = []
         for edge in result.edges[:8]:
+            source_id = str(edge.get("uuid") or "").strip()
+            if not source_id:
+                continue
             subject = edge.get("subject")
             target = edge.get("object")
             relation = edge.get("relationship_type")
             fact = (edge.get("fact") or "").strip()
             if subject and target and relation:
-                fact_lines.append(f"- {subject} — {relation} → {target}")
+                rows["edges"].append((f"- {subject} — {relation} → {target}", source_id))
             elif fact:
-                fact_lines.append(f"- {fact[:300]}")
-        if fact_lines:
-            sections.append("## Связи и факты\n" + "\n".join(fact_lines))
-            sources["edges"] = len(fact_lines)
+                rows["edges"].append((f"- {fact[:300]}", source_id))
 
-        community_lines = []
         for community in result.communities[:3]:
+            source_id = str(community.get("uuid") or "").strip()
+            if not source_id:
+                continue
             name = (community.get("name") or "").strip()
             summary = (community.get("summary") or "").strip()
             if name or summary:
-                community_lines.append(
-                    f"- {name or 'Community'}" + (f": {summary[:240]}" if summary else "")
+                rows["communities"].append(
+                    (
+                        f"- {name or 'Community'}" + (f": {summary[:240]}" if summary else ""),
+                        source_id,
+                    )
                 )
-        if community_lines:
-            sections.append("## Сообщества\n" + "\n".join(community_lines))
-            sources["communities"] = len(community_lines)
 
-        text = "\n\n".join(sections)
+        titles = {
+            "episodes": "## Эпизоды\n",
+            "entities": "## Сущности\n",
+            "edges": "## Связи и факты\n",
+            "communities": "## Сообщества\n",
+        }
+        parts: list[tuple[str, str | None, str | None]] = []
+        for key in ("episodes", "entities", "edges", "communities"):
+            if not rows[key]:
+                continue
+            if parts:
+                parts.append(("\n\n", None, None))
+            parts.append((titles[key], None, None))
+            for index, (line, source_id) in enumerate(rows[key]):
+                if index:
+                    parts.append(("\n", None, None))
+                parts.append((line, source_id, key))
+
         max_chars = max_tokens * 4
-        if len(text) > max_chars:
-            text = text[:max_chars].rstrip() + "\n[Контекст обрезан по лимиту]"
+        remaining = max_chars
+        rendered: list[str] = []
+        visible_ids: list[str] = []
+        sources = {"episodes": 0, "entities": 0, "edges": 0, "communities": 0}
+        truncated = False
+
+        for part, source_id, source_kind in parts:
+            if remaining <= 0:
+                truncated = True
+                break
+            piece = part[:remaining]
+            if piece:
+                rendered.append(piece)
+                # A source is exposed only if its source-specific line fits in
+                # full. Prefix-only or partially truncated text must not count
+                # as evidence that this object reached the model context.
+                if (
+                    source_id
+                    and source_kind
+                    and len(piece) == len(part)
+                    and source_id not in visible_ids
+                ):
+                    visible_ids.append(source_id)
+                    sources[source_kind] += 1
+            remaining -= len(piece)
+            if len(piece) < len(part):
+                truncated = True
+                break
+
+        text = "".join(rendered)
+        if truncated:
+            text = text.rstrip() + "\n[Контекст обрезан по лимиту]"
         token_estimate = min(max_tokens, (len(text) + 3) // 4)
-        return ContextResult(text=text, token_estimate=token_estimate, sources=sources)
+
+        if visible_ids:
+            try:
+                await record_recall(
+                    self.graphiti,
+                    user_id=self.user_id,
+                    query=query,
+                    object_uuids=visible_ids,
+                )
+            except Exception as exc:  # telemetry must never break retrieval
+                logger.warning("Recall telemetry failed closed from answer path: %s", type(exc).__name__)
+
+        return ContextResult(
+            text=text,
+            token_estimate=token_estimate,
+            sources=sources,
+            source_ids=visible_ids,
+            failed_scopes=list(result.failed_scopes),
+        )

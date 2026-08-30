@@ -27,18 +27,26 @@ def build_context_receipt(
 ) -> ContextReceipt:
     """Describe the exact rendered context text exposed to the model.
 
-    `source_ids` is intentionally optional. Current ContextResult exposes exact
-    rendered text and collection counts but not per-rendered-line UUIDs. The
-    receipt therefore never invents UUIDs. A later bounded formatter can fill
-    this field when exact line-to-object identity is available.
+    Exact rendered source UUIDs are taken from ``ContextResult.source_ids`` by
+    default. Callers may still supply an explicit list for compatibility, but the
+    receipt never invents UUIDs that the formatter did not expose.
     """
     text = context.text or ""
-    normalized_ids = sorted({str(value) for value in (source_ids or []) if str(value).strip()})
+    raw_ids = context.source_ids if source_ids is None else source_ids
+    normalized_ids = sorted({str(value) for value in (raw_ids or []) if str(value).strip()})
+
+    receipt_status = status
+    receipt_reason = reason
+    if status == "OK" and context.failed_scopes:
+        receipt_status = "DEGRADED_PARTIAL"
+        failed = ", ".join(context.failed_scopes)
+        receipt_reason = f"{reason}; failed scopes: {failed}" if reason else f"failed scopes: {failed}"
+
     return ContextReceipt(
-        status=status,
+        status=receipt_status,
         requested_mode=requested_mode,
         effective_mode=effective_mode,
-        reason=reason,
+        reason=receipt_reason,
         source_ids=normalized_ids,
         source_counts=dict(context.sources or {}),
         query_sha256=query_fingerprint(query),
@@ -84,7 +92,7 @@ async def persist_recall_guard_metadata(
     """
     derived = bool(
         context_receipt
-        and context_receipt.status == "OK"
+        and context_receipt.status in {"OK", "DEGRADED_PARTIAL"}
         and context_receipt.token_estimate > 0
         and any(int(value) > 0 for value in context_receipt.source_counts.values())
     )
