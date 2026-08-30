@@ -131,6 +131,7 @@ class SearchResult:
     total_entities: int = 0
     total_edges: int = 0
     total_communities: int = 0
+    failed_scopes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -157,6 +158,8 @@ class ContextResult:
     text: str
     token_estimate: int
     sources: Dict[str, int] = field(default_factory=dict)
+    source_ids: List[str] = field(default_factory=list)
+    failed_scopes: List[str] = field(default_factory=list)
     receipt: Optional[ContextReceipt] = None
 
 
