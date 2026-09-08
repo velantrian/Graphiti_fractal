@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt constraints-ci.txt ./
+RUN pip install --no-cache-dir -c constraints-ci.txt -r requirements.txt \
+    && pip check
 
 # Neo4j 5.26+ supports the dynamic label syntax used by current Graphiti.
 # Do not mutate installed graphiti_core sources at image-build time.
