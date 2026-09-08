@@ -70,11 +70,16 @@ async def llm_summarize(text_list: list[str], context: str = "general") -> str:
         return f"Error generating summary: {exc}"
 
 
-async def llm_chat_response(messages: list[dict], context: str = "chat") -> str:
-    """Generate a chat response using the configured current model policy."""
-    client = get_async_client()
+async def llm_chat_response(messages: list[dict], context: str = "chat", client=None) -> str:
+    """Generate a chat response using the configured current model policy.
+
+    Provider failures are raised instead of being returned as normal assistant
+    text. This prevents error strings from entering the conversation buffer or
+    durable chat memory as if they were successful model responses.
+    """
+    client = client or get_async_client()
     if not client:
-        return "LLM service unavailable due to missing API key."
+        raise RuntimeError("LLM client unavailable")
 
     model = _select_model_for_context(context)
 
@@ -86,6 +91,5 @@ async def llm_chat_response(messages: list[dict], context: str = "chat") -> str:
         )
         return resp.choices[0].message.content or ""
     except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        logger.error("LLM chat error with model %s: %s", model, msg)
-        return f"Извините, произошла ошибка при генерации ответа: {msg[:120]}"
+        logger.error("LLM chat error with model %s: %s", model, exc)
+        raise RuntimeError("LLM chat provider failed") from exc

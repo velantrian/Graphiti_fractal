@@ -43,14 +43,17 @@ def _clear_config_cache(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_recall_timeout_degrades_memory_but_still_returns_model_reply(monkeypatch):
-    async def fake_llm(messages, context):
+    injected_client = SimpleNamespace()
+
+    async def fake_llm(messages, context, client=None):
+        assert client is injected_client
         assert "Context from memory:" not in messages[-1]["content"]
         return "ответ без памяти"
 
     monkeypatch.setattr(chat_module, "llm_chat_response", fake_llm)
     monkeypatch.setattr(chat_module, "spawn", _discard_background_task)
 
-    agent = SimpleChatAgent(SimpleNamespace(), _SlowMemory())
+    agent = SimpleChatAgent(injected_client, _SlowMemory())
     reply, _, context = await agent.answer_core("Что мы обсуждали раньше?")
 
     assert reply == "ответ без памяти"
@@ -61,13 +64,16 @@ async def test_recall_timeout_degrades_memory_but_still_returns_model_reply(monk
 
 @pytest.mark.asyncio
 async def test_recall_error_degrades_memory_but_still_returns_model_reply(monkeypatch):
-    async def fake_llm(messages, context):
+    injected_client = SimpleNamespace()
+
+    async def fake_llm(messages, context, client=None):
+        assert client is injected_client
         return "ответ после ошибки памяти"
 
     monkeypatch.setattr(chat_module, "llm_chat_response", fake_llm)
     monkeypatch.setattr(chat_module, "spawn", _discard_background_task)
 
-    agent = SimpleChatAgent(SimpleNamespace(), _BrokenMemory())
+    agent = SimpleChatAgent(injected_client, _BrokenMemory())
     reply, _, context = await agent.answer_core("Напомни прошлое решение")
 
     assert reply == "ответ после ошибки памяти"
