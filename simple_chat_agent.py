@@ -149,7 +149,9 @@ class SimpleChatAgent:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_buffer.get_recent_messages(6))
             messages.append({"role": "user", "content": user_content})
-            response = (await llm_chat_response(messages, context="chat")).strip()
+            response = (
+                await llm_chat_response(messages, context="chat", client=self.llm_client)
+            ).strip()
             if not response:
                 raise RuntimeError("LLM returned an empty response")
             conversation_text = f"User: {user_message}\nAssistant: {response}"
