@@ -1,6 +1,6 @@
-# Reviewed CI dependency resolution captured from exact-head green runs on 2026-08-29.
+# Reviewed dependency resolution captured from exact-head green runs on 2026-08-29.
 # requirements.txt remains the human-authored compatibility policy; this file
-# makes validation environments reproducible without promoting new runtime deps.
+# pins the reviewed environment used by CI and Docker image builds.
 # Regenerate only in a bounded dependency-review PR and validate both Python 3.10/3.12.
 
 graphiti_core==0.29.3
