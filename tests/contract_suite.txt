@@ -30,3 +30,5 @@ tests/test_experience_stack_redaction.py
 tests/test_experience_provenance_envelope.py
 tests/test_trust_visualization_hardening.py
 tests/test_chat_failure_hygiene.py
+tests/test_context_builder.py
+tests/test_simple_chat_agent.py

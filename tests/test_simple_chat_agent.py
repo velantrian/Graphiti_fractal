@@ -1,78 +1,69 @@
-"""
-Tests for SimpleChatAgent.
-"""
+"""Deterministic contract tests for the current SimpleChatAgent answer path."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from unittest.mock import AsyncMock, Mock
 
+import simple_chat_agent as chat_module
+from core.conversation_buffer import clear_user_buffer, get_user_conversation_buffer
+from core.types import ContextResult
 from simple_chat_agent import SimpleChatAgent
-from core.memory_ops import MemoryOps
 
 
-@pytest.fixture
-def mock_memory():
-    """Mock MemoryOps instance."""
-    memory = Mock(spec=MemoryOps)
-    memory.build_context_for_query = AsyncMock()
-    memory.remember_text = AsyncMock()
-    return memory
+def _discard_background_task(coro, **_kwargs):
+    coro.close()
+    return None
 
 
-@pytest.fixture
-def mock_llm_client():
-    """Mock LLM client."""
-    return AsyncMock()
+@pytest.mark.asyncio
+async def test_answer_flow_uses_scoped_recall_and_injected_client(monkeypatch):
+    user_id = "simple-chat-agent-contract"
+    clear_user_buffer(user_id)
 
-
-@pytest.fixture
-def chat_agent(mock_llm_client, mock_memory):
-    """SimpleChatAgent instance with mocks."""
-    return SimpleChatAgent(mock_llm_client, mock_memory)
-
-
-class TestSimpleChatAgent:
-    """Test SimpleChatAgent functionality."""
-
-    @pytest.mark.asyncio
-    async def test_answer_flow(self, chat_agent, mock_memory, mock_llm_client):
-        """Test the complete answer flow."""
-        # Mock context building
-        mock_memory.build_context_for_query.return_value = Mock(
+    build_context = AsyncMock(
+        return_value=ContextResult(
             text="Mock context",
-            token_estimate=50
+            token_estimate=50,
+            sources={"episodes": 1},
+            source_ids=["episode-1"],
         )
+    )
+    memory = SimpleNamespace(
+        user_id=user_id,
+        graphiti=object(),
+        build_context_for_query=build_context,
+    )
+    injected_client = object()
+    seen = {}
 
-        # Mock LLM response
-        mock_llm_client.return_value = "Mock LLM response"
+    async def fake_llm(messages, context, client=None):
+        seen["messages"] = messages
+        seen["context"] = context
+        seen["client"] = client
+        return "Mock LLM response"
 
-        # Mock memory storage
-        mock_memory.remember_text.return_value = {"status": "ok"}
+    monkeypatch.setattr(chat_module, "should_recall", lambda *_args, **_kwargs: (True, "test"))
+    monkeypatch.setattr(chat_module, "llm_chat_response", fake_llm)
+    monkeypatch.setattr(chat_module, "spawn", _discard_background_task)
 
-        # Test answer
-        response = await chat_agent.answer("Test question")
+    agent = SimpleChatAgent(injected_client, memory)
+    response = await agent.answer("Test question")
 
-        # Verify context was requested
-        mock_memory.build_context_for_query.assert_called_once_with(
-            "Test question",
-            max_tokens=2000,
-            include_episodes=True,
-            include_entities=True
-        )
+    assert response == "Mock LLM response"
+    build_context.assert_awaited_once_with(
+        "Test question",
+        scopes=["personal", "project", "knowledge", "experience"],
+        max_tokens=2000,
+        include_episodes=True,
+        include_entities=True,
+    )
+    assert seen["context"] == "chat"
+    assert seen["client"] is injected_client
+    assert "Mock context" in seen["messages"][-1]["content"]
+    assert get_user_conversation_buffer(user_id).get_recent_messages() == [
+        {"role": "user", "content": "Test question"},
+        {"role": "assistant", "content": "Mock LLM response"},
+    ]
 
-        # Verify conversation was stored
-        # mock_memory.remember_text.assert_called_once()
-        # call_args = mock_memory.remember_text.call_args
-        # stored_text = call_args[0][0]  # First positional argument
-        # assert "Test question" in stored_text
-        # assert "Mock LLM response" in stored_text
-
-    @pytest.mark.asyncio
-    async def test_error_handling(self, chat_agent, mock_memory, mock_llm_client):
-        """Test error handling in answer method."""
-        # Make context building fail
-        mock_memory.build_context_for_query.side_effect = Exception("Context error")
-
-        response = await chat_agent.answer("Test question")
-
-        # Should return fallback response
-        assert "Извините, произошла ошибка" in response
+    clear_user_buffer(user_id)
