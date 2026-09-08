@@ -8,7 +8,7 @@ import os
 
 
 def get_instance_user_id() -> str:
-    user_id = (os.getenv("FRACTAL_USER_ID") or "sergey").strip()
+    user_id = (os.getenv("FRACTAL_USER_ID") or "velan").strip()
     if not user_id:
         raise RuntimeError("FRACTAL_USER_ID must not be empty")
     return user_id
