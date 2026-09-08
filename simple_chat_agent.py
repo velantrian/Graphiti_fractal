@@ -24,7 +24,7 @@ from core.ingest_atomicity import classify_episode_origin
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
-from core.prompt_boundary import MEMORY_DATA_POLICY, SUMMARY_DATA_POLICY, build_memory_user_content
+from core.prompt_boundary import MEMORY_DATA_POLICY, SUMMARY_DATA_POLICY, build_memory_user_content, build_summary_user_content
 from core.provenance import build_provenance_record
 from core.provenance_persistence import persist_provenance_metadata
 from core.rate_limit_retry import with_rate_limit_retry
@@ -265,18 +265,7 @@ class SimpleChatAgent:
 
 async def _generate_chat_summary(turns: list[dict]) -> str:
     conversation_text = "\n".join(str(turn.get("content") or "") for turn in turns)
-    prompt = f"""Создай краткое summary разговора на русском языке.
-
-<conversation_transcript>
-{conversation_text}
-</conversation_transcript>
-
-Включи:
-- основные темы;
-- решения и договорённости;
-- обновления фактов или коррекции.
-
-Не добавляй новых фактов. Длина: 3-5 предложений."""
+    prompt = build_summary_user_content(conversation_text)
     messages = [
         {"role": "system", "content": SUMMARY_DATA_POLICY},
         {"role": "user", "content": prompt},
