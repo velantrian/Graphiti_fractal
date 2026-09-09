@@ -1,12 +1,13 @@
-import pytest
-from unittest.mock import AsyncMock, Mock
-from pydantic import ValidationError
-from knowledge.ingest import ingest_text_document
-from core.safe_graphiti import filter_graphiti_results
+from unittest.mock import AsyncMock, Mock, patch
 
-@pytest.mark.asyncio
-async def test_filter_graphiti_results_with_malformed_data():
-    # Mock Graphiti result object with some valid and some invalid entities
+import pytest
+from pydantic import BaseModel, ValidationError
+
+from core.safe_graphiti import filter_graphiti_results
+from knowledge.ingest import ingest_text_document
+
+
+def test_filter_graphiti_results_with_malformed_data():
     class MockEntity:
         def __init__(self, uuid, name, summary=""):
             self.uuid = uuid
@@ -25,57 +26,65 @@ async def test_filter_graphiti_results_with_malformed_data():
         MockEntity("uuid1", "Valid Entity"),
         MockEntity(None, "Invalid - No UUID"),
         MockEntity("uuid2", None),
-        None
+        None,
     ]
     mock_results.extracted_edges = [
         MockEdge("uuid1", "uuid2", "RELATES_TO"),
         MockEdge(None, "uuid2", "NO_SOURCE"),
-        None
+        None,
     ]
 
     filtered = filter_graphiti_results(mock_results)
-    
+
     assert len(filtered["entities"]) == 1
     assert filtered["entities"][0]["uuid"] == "uuid1"
     assert filtered["dropped_entities"] == 3
-    
     assert len(filtered["edges"]) == 1
     assert filtered["edges"][0]["relationship_type"] == "RELATES_TO"
     assert filtered["dropped_edges"] == 2
 
+
 @pytest.mark.asyncio
-async def test_ingest_document_validation_recovery():
-    # Mock graphiti and its driver
-    mock_graphiti = AsyncMock()
-    mock_driver = AsyncMock()
-    mock_graphiti.driver = mock_driver
-    
-    # Mock add_episode to raise ValidationError
-    # We use a real Pydantic ValidationError for authenticity if possible, 
-    # but it's hard to instantiate without a model. So we mock it or use a dummy model.
-    from pydantic import BaseModel
+async def test_ingest_validation_failure_is_fail_closed():
+    """Malformed provider output must not be recovered into a successful ingest."""
+
     class DummyModel(BaseModel):
         x: int
-    
-    try:
-        DummyModel(x="not an int")
-    except ValidationError as e:
-        ve = e
 
-    mock_graphiti.add_episode.side_effect = ve
-    
-    # Mock driver.execute_query to find the episode during recovery
-    mock_driver.execute_query.return_value = Mock(records=[{"uuid": "recovered-uuid"}])
-    
-    # Run ingest
-    result = await ingest_text_document(
-        mock_graphiti,
-        "Test content",
-        source_description="Test Source",
-        user_id="test-user"
-    )
-    
-    assert result["status"] == "ok"
-    assert "recovered-uuid" in str(mock_graphiti.mock_calls) # Should have been used in subsequent calls
-    assert len(result["warnings"]) > 0
-    assert "Graphiti returned malformed entities/edges" in result["warnings"][0]
+    with pytest.raises(ValidationError) as exc_info:
+        DummyModel(x="not an int")
+
+    graphiti = Mock()
+    graphiti.add_episode = AsyncMock(side_effect=exc_info.value)
+    graphiti.driver = Mock()
+
+    with (
+        patch("knowledge.ingest.episode_exists", new=AsyncMock(return_value=False)),
+        patch(
+            "knowledge.ingest.acquire_ingest_claim",
+            new=AsyncMock(return_value="test-claim-token"),
+        ),
+        patch("knowledge.ingest.release_ingest_claim", new=AsyncMock()) as release_claim,
+        patch(
+            "knowledge.ingest.mark_ingest_claim_episode_created",
+            new=AsyncMock(),
+        ) as mark_created,
+        patch(
+            "knowledge.ingest.finalize_episode_identity",
+            new=AsyncMock(),
+        ) as finalize,
+    ):
+        result = await ingest_text_document(
+            graphiti,
+            "Test content",
+            source_description="Test Source",
+            user_id="test-user",
+        )
+
+    assert result["status"] == "error"
+    assert result["added"] == 0
+    assert result["skipped"] == 0
+    assert any("ValidationError" in warning for warning in result["warnings"])
+    release_claim.assert_awaited_once()
+    mark_created.assert_not_awaited()
+    finalize.assert_not_awaited()
