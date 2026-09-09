@@ -1,4 +1,3 @@
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
@@ -32,8 +31,18 @@ def _clear_upload_jobs():
     UPLOAD_JOBS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _disable_retry_wall_clock():
+    """Keep retry contracts deterministic and free of real backoff sleeps."""
+    with (
+        patch("core.rate_limit_retry.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch("core.rate_limit_retry.random.random", return_value=0.0),
+    ):
+        yield sleep
+
+
 @pytest.mark.asyncio
-async def test_retry_wrapper_logic():
+async def test_retry_wrapper_logic(_disable_retry_wall_clock):
     """Test the retry wrapper in isolation."""
     mock_op = AsyncMock()
     error = openai.RateLimitError(
@@ -56,12 +65,13 @@ async def test_retry_wrapper_logic():
     assert result == "success"
     assert mock_op.call_count == 3
     assert callback.call_count == 2
+    assert _disable_retry_wall_clock.await_count == 2
     args, _ = callback.call_args
-    assert args[0] >= 0.6
+    assert args[0] == pytest.approx(0.6)
 
 
 @pytest.mark.asyncio
-async def test_ingest_flow_with_retry():
+async def test_ingest_flow_with_retry(_disable_retry_wall_clock):
     """Test the ingest flow with mocked Graphiti and job-status updates."""
     graphiti = MockGraphiti()
     error_429 = openai.RateLimitError(
@@ -80,7 +90,10 @@ async def test_ingest_flow_with_retry():
 
     # ingest_text_document imports update_upload_job locally from api.jobs
     # (not the api-package re-export), so the patch target must match that.
-    with patch("api.jobs.update_upload_job") as mock_update:
+    with (
+        patch("api.jobs.update_upload_job") as mock_update,
+        patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),
+    ):
         def side_effect_update(jid, **kwargs):
             if jid in UPLOAD_JOBS:
                 UPLOAD_JOBS[jid].update(kwargs)
@@ -95,7 +108,9 @@ async def test_ingest_flow_with_retry():
         )
 
         assert result["status"] == "ok"
+        assert result["added"] == 1
         assert graphiti.add_episode.call_count == 3
+        assert _disable_retry_wall_clock.await_count == 2
 
         rate_limit_calls = [
             call
