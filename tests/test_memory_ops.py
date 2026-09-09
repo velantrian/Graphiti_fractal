@@ -1,23 +1,17 @@
-"""
-Tests for MemoryOps layer.
-"""
+"""Tests for the current MemoryOps layer contract."""
 
-import pytest
-import asyncio
 from unittest.mock import AsyncMock, Mock
 
-from core.memory_ops import MemoryOps, SearchResult, ContextResult
+import pytest
+
+from core.memory_ops import ContextResult, MemoryOps, SearchResult, _recent_memories
 
 
 @pytest.fixture
 def mock_graphiti():
-    """Mock Graphiti instance for testing."""
+    """Mock Graphiti instance for deterministic MemoryOps tests."""
     graphiti = Mock()
     graphiti.search_ = AsyncMock()
-    # Make add_episode awaitable and return a dummy result with uuid
-    graphiti.add_episode = AsyncMock(return_value=Mock(uuid="ep123"))
-    
-    # Disable optional cross-layer expansion logic (it expects a real neo4j driver).
     graphiti.driver = None
     graphiti._driver = None
     return graphiti
@@ -25,8 +19,12 @@ def mock_graphiti():
 
 @pytest.fixture
 def memory_ops(mock_graphiti):
-    """MemoryOps instance with mocked Graphiti."""
-    return MemoryOps(mock_graphiti, "test_user")
+    """MemoryOps instance isolated from process-global recent-memory state."""
+    user_id = "memory_ops_contract_user"
+    _recent_memories.pop(user_id, None)
+    ops = MemoryOps(mock_graphiti, user_id)
+    yield ops
+    _recent_memories.pop(user_id, None)
 
 
 class DummySearchResults:
@@ -53,7 +51,14 @@ class DummySearchResults:
 
 
 class DummyEpisode:
-    def __init__(self, *, uuid="ep1", content="episode content", group_id="personal", source_description="test"):
+    def __init__(
+        self,
+        *,
+        uuid="ep1",
+        content="episode content",
+        group_id="personal",
+        source_description="test",
+    ):
         self.uuid = uuid
         self.content = content
         self.group_id = group_id
@@ -92,29 +97,23 @@ class DummyEdge:
 
 
 class TestMemoryOps:
-    """Test MemoryOps functionality."""
+    """Deterministic coverage for active MemoryOps behavior."""
 
     @pytest.mark.asyncio
-    async def test_remember_text_calls_ingest(self, memory_ops, mock_graphiti):
-        """Test that remember_text calls the underlying ingest pipeline (add_episode)."""
-        # Call remember_text
+    async def test_remember_text_routes_to_canonical_ingest_pipeline(self, memory_ops):
+        memory_ops.ingest_pipeline = AsyncMock(return_value={"status": "ok", "added": 1})
+
         result = await memory_ops.remember_text("test text", memory_type="personal")
 
-        # Verify result and call
-        assert result["status"] == "success"
-        assert result["uuid"] == "ep123"
-        mock_graphiti.add_episode.assert_called_once()
-        
-        # Verify arguments passed to add_episode
-        call_kwargs = mock_graphiti.add_episode.call_args.kwargs
-        assert call_kwargs["episode_body"] == "test text"
-        assert call_kwargs["group_id"] is not None # Should be resolved to personal_group_id (mocked config or default?)
-        # Actually resolve_group_id relies on config. 
-        # But we can check it's passed.
+        assert result == {"status": "ok", "added": 1}
+        memory_ops.ingest_pipeline.assert_awaited_once_with(
+            "test text",
+            source_description="memory_ops",
+            memory_type="personal",
+        )
 
     @pytest.mark.asyncio
     async def test_search_memory_combines_results(self, memory_ops, mock_graphiti):
-        """Test that search_memory combines episodes and entities."""
         mock_graphiti.search_.return_value = DummySearchResults(
             episodes=[DummyEpisode(uuid="ep1", content="episode content with enough length")],
             nodes=[DummyNode(uuid="ent1", name="Entity Name", summary="Entity summary")],
@@ -135,8 +134,7 @@ class TestMemoryOps:
         assert len(result.entities) == 1
 
     @pytest.mark.asyncio
-    async def test_build_context_formats_properly(self, memory_ops, mock_graphiti):
-        """Test that build_context creates properly formatted context."""
+    async def test_build_context_formats_current_episode_section(self, memory_ops, mock_graphiti):
         mock_graphiti.search_.return_value = DummySearchResults(
             episodes=[DummyEpisode(uuid="ep1", content="Test episode content with enough length")],
             nodes=[],
@@ -148,17 +146,15 @@ class TestMemoryOps:
         result = await memory_ops.build_context_for_query("test query")
 
         assert isinstance(result, ContextResult)
-        assert "## Информация из памяти:" in result.text
+        assert "## Эпизоды" in result.text
         assert "Test episode content" in result.text
-        # Build_context limits to max 3 episodes; this case should include 1
-        assert result.sources["episodes"] >= 1
+        assert result.sources["episodes"] == 1
         assert result.sources["entities"] == 0
+        assert result.source_ids == ["ep1"]
 
     @pytest.mark.asyncio
     async def test_context_truncation(self, memory_ops, mock_graphiti):
-        """Test that context is properly truncated for token limits."""
-        # Mock a very long episode
-        long_content = "Very long content " * 1000  # ~20k characters
+        long_content = "Very long content " * 1000
         mock_graphiti.search_.return_value = DummySearchResults(
             episodes=[DummyEpisode(uuid="ep1", content=long_content)],
             nodes=[],
@@ -169,7 +165,6 @@ class TestMemoryOps:
 
         result = await memory_ops.build_context_for_query("test", max_tokens=100)
 
-        # Should be truncated
         assert len(result.text) < len(long_content)
         assert "[Контекст обрезан" in result.text
         assert result.token_estimate <= 100
