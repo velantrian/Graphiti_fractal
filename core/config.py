@@ -4,7 +4,6 @@ Centralized Configuration Module
 All application settings in one place with validation.
 """
 
-import logging
 import os
 from functools import lru_cache
 from typing import Literal
@@ -91,25 +90,7 @@ class MemorySettings(BaseSettings):
         alias="FRACTAL_RECALL_TIMEOUT_SECONDS",
     )
 
-    chat_save_episodes: bool = Field(default=False, alias="CHAT_SAVE_EPISODES")
-    chat_save_bot_episodes: bool = Field(default=False, alias="CHAT_SAVE_BOT_EPISODES")
-    chat_use_graphiti_search: bool = Field(default=False, alias="CHAT_USE_GRAPHITI_SEARCH")
-
     model_config = {"env_file": ".env", "extra": "ignore"}
-
-    def __init__(self, **kwargs):
-        for field in ["chat_save_episodes", "chat_save_bot_episodes", "chat_use_graphiti_search"]:
-            env_name = field.upper()
-            if env_name in os.environ:
-                kwargs[field] = _env_flag(env_name)
-        super().__init__(**kwargs)
-
-        if self.chat_save_episodes:
-            logging.getLogger(__name__).warning(
-                "CHAT_SAVE_EPISODES is deprecated and ignored. "
-                "Chat persistence is now handled automatically by SimpleChatAgent. "
-                "This flag will be removed in a future version."
-            )
 
 
 class AppSettings(BaseSettings):
@@ -172,9 +153,12 @@ class Settings:
     def __init__(self):
         config = get_config()
 
-        self.CHAT_SAVE_EPISODES = config.memory.chat_save_episodes
-        self.CHAT_SAVE_BOT_EPISODES = config.memory.chat_save_bot_episodes
-        self.CHAT_USE_GRAPHITI_SEARCH = config.memory.chat_use_graphiti_search
+        # Compatibility-only flags from the pre-SimpleChatAgent flow. Current
+        # runtime chat persistence/retrieval does not consult these values, so
+        # they stay out of active MemorySettings while preserving legacy attrs.
+        self.CHAT_SAVE_EPISODES = _env_flag("CHAT_SAVE_EPISODES")
+        self.CHAT_SAVE_BOT_EPISODES = _env_flag("CHAT_SAVE_BOT_EPISODES")
+        self.CHAT_USE_GRAPHITI_SEARCH = _env_flag("CHAT_USE_GRAPHITI_SEARCH")
 
         self.EXPERIENCE_GROUP_ID = config.memory.experience_group_id
         self.KNOWLEDGE_GROUP_ID = config.memory.knowledge_group_id
