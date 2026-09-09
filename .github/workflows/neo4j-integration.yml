@@ -24,7 +24,7 @@ jobs:
       NEO4J_PASSWORD: fractal-test-password
     steps:
       - name: Checkout exact validation target
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
@@ -40,7 +40,7 @@ jobs:
           }
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
