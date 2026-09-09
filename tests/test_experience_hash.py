@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from experience.models import ErrorEvent, ExperienceIngestRequest, TestRunEvent, ToolCallEvent
+from experience.models import (
+    ErrorEvent,
+    ExperienceIngestRequest,
+    TestRunEvent as ExperienceTestRunEvent,
+    ToolCallEvent,
+)
 from experience.writer import (
     canonical_tool_args,
     compute_context_hash,
@@ -165,7 +170,7 @@ def test_same_run_id_reuses_deterministic_child_ids_and_merge_queries(monkeypatc
         run_id="run-idempotent-001",
         task_type="fix_bug",
         tool_calls=[ToolCallEvent(tool="shell", command="echo ok", args={"safe": "yes"})],
-        test_runs=[TestRunEvent(framework="pytest", command="pytest -q", passed=True)],
+        test_runs=[ExperienceTestRunEvent(framework="pytest", command="pytest -q", passed=True)],
         errors=[ErrorEvent(error_type="ExampleError", message="bounded")],
     )
     graphiti = _RecordingGraphiti()
