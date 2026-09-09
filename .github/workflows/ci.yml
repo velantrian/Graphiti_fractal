@@ -60,3 +60,27 @@ jobs:
 
       - name: Run always-on contracts
         run: make PYTHON=python test-contracts
+
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout exact validation target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify exact validation target
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "expected $EXPECTED_SHA but checked out $ACTUAL_SHA"
+            exit 2
+          }
+
+      - name: Build reviewed Docker image
+        run: docker build --file Dockerfile --tag graphiti-fractal:ci .
