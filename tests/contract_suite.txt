@@ -6,6 +6,7 @@ tests/test_runtime_dependency_policy.py
 tests/test_memory_lifecycle.py
 tests/test_memory_import.py
 tests/test_memory_ops.py
+tests/test_knowledge_ingest.py
 tests/test_recall_telemetry_wiring.py
 tests/test_context_guard.py
 tests/test_recall_resilience.py
