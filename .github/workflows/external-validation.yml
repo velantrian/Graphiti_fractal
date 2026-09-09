@@ -19,7 +19,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - name: Checkout exact PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -75,7 +75,7 @@ jobs:
       FRACTAL_MEMORY_RECALL: always
     steps:
       - name: Checkout exact PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -86,7 +86,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -126,7 +126,7 @@ jobs:
       NEO4J_PASSWORD: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_PASSWORD }}
     steps:
       - name: Checkout exact PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -172,7 +172,7 @@ jobs:
       NEO4J_PASSWORD: ${{ secrets.FRACTAL_PROVENANCE_NEO4J_PASSWORD }}
     steps:
       - name: Checkout exact PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -183,7 +183,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -201,7 +201,7 @@ jobs:
         run: python scripts/provenance_migration.py | tee provenance-preview.json
 
       - name: Upload provenance preview
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: provenance-preview-${{ github.event.pull_request.head.sha }}
           path: provenance-preview.json

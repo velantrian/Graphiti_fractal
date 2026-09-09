@@ -23,10 +23,10 @@ jobs:
           test -n "$NEO4J_PASSWORD" || { echo 'FRACTAL_PROVENANCE_NEO4J_PASSWORD secret is required'; exit 2; }
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -45,7 +45,7 @@ jobs:
           python scripts/provenance_migration.py | tee provenance-preview.json
 
       - name: Upload preview artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: provenance-preview
           path: provenance-preview.json
