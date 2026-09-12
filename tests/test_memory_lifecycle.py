@@ -36,6 +36,32 @@ def test_promotion_requires_all_deterministic_gates():
     assert result["writes_performed"] is False
 
 
+def test_high_frequency_without_distinct_query_diversity_cannot_promote():
+    """Repeated retrieval alone must not imply reusable long-term value.
+
+    This is the explicit negative control for the OpenClaw-derived
+    minUniqueQueries donor pattern already represented in Fractal policy.
+    """
+    strong = PromotionSignals(
+        relevance=1.0,
+        frequency=1.0,
+        query_diversity=1.0,
+        recency=1.0,
+        consolidation=1.0,
+        conceptual_richness=1.0,
+    )
+    result = explain_promotion(
+        strong,
+        origin_class="owner",
+        recall_count=100,
+        unique_queries=1,
+    )
+    assert result["score"] == 1.0
+    assert result["decision"] == "KEEP_EPISODIC"
+    assert "unique_queries<3" in result["blockers"]
+    assert result["writes_performed"] is False
+
+
 def test_untrusted_content_can_never_promote_by_score():
     strong = PromotionSignals(
         relevance=1.0,
