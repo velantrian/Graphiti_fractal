@@ -55,15 +55,22 @@ class DummyEpisode:
         self,
         *,
         uuid="ep1",
+        name="Episode",
         content="episode content",
         group_id="personal",
         source_description="test",
+        episode_kind=None,
     ):
         self.uuid = uuid
+        self.name = name
         self.content = content
         self.group_id = group_id
         self.source_description = source_description
-        self.episode_kind = ""
+        # Graphiti 0.29.3 EpisodicNode search results do not expose Fractal's
+        # direct Neo4j custom `episode_kind` property. Tests may opt in to the
+        # attribute only when they explicitly exercise Fractal-enriched shapes.
+        if episode_kind is not None:
+            self.episode_kind = episode_kind
         self.created_at = None
 
 
@@ -151,6 +158,31 @@ class TestMemoryOps:
         assert result.sources["episodes"] == 1
         assert result.sources["entities"] == 0
         assert result.source_ids == ["ep1"]
+
+    @pytest.mark.asyncio
+    async def test_pre_summary_chat_turn_remains_visible_with_graphiti_episodic_shape(self, memory_ops, mock_graphiti):
+        """Model the actual Graphiti 0.29.3 episode shape after process-local RAM loss."""
+        prior_turn = "User: Remember the cobalt launch key\nAssistant: The key is ORBIT-7"
+        mock_graphiti.search_.return_value = DummySearchResults(
+            episodes=[
+                DummyEpisode(
+                    uuid="chat-turn-1",
+                    name="chat_turn",
+                    content=prior_turn,
+                    source_description="chat",
+                )
+            ],
+            nodes=[],
+            edges=[],
+            communities=[],
+            episode_reranker_scores=[1.0],
+        )
+
+        result = await memory_ops.build_context_for_query("What was the cobalt launch key?")
+
+        assert "ORBIT-7" in result.text
+        assert "chat-turn-1" in result.source_ids
+        assert result.sources["episodes"] == 1
 
     @pytest.mark.asyncio
     async def test_context_truncation(self, memory_ops, mock_graphiti):
