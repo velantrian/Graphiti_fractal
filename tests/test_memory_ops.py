@@ -58,12 +58,13 @@ class DummyEpisode:
         content="episode content",
         group_id="personal",
         source_description="test",
+        episode_kind="",
     ):
         self.uuid = uuid
         self.content = content
         self.group_id = group_id
         self.source_description = source_description
-        self.episode_kind = ""
+        self.episode_kind = episode_kind
         self.created_at = None
 
 
@@ -151,6 +152,31 @@ class TestMemoryOps:
         assert result.sources["episodes"] == 1
         assert result.sources["entities"] == 0
         assert result.source_ids == ["ep1"]
+
+    @pytest.mark.asyncio
+    async def test_unsummarized_relevant_chat_turn_survives_ram_buffer_loss(self, memory_ops, mock_graphiti):
+        """Persisted pre-summary chat must remain expressible after RAM context is gone."""
+        prior_turn = "User: Remember the cobalt launch key\nAssistant: The key is ORBIT-7"
+        mock_graphiti.search_.return_value = DummySearchResults(
+            episodes=[
+                DummyEpisode(
+                    uuid="chat-turn-1",
+                    content=prior_turn,
+                    source_description="chat",
+                    episode_kind="chat_turn",
+                )
+            ],
+            nodes=[],
+            edges=[],
+            communities=[],
+            episode_reranker_scores=[1.0],
+        )
+
+        result = await memory_ops.build_context_for_query("What was the cobalt launch key?")
+
+        assert "ORBIT-7" in result.text
+        assert "chat-turn-1" in result.source_ids
+        assert result.sources["episodes"] == 1
 
     @pytest.mark.asyncio
     async def test_context_truncation(self, memory_ops, mock_graphiti):
