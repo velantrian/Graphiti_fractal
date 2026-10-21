@@ -1,5 +1,14 @@
 # 🧠 FRACTAL MEMORY 🕸️
 
+> 🕸️ **Temporal memory for AI agents, with source links instead of automatic truth.**
+>
+> **Why:** A conversation ends, but important events, people and decisions may still matter later. Fractal uses Graphiti and Neo4j to organize recall with provenance; retrieving a graph fact does not make it verified.
+>
+> **Example:** A later question can surface a past project decision and its source while leaving trust and authorization to explicit review.
+>
+> **Scope:** Research-grade local-first memory layer; not a claim of production authorization.
+
+
 > **Graphiti-native local-first memory for AI agents.**
 >
 > Представь AI, который не просто держит последние сообщения в контекстном окне, а может **помнить события во времени, связывать людей и идеи, возвращаться к прошлому опыту и сохранять происхождение памяти** — при этом не превращая найденное, часто повторяемое или сгенерированное моделью в автоматическую истину.
