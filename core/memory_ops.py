@@ -128,7 +128,9 @@ class MemoryOps:
         return await ingest_experience(self.graphiti, request)
 
     def _resolve_scopes(self, scopes: Optional[List[str]]) -> list[str]:
-        requested = scopes or ["personal", "project", "knowledge", "experience"]
+        requested = ["personal", "project", "knowledge", "experience"] if scopes is None else scopes
+        if not requested:
+            raise ValueError("explicit empty scopes are not allowed")
         resolved = []
         for scope in requested:
             group_id = resolve_group_id(scope) if scope in MEMORY_TYPES else scope
