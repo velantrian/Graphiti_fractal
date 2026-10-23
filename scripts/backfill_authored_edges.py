@@ -1,3 +1,5 @@
+raise SystemExit("Legacy mutating script disabled pending owner-reviewed safe migration")
+
 
 import asyncio
 import os
