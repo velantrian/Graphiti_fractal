@@ -230,7 +230,7 @@ class SimpleChatAgent:
     async def _create_persisted_summary(self, *, conversation_id: str, end_turn_index: int) -> None:
         graphiti = self.memory.graphiti
         turns = await fetch_persisted_turn_window(graphiti, user_id=self.memory.user_id, conversation_id=conversation_id, end_turn_index=end_turn_index, window_size=10, wait_timeout=25.0)
-        if len(turns) != 10:
+        if len(turns) != 10 or [turn.get("turn_index") for turn in turns] != list(range(end_turn_index - 9, end_turn_index + 1)) or len({turn.get("uuid") for turn in turns}) != 10:
             logger.warning("Skipping chat summary because persisted window is incomplete", extra={"conversation_id": conversation_id, "end_turn_index": end_turn_index, "persisted_turns": len(turns)})
             return
         summary_text = await _generate_chat_summary(turns)
@@ -245,13 +245,13 @@ class SimpleChatAgent:
         await persist_provenance_metadata(graphiti, summary_uuid, {"provenance_id": provenance["provenance_id"], "provenance_activity": provenance["activity"], "provenance_agent": provenance["agent"], "payload_sha256": provenance["payload_sha256"], "derived_source_ids": source_uuids, "authoritative_fact": False})
         updated = await mark_turns_summarized(graphiti, turn_uuids=source_uuids, summary_uuid=summary_uuid)
         if updated != len(source_uuids):
-            logger.warning("Summary source marking incomplete: expected=%d updated=%d", len(source_uuids), updated)
+            raise RuntimeError(f"Summary source marking incomplete: expected={len(source_uuids)} updated={updated}")
         logger.info("Chat summary created", extra={"summary_uuid": summary_uuid, "conversation_id": conversation_id, "covers_turns": f"{start_turn_index}-{end_turn_index}", "provenance_id": provenance["provenance_id"], "user_id": self.memory.user_id})
 
     async def _handle_long_message(self, text: str):
         from core.types import ContextResult
         from knowledge.ingest import ingest_text_document
-        response = "Большой текст принят и отправлен на сохранение как документ."
+        response = "Большой текст поставлен в очередь на сохранение. Подтверждение записи ещё не получено."
         async def store_document():
             try:
                 await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id="personal")
