@@ -1,3 +1,5 @@
+raise SystemExit("Legacy manifest ingest disabled: noncanonical ownership and cross-namespace links")
+
 import asyncio
 import logging
 import sys

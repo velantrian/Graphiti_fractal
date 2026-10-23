@@ -30,7 +30,7 @@ async def fetch_episodes(driver) -> list[dict]:
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
         RETURN e.uuid AS uuid,
-               coalesce(e.summary, e.content, e.episode_body, '') AS text,
+               coalesce(e.content, e.episode_body, '') AS text,
                coalesce(e.group_id, 'unknown') AS group_id,
                e.created_at AS created_at,
                e.reference_time AS reference_time
@@ -108,6 +108,10 @@ async def main(*, dry_run: bool = True, purge_days: int | None = None):
     if dry_run:
         print("✅ Dry run complete; no mutations applied. Re-run with --apply to mutate.")
         return
+
+    # Deduplication with mutations is disabled until provenance-preserving
+    # canonical identity and Graphiti-backed regression tests are available.
+    raise RuntimeError("episode deduplication apply is disabled pending safety review")
 
     fingerprints_set = 0
     duplicates_marked = 0

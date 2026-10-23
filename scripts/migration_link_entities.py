@@ -1,3 +1,5 @@
+raise SystemExit("Legacy mutating script disabled pending owner-reviewed safe migration")
+
 from neo4j import GraphDatabase
 import os
 from dotenv import load_dotenv

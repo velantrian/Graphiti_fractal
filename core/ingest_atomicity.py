@@ -10,6 +10,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from neo4j.exceptions import ConstraintError
+
 
 VALID_ORIGIN_CLASSES = {"owner", "agent_derived", "untrusted", "system"}
 
@@ -79,7 +81,9 @@ async def acquire_ingest_claim(
             expires=expires.isoformat(),
         )
         return str(result.records[0]["token"]) if result.records else None
-    except Exception:  # uniqueness conflict => another claim owns this identity
+    except ConstraintError:
+        # Only a uniqueness conflict is evidence of an existing claim.
+        # Database outages, auth errors, and query failures must propagate.
         return None
 
 
