@@ -1,6 +1,5 @@
 import logging
 from typing import Any, Dict, List, Optional
-from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
