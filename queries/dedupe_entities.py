@@ -199,7 +199,7 @@ async def main(dry_run: bool = True):
         logger.info("✅ Dry run complete; no mutations applied. Re-run with --apply to mutate.")
         return
 
-    logger.info("✅ Entity dedup complete: %s", await deduplicate_entities(graphiti.driver, entities))
+    raise RuntimeError("entity deduplication apply is disabled pending provenance-safe merge review")
 
 
 if __name__ == "__main__":
