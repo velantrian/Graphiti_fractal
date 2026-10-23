@@ -110,7 +110,7 @@ async def fetch_persisted_turn_window(
             }
             for record in result.records
         ]
-        if len(turns) == expected_count:
+        if len(turns) == expected_count and [turn["turn_index"] for turn in turns] == list(range(start_turn_index, end_turn_index + 1)) and len({turn["uuid"] for turn in turns}) == expected_count:
             return turns
         if monotonic() >= deadline:
             logger.warning(
