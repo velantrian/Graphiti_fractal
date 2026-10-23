@@ -4,7 +4,7 @@
 """
 
 from datetime import datetime, timezone
-from typing import Optional, Union, Any
+from typing import Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
