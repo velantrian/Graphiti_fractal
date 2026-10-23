@@ -86,8 +86,8 @@ def build_import_plan(path: str, *, source_type: str = "auto") -> dict:
             continue
         seen.add(key)
         deduped.append(cleaned)
-        if len(deduped) >= MAX_IMPORT_ENTRIES:
-            break
+        if len(deduped) > MAX_IMPORT_ENTRIES:
+            raise ValueError(f"import contains more than {MAX_IMPORT_ENTRIES} unique entries; refusing partial import")
 
     return {
         "mode": "PREVIEW",
