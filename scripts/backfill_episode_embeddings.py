@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.graphiti_client import get_graphiti_client
 from core.embeddings import get_embedding
-from core.rate_limit_retry import run_with_rate_limit_retry
+from core.rate_limit_retry import with_rate_limit_retry
 
 # Configure logging
 logging.basicConfig(
@@ -66,7 +66,7 @@ async def backfill_embeddings():
                 async def _gen():
                     return await get_embedding(embed_text)
                 
-                vec = await run_with_rate_limit_retry(
+                vec = await with_rate_limit_retry(
                     _gen, 
                     op_name=f"embed_{uuid[:8]}",
                     on_rate_limit=lambda s, a: print(f"    Rate limit hit, sleeping {s:.1f}s (attempt {a})")
