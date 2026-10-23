@@ -22,7 +22,7 @@ async def check_openai():
         print("❌ OPENAI_API_KEY не установлен!")
         return False
     
-    print(f"✓ OPENAI_API_KEY установлен (начинается с {api_key[:20]}...)")
+    print("✓ OPENAI_API_KEY установлен (значение скрыто)")
     
     try:
         from openai import AsyncOpenAI
@@ -77,7 +77,7 @@ async def check_graphiti():
         
         # Пробуем добавить тестовый эпизод
         print("  Добавляем тестовый эпизод...")
-        await graphiti.add_episode(
+        episode_result = await graphiti.add_episode(
             name="Diagnostic Test",
             episode_body="This is a diagnostic test episode",
             source_description="diagnostic",
@@ -87,8 +87,11 @@ async def check_graphiti():
         
         # Удаляем тестовый эпизод
         driver = graphiti.driver
+        episode_uuid = getattr(getattr(episode_result, "episode", None), "uuid", None)
+        if not episode_uuid:
+            raise RuntimeError("Cannot safely clean diagnostic episode without exact UUID")
         await driver.execute_query(
-            "MATCH (e:Episodic) WHERE e.source_description = 'diagnostic' DETACH DELETE e"
+            "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e", uuid=episode_uuid
         )
         print("✓ Тестовый эпизод удалён")
         return True
