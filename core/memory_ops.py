@@ -6,6 +6,8 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime
+
+from core.config import get_config
 from typing import Any, Dict, List, Optional
 
 from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
@@ -98,20 +100,17 @@ class MemoryOps:
         if routed_type not in MEMORY_TYPES:
             raise ValueError(f"invalid memory_type: {routed_type!r}")
 
-        memories = _recent_memories.setdefault(self.user_id, deque(maxlen=20))
-        memories.append(
-            {
-                "text": cleaned,
-                "memory_type": routed_type,
-                "source_description": source_description,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-        return await self.ingest_pipeline(
+        result = await self.ingest_pipeline(
             cleaned,
             source_description=source_description or "memory_ops",
             memory_type=routed_type,
         )
+        if result.get("status") == "ok":
+            max_size = get_config().app.recent_memories_max_size
+            if max_size > 0:
+                memories = _recent_memories.setdefault(self.user_id, deque(maxlen=max_size))
+                memories.append({"text": cleaned, "memory_type": routed_type, "source_description": source_description, "timestamp": datetime.now().isoformat()})
+        return result
 
     async def remember_experience(
         self,
