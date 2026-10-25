@@ -3,7 +3,28 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Read/filter outcome statuses (aligned with core.context_guard vocabulary).
+FILTER_OK = "OK"
+FILTER_EMPTY = "EMPTY"
+FILTER_DEGRADED_ERROR = "DEGRADED_ERROR"
+
+
+class _ValidationError(Exception):
+    """Internal marker: validation raised, distinct from 'invalid/missing fields'."""
+
+
 def safe_entity(item: Any) -> Optional[Dict[str, Any]]:
+    """Backward-compatible wrapper: returns None for invalid OR errored items.
+
+    Use ``_entity_checked`` when the caller must distinguish the two.
+    """
+    try:
+        return _entity_checked(item)
+    except _ValidationError:
+        return None
+
+
+def _entity_checked(item: Any) -> Optional[Dict[str, Any]]:
     """
     Safely extracts and validates an entity from Graphiti result.
     Returns a dict if valid, None otherwise.
@@ -38,9 +59,17 @@ def safe_entity(item: Any) -> Optional[Dict[str, Any]]:
         }
     except Exception as e:
         logger.error(f"Error validating entity: {e}")
-        return None
+        raise _ValidationError(str(e)) from e
 
 def safe_edge(item: Any) -> Optional[Dict[str, Any]]:
+    """Backward-compatible wrapper; see ``_edge_checked``."""
+    try:
+        return _edge_checked(item)
+    except _ValidationError:
+        return None
+
+
+def _edge_checked(item: Any) -> Optional[Dict[str, Any]]:
     """
     Safely extracts and validates an edge from Graphiti result.
     """
@@ -64,7 +93,7 @@ def safe_edge(item: Any) -> Optional[Dict[str, Any]]:
         }
     except Exception as e:
         logger.error(f"Error validating edge: {e}")
-        return None
+        raise _ValidationError(str(e)) from e
 
 def filter_graphiti_results(results: Any) -> Dict[str, List]:
     """
@@ -76,18 +105,34 @@ def filter_graphiti_results(results: Any) -> Dict[str, List]:
     raw_entities = getattr(results, "extracted_entities", []) or []
     raw_edges = getattr(results, "extracted_edges", []) or []
     
+    errored_entities = 0
+    errored_edges = 0
     for ent in raw_entities:
-        s_ent = safe_entity(ent)
+        try:
+            s_ent = _entity_checked(ent)
+        except _ValidationError:
+            errored_entities += 1
+            continue
         if s_ent:
             entities.append(s_ent)
-            
+
     for edge in raw_edges:
-        s_edge = safe_edge(edge)
+        try:
+            s_edge = _edge_checked(edge)
+        except _ValidationError:
+            errored_edges += 1
+            continue
         if s_edge:
             edges.append(s_edge)
-            
+
     dropped_entities = len(raw_entities) - len(entities)
     dropped_edges = len(raw_edges) - len(edges)
+    if errored_entities or errored_edges:
+        status = FILTER_DEGRADED_ERROR
+    elif entities or edges:
+        status = FILTER_OK
+    else:
+        status = FILTER_EMPTY
     
     if dropped_entities > 0 or dropped_edges > 0:
         logger.warning(f"Dropped malformed graph elements: entities={dropped_entities}, edges={dropped_edges}")
@@ -96,5 +141,8 @@ def filter_graphiti_results(results: Any) -> Dict[str, List]:
         "entities": entities,
         "edges": edges,
         "dropped_entities": dropped_entities,
-        "dropped_edges": dropped_edges
+        "dropped_edges": dropped_edges,
+        "errored_entities": errored_entities,
+        "errored_edges": errored_edges,
+        "status": status,
     }

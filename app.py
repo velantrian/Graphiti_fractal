@@ -150,6 +150,9 @@ class ChatResponse(BaseModel):
     reply: str
     duration_ms: float | None = None
     timing: dict | None = None
+    # Background save is not confirmed at response time: poll GET /persist/{persist_id}.
+    persist_id: str | None = None
+    persist_status: str | None = None
 
 
 class BufferClearRequest(BaseModel):
@@ -275,7 +278,33 @@ async def chat(req: ChatRequest):
         reply=reply,
         duration_ms=total_ms,
         timing={"answer_ms": answer_ms, "total_ms": total_ms},
+        persist_id=agent.last_persist_id,
+        persist_status=_persist_status(agent.last_persist_id, user_id),
     )
+
+
+def _persist_status(persist_id: str | None, user_id: str) -> str | None:
+    from core import persist_outcomes
+
+    if not persist_id:
+        return None
+    entry = persist_outcomes.get(persist_id, user_id=user_id)
+    return entry["status"] if entry else None
+
+
+@app.get("/persist/{persist_id}", tags=["Chat"], dependencies=[Depends(require_api_token)])
+async def persist_outcome(persist_id: str, user_id: str | None = None):
+    """Final outcome of a background write: pending/persisted/partial/failed/unknown.
+
+    404 means the id is unknown or evicted — it is NOT evidence of success.
+    """
+    from core import persist_outcomes
+
+    entry = persist_outcomes.get(persist_id, user_id=_owner(user_id))
+    if entry is None:
+        raise HTTPException(status_code=404, detail="persist outcome unknown or evicted")
+    entry.pop("user_id", None)
+    return entry
 
 
 @app.post("/remember", tags=["Memory"], dependencies=[Depends(require_api_token)])

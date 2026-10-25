@@ -329,6 +329,7 @@ async def ingest_text_document(
     started = perf_counter()
     total_chunks = len(chunks)
     warnings: list[str] = []
+    degraded_chunks = 0
     errors: list[str] = []
     added_count = 0
     skipped_count = 0
@@ -397,10 +398,21 @@ async def ingest_text_document(
                 on_rate_limit=on_rate_limit,
             )
             safety = filter_graphiti_results(episode_result)
-            if safety["dropped_entities"] or safety["dropped_edges"]:
+            if safety.get("status") == "DEGRADED_ERROR":
+                # Validation itself raised: the extraction result is not trustworthy,
+                # which is different from "malformed elements were dropped".
+                degraded_chunks += 1
                 warnings.append(
-                    f"Chunk {index}: dropped {safety['dropped_entities']} entities "
-                    f"and {safety['dropped_edges']} edges"
+                    f"Chunk {index}: DEGRADED_ERROR — validation raised for "
+                    f"{safety.get('errored_entities', 0)} entities and "
+                    f"{safety.get('errored_edges', 0)} edges"
+                )
+            invalid_entities = safety["dropped_entities"] - safety.get("errored_entities", 0)
+            invalid_edges = safety["dropped_edges"] - safety.get("errored_edges", 0)
+            if invalid_entities or invalid_edges:
+                warnings.append(
+                    f"Chunk {index}: dropped {invalid_entities} entities "
+                    f"and {invalid_edges} edges"
                 )
 
             episode = getattr(episode_result, "episode", episode_result)
@@ -517,6 +529,7 @@ async def ingest_text_document(
         "chunks": total_chunks,
         "elapsed": elapsed,
         "warnings": warnings,
+        "degraded_chunks": degraded_chunks,
         "origin_class": resolved_origin_class,
     }
 
