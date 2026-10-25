@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Optional, Tuple
 
+from core import persist_outcomes
 from core.chat_persistence import allocate_turn_index, fetch_persisted_turn_window, mark_turns_summarized
 from core.config import get_config
 from core.context_guard import build_context_receipt, degraded_context, persist_recall_guard_metadata
@@ -49,6 +50,18 @@ SYSTEM_PROMPT = f"""Ты — Velan: ИИ-компаньон.
 """
 
 
+# Write outcome statuses: a failed save must never look like "nothing happened".
+PERSIST_PERSISTED = "persisted"   # episode + metadata written
+PERSIST_PARTIAL = "partial"       # episode written, follow-up metadata/summary failed
+PERSIST_FAILED = "failed"         # write raised before an episode UUID was confirmed
+PERSIST_UNKNOWN = "unknown"       # timeout/cancel during write: outcome not knowable
+
+
+def _outcome(status: str, episode_uuid, exc) -> dict:
+    return {"status": status, "episode_uuid": episode_uuid,
+            "error": None if exc is None else f"{type(exc).__name__}: {exc}"}
+
+
 def _episode_uuid(result) -> str | None:
     episode = getattr(result, "episode", result)
     if isinstance(episode, dict):
@@ -60,6 +73,7 @@ def _episode_uuid(result) -> str | None:
 
 class SimpleChatAgent:
     def __init__(self, llm_client, memory: MemoryOps):
+        self.last_persist_id: str | None = None
         self.llm_client = llm_client
         self.memory = memory
 
@@ -156,11 +170,15 @@ class SimpleChatAgent:
                 raise RuntimeError("LLM returned an empty response")
             conversation_text = f"User: {user_message}\nAssistant: {response}"
             conversation_buffer.add_turn(user_message, response)
+            persist_id = persist_outcomes.new_persist_id("chat")
+            persist_outcomes.mark_pending(persist_id, user_id=self.memory.user_id)
+            self.last_persist_id = persist_id
             spawn(
                 self._persist_turn_pipeline(
                     conversation_id=conversation_id,
                     conversation_text=conversation_text,
                     context_receipt=context_result.receipt,
+                    persist_id=persist_id,
                 ),
                 name=f"chat-persist:{self.memory.user_id}:{conversation_id}",
             )
@@ -186,10 +204,15 @@ class SimpleChatAgent:
         conversation_id: str,
         conversation_text: str,
         context_receipt: "ContextReceipt | None" = None,
-    ) -> None:
+        persist_id: str | None = None,
+    ) -> dict:
         graphiti = self.memory.graphiti
+        persist_id = persist_id or persist_outcomes.new_persist_id("chat")
+        turn_uuid = None
+        episode_write_started = False
         try:
             turn_index = await allocate_turn_index(graphiti, self.memory.user_id, conversation_id)
+            episode_write_started = True
             turn_uuid = await self._persist_episode(name="chat_turn", body=conversation_text, op_name="add_episode:chat")
             from core.authorship import attach_author
             from knowledge.ingest import update_episode_metadata
@@ -202,8 +225,34 @@ class SimpleChatAgent:
             )
             if turn_index % 10 == 0:
                 await self._create_persisted_summary(conversation_id=conversation_id, end_turn_index=turn_index)
-        except Exception:
-            logger.exception("Chat persistence pipeline failed", extra={"conversation_id": conversation_id, "user_id": self.memory.user_id})
+            outcome = _outcome(PERSIST_PERSISTED, turn_uuid, None)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            # Before the episode write started nothing was sent -> failed (not unknown).
+            if turn_uuid:
+                status = PERSIST_PARTIAL
+            elif episode_write_started:
+                status = PERSIST_UNKNOWN
+            else:
+                status = PERSIST_FAILED
+            outcome = _outcome(status, turn_uuid, exc)
+            self._record_persist_outcome(persist_id, outcome, conversation_id)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return outcome
+        except Exception as exc:
+            outcome = _outcome(PERSIST_PARTIAL if turn_uuid else PERSIST_FAILED, turn_uuid, exc)
+        self._record_persist_outcome(persist_id, outcome, conversation_id)
+        return outcome
+
+    def _record_persist_outcome(self, persist_id: str, outcome: dict, conversation_id: str | None = None) -> None:
+        """Single place that publishes a write outcome (registry + log level by status)."""
+        persist_outcomes.record(persist_id, outcome, user_id=self.memory.user_id)
+        extra = {"conversation_id": conversation_id, "user_id": self.memory.user_id,
+                 "persist_id": persist_id, "persist_status": outcome["status"]}
+        if outcome["status"] == PERSIST_PERSISTED:
+            logger.info("Persistence outcome persisted", extra=extra)
+        else:
+            logger.error("Persistence outcome %s: %s", outcome["status"], outcome.get("error"), extra=extra)
 
     async def _persist_episode(self, *, name: str, body: str, op_name: str) -> str:
         graphiti = self.memory.graphiti
@@ -252,11 +301,22 @@ class SimpleChatAgent:
         from core.types import ContextResult
         from knowledge.ingest import ingest_text_document
         response = "Большой текст поставлен в очередь на сохранение. Подтверждение записи ещё не получено."
+        doc_persist_id = persist_outcomes.new_persist_id("document")
+        persist_outcomes.mark_pending(doc_persist_id, user_id=self.memory.user_id)
+        self.last_persist_id = doc_persist_id
         async def store_document():
             try:
                 await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id="personal")
-            except Exception:
+                outcome = _outcome(PERSIST_PERSISTED, None, None)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                self._record_persist_outcome(doc_persist_id, _outcome(PERSIST_UNKNOWN, None, exc))
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+            except Exception as exc:
                 logger.exception("Long chat document persistence failed")
+                outcome = _outcome(PERSIST_FAILED, None, exc)
+            self._record_persist_outcome(doc_persist_id, outcome)
         spawn(store_document(), name=f"chat-document:{self.memory.user_id}")
         get_user_conversation_buffer(self.memory.user_id).add_turn(f"[LONG TEXT DOCUMENT: {len(text)} chars]", response)
         empty_context = ContextResult(text="", token_estimate=0, sources={})
