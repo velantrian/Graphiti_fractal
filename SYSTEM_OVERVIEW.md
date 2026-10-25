@@ -314,6 +314,22 @@ Applied material остаётся `untrusted`, попадает в namespace `im
 
 ---
 
+### Persist outcome statuses
+
+Каждая фоновая запись (chat turn, длинный документ) получает `persist_id`; статус читается через `GET /persist/{persist_id}`:
+
+| Статус | Значение |
+|---|---|
+| `pending` | запись запущена, итог ещё неизвестен |
+| `persisted` | episode и metadata записаны |
+| `partial` | episode записан, но последующие metadata/summary упали |
+| `failed` | ошибка до подтверждения episode UUID; детали в `error` |
+| `unknown` | таймаут/отмена во время записи — итог неизвестен |
+
+404 означает «id неизвестен/вытеснен» (in-memory bounded registry, не переживает рестарт) — **не** успех.
+
+---
+
 ## 🪜 L1 / L2 / L3
 
 ```text
