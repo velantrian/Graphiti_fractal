@@ -467,12 +467,12 @@ External test, который был skipped из-за отсутствующе�
 - `persist_id` — идентификатор фоновой записи;
 - `persist_status` — статус на момент ответа (обычно `pending`).
 
-Финальный результат: `GET /persist/{persist_id}` (тот же API-токен) → `pending` / `persisted` / `partial` / `failed` / `unknown`.
+Финальный результат: `GET /persist/{persist_id}` (тот же API-токен) → `pending` / `persisted` / `partial` / `unconfirmed` / `failed` / `unknown`.
 
 - ⚠️ **404 ≠ успех.** 404 значит «id неизвестен или вытеснен» (registry in-memory, bounded LRU на 1000 записей, теряется при рестарте). Это не подтверждение записи.
 - 📥 Ingest длинных документов возвращает `degraded_chunks` — число чанков, сохранённых в деградированном режиме; `> 0` означает неполное качество извлечения, а не чистый успех.
 - UI пока не опрашивает этот endpoint; это делают клиенты/операторы вручную.
-- 📄 Длинный документ больше не помечается `persisted`, если часть чанков не сохранилась: статус берётся из `completeness` ingest (`complete` → `persisted`, `partial` → `partial`, `failed` → `failed`, нет сводки → `unknown`), а запись несёт счётчики `chunks` (`added`, `skipped_existing`, `skipped_claim_held`, `failed_chunks`, `degraded_chunks`). `skipped_claim_held` — чанк пишет другой процесс, этим вызовом не подтверждён. Legacy-поле `status` ingest по-прежнему `ok` при частичном результате — смотрите `completeness`.
+- 📄 Длинный документ больше не помечается `persisted`, если часть чанков не сохранилась: статус берётся из `completeness` ingest (`complete` → `persisted`, `partial` → `partial`, `unconfirmed` → `unconfirmed`, `failed` → `failed`, нет сводки → `unknown`), а запись несёт счётчики `chunks` (`added`, `skipped_existing`, `skipped_claim_held`, `failed_chunks`, `degraded_chunks`). `skipped_claim_held` — чанк пишет другой процесс, этим вызовом не подтверждён: если других ошибок нет (или ничего не подтверждено), статус `unconfirmed`, а не `failed`. Legacy-поле `status` ingest по-прежнему `ok` при частичном результате — смотрите `completeness`.
 
 ### 🔄 Что теряется при перезапуске (registry в памяти)
 

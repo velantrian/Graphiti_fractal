@@ -546,14 +546,18 @@ async def ingest_text_document(
 
 def _completeness(total: int, added: int, existing: int, failed: int, degraded: int,
                   claim_held: int) -> str:
-    """complete: every chunk confirmed stored (written now or already present) and none
-    degraded. failed: nothing confirmed. partial: anything in between, including chunks
-    whose write belongs to another in-flight writer (unconfirmed by this call)."""
+    """complete: every chunk confirmed stored (written now or already present), none degraded.
+    unconfirmed: no chunk definitely failed or degraded here, but some (or all) are held by
+    another in-flight writer, so this call can neither confirm nor deny them; also used when
+    nothing was confirmed and at least one chunk is held elsewhere. failed: nothing confirmed
+    and nothing held elsewhere. partial: some confirmed, some definitely failed/degraded."""
     confirmed = added + existing
-    if confirmed == 0:
-        return "failed"
     if confirmed == total and not failed and not degraded and not claim_held:
         return "complete"
+    if claim_held and (confirmed == 0 or (not failed and not degraded)):
+        return "unconfirmed"
+    if confirmed == 0:
+        return "failed"
     return "partial"
 
 

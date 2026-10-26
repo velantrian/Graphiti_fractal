@@ -55,6 +55,7 @@ PERSIST_PERSISTED = "persisted"   # episode + metadata written
 PERSIST_PARTIAL = "partial"       # episode written, follow-up metadata/summary failed
 PERSIST_FAILED = "failed"         # write raised before an episode UUID was confirmed
 PERSIST_UNKNOWN = "unknown"       # timeout/cancel during write: outcome not knowable
+PERSIST_UNCONFIRMED = "unconfirmed"  # chunks held by another writer: not confirmed by this call
 
 
 def _outcome(status: str, episode_uuid, exc) -> dict:
@@ -73,7 +74,8 @@ def _document_outcome(result) -> dict:
     if completeness is None:  # legacy summary without counters: only "error" is definite
         status = PERSIST_FAILED if result.get("status") == "error" else PERSIST_PERSISTED
     else:
-        status = {"complete": PERSIST_PERSISTED, "partial": PERSIST_PARTIAL, "failed": PERSIST_FAILED}.get(
+        status = {"complete": PERSIST_PERSISTED, "partial": PERSIST_PARTIAL, "failed": PERSIST_FAILED,
+                  "unconfirmed": PERSIST_UNCONFIRMED}.get(
             completeness, PERSIST_UNKNOWN)
     outcome = _outcome(status, None, None)
     if status != PERSIST_PERSISTED and result.get("warnings"):

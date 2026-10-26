@@ -45,6 +45,8 @@ async def _run_doc(monkeypatch, summary):
       "warnings": ["Chunk 2: RuntimeError: neo4j down"]}, "partial"),
     ({"status": "error", "chunks": 3, "added": 0, "skipped_existing": 0, "skipped_claim_held": 0,
       "failed_chunks": 3, "degraded_chunks": 0, "completeness": "failed", "warnings": ["x"]}, "failed"),
+    ({"status": "ok", "chunks": 3, "added": 1, "skipped_existing": 0, "skipped_claim_held": 2,
+      "failed_chunks": 0, "degraded_chunks": 0, "completeness": "unconfirmed", "warnings": []}, "unconfirmed"),
     (None, "unknown"),
 ])
 async def test_document_status_matches_stored_chunks(monkeypatch, summary, expected):
@@ -77,7 +79,7 @@ def _graphiti_failing_chunk(fail_index):
     ("t", False, None, "complete", "ok"),
     ("t", False, 2, "partial", "ok"),        # legacy status stays "ok": completeness tells the truth
     ("t", False, "all", "failed", "error"),
-    (None, False, None, "failed", "ok"),     # every claim held by another writer: nothing confirmed
+    (None, False, None, "unconfirmed", "ok"),  # every claim held by another writer: not "failed"
     ("t", True, None, "complete", "ok"),     # already stored earlier
 ])
 async def test_ingest_completeness_real_loop(claim, exists, fail, completeness, status):
@@ -109,3 +111,20 @@ def test_registry_restart_loses_outcomes_and_404_is_not_absence():
     fresh = importlib.reload(persist_outcomes)  # same as a new process: module state rebuilt
     assert fresh.get("document:abc") is None   # final partial status gone
     assert fresh.get("chat:p") is None         # in-flight pending gone; its task died with the process
+
+
+@pytest.mark.parametrize("args, expected", [
+    # total, added, existing, failed, degraded, claim_held
+    ((3, 3, 0, 0, 0, 0), "complete"),
+    ((3, 1, 2, 0, 0, 0), "complete"),
+    ((3, 0, 0, 0, 0, 3), "unconfirmed"),   # all held by another writer: never "failed"
+    ((3, 2, 0, 0, 0, 1), "unconfirmed"),   # rest confirmed, one held elsewhere
+    ((3, 0, 0, 2, 0, 1), "unconfirmed"),   # nothing confirmed but one may still land
+    ((3, 1, 0, 1, 0, 1), "partial"),       # a definite failure alongside stored chunks
+    ((3, 2, 0, 1, 0, 0), "partial"),
+    ((3, 2, 0, 0, 1, 0), "partial"),
+    ((3, 0, 0, 3, 0, 0), "failed"),
+])
+def test_completeness_claim_held_is_unconfirmed_not_failed(args, expected):
+    from knowledge.ingest import _completeness
+    assert _completeness(*args) == expected
