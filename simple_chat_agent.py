@@ -55,11 +55,33 @@ PERSIST_PERSISTED = "persisted"   # episode + metadata written
 PERSIST_PARTIAL = "partial"       # episode written, follow-up metadata/summary failed
 PERSIST_FAILED = "failed"         # write raised before an episode UUID was confirmed
 PERSIST_UNKNOWN = "unknown"       # timeout/cancel during write: outcome not knowable
+PERSIST_UNCONFIRMED = "unconfirmed"  # chunks held by another writer: not confirmed by this call
 
 
 def _outcome(status: str, episode_uuid, exc) -> dict:
     return {"status": status, "episode_uuid": episode_uuid,
             "error": None if exc is None else f"{type(exc).__name__}: {exc}"}
+
+
+_DOC_COUNTERS = ("chunks", "added", "skipped_existing", "skipped_claim_held", "failed_chunks", "degraded_chunks")
+
+
+def _document_outcome(result) -> dict:
+    """Map ingest_text_document's summary to a persist status without overstating it."""
+    if not isinstance(result, dict):
+        return {**_outcome(PERSIST_UNKNOWN, None, None), "error": "ingest returned no summary"}
+    completeness = result.get("completeness")
+    if completeness is None:  # legacy summary without counters: only "error" is definite
+        status = PERSIST_FAILED if result.get("status") == "error" else PERSIST_PERSISTED
+    else:
+        status = {"complete": PERSIST_PERSISTED, "partial": PERSIST_PARTIAL, "failed": PERSIST_FAILED,
+                  "unconfirmed": PERSIST_UNCONFIRMED}.get(
+            completeness, PERSIST_UNKNOWN)
+    outcome = _outcome(status, None, None)
+    if status != PERSIST_PERSISTED and result.get("warnings"):
+        outcome["error"] = "; ".join(str(w) for w in result["warnings"])[:500]
+    outcome["chunks"] = {k: result.get(k) for k in _DOC_COUNTERS if k in result}
+    return outcome
 
 
 def _episode_uuid(result) -> str | None:
@@ -306,8 +328,8 @@ class SimpleChatAgent:
         self.last_persist_id = doc_persist_id
         async def store_document():
             try:
-                await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id="personal")
-                outcome = _outcome(PERSIST_PERSISTED, None, None)
+                result = await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id="personal")
+                outcome = _document_outcome(result)
             except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                 self._record_persist_outcome(doc_persist_id, _outcome(PERSIST_UNKNOWN, None, exc))
                 if isinstance(exc, asyncio.CancelledError):

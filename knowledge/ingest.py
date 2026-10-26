@@ -333,6 +333,8 @@ async def ingest_text_document(
     errors: list[str] = []
     added_count = 0
     skipped_count = 0
+    skipped_existing = 0
+    skipped_claim_held = 0
     reference_time = datetime.now(timezone.utc)
     semaphore = get_write_semaphore()
 
@@ -367,6 +369,7 @@ async def ingest_text_document(
         try:
             if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id):
                 skipped_count += 1
+                skipped_existing += 1
                 if job_id:
                     update_upload_job(job_id, processed_chunks=index, stage="ingest")
                 continue
@@ -377,7 +380,9 @@ async def ingest_text_document(
                 fingerprint=chunk_fp,
             )
             if not claim_token:
+                # Another writer holds the claim: this call did not confirm the chunk.
                 skipped_count += 1
+                skipped_claim_held += 1
                 if job_id:
                     update_upload_job(job_id, processed_chunks=index, stage="ingest")
                 continue
@@ -530,8 +535,30 @@ async def ingest_text_document(
         "elapsed": elapsed,
         "warnings": warnings,
         "degraded_chunks": degraded_chunks,
+        "failed_chunks": len(errors),
+        "skipped_existing": skipped_existing,
+        "skipped_claim_held": skipped_claim_held,
+        "completeness": _completeness(total_chunks, added_count, skipped_existing, len(errors),
+                                      degraded_chunks, skipped_claim_held),
         "origin_class": resolved_origin_class,
     }
+
+
+def _completeness(total: int, added: int, existing: int, failed: int, degraded: int,
+                  claim_held: int) -> str:
+    """complete: every chunk confirmed stored (written now or already present), none degraded.
+    unconfirmed: no chunk definitely failed or degraded here, but some (or all) are held by
+    another in-flight writer, so this call can neither confirm nor deny them; also used when
+    nothing was confirmed and at least one chunk is held elsewhere. failed: nothing confirmed
+    and nothing held elsewhere. partial: some confirmed, some definitely failed/degraded."""
+    confirmed = added + existing
+    if confirmed == total and not failed and not degraded and not claim_held:
+        return "complete"
+    if claim_held and (confirmed == 0 or (not failed and not degraded)):
+        return "unconfirmed"
+    if confirmed == 0:
+        return "failed"
+    return "partial"
 
 
 async def ingest_text_document_simple(
