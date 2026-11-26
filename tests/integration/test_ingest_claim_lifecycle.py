@@ -157,17 +157,6 @@ async def test_error_from_graphiti_without_a_write_is_still_unconfirmed(stub):
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retry_counts_each_attempt_and_can_complete(stub):
-    text = _text("rate-limit")
-    stub.plan = [raise_without_writing(RateLimitError("Please try again in 0.01s."))]
-    result = await _ingest(stub, text)
-    assert result["completeness"] == "complete" and result["added"] == 1
-    assert len(stub.calls) == 2
-    claim = await _claim(stub, text)
-    assert claim["state"] == "COMMITTED" and claim["attempts"] == 2
-
-
-@pytest.mark.asyncio
 async def test_degraded_write_keeps_its_quality_on_retry(stub):
     text = _text("degraded")
     stub.plan = [write_degraded()]
@@ -354,3 +343,32 @@ async def test_http_remember_reports_failed_then_complete_for_the_same_text(stub
         "MATCH (e:Episodic) WHERE e.content IN [$a, $b] RETURN count(e) AS n",
         a=text.strip(), b=_text("http-ambiguous").strip())).records
     assert rows[0]["n"] == 2 and group
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_after_a_committed_write_is_not_retried_into_a_second_episode(stub):
+    """The first attempt stores the episode, then Graphiti raises RateLimitError.
+
+    A repeat of the whole operation must neither call Graphiti again nor create a
+    second episode, and the public result must not say "complete".
+    """
+    text = _text("rate-limit-after-write")
+    stub.plan = [write_then_raise(RateLimitError("Please try again in 0.01s."))]
+    result = await _ingest(stub, text)
+    claim = await _claim(stub, text)
+    observed = {
+        "graphiti_calls": len(stub.calls),
+        "episodes_in_neo4j": await _episodes(stub, text),
+        "claim_state": claim["state"], "write_attempts": claim["attempts"],
+        "completeness": result["completeness"], "added": result["added"],
+        "unconfirmed_writes": result["unconfirmed_writes"],
+    }
+    print("OBSERVED", json.dumps(observed, sort_keys=True))
+    assert observed["graphiti_calls"] == 1
+    assert observed["episodes_in_neo4j"] == 1
+    assert observed["claim_state"] == "RECONCILIATION_REQUIRED"
+    assert observed["completeness"] == "unconfirmed" and observed["added"] == 0
+
+    again = await _ingest(stub, text)                   # repeat of the whole operation
+    assert again["completeness"] == "unconfirmed"
+    assert len(stub.calls) == 1 and await _episodes(stub, text) == 1

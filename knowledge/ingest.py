@@ -6,6 +6,9 @@ import hashlib
 from datetime import datetime, timezone
 from time import perf_counter
 
+import openai
+from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+
 from core.config import get_config
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
@@ -59,6 +62,10 @@ async def _resolve_episode_uuid(
             "episode content lookup is ambiguous; supply episode_uuid instead of mutating by content"
         )
     return str(uuids[0])
+
+
+class AmbiguousGraphitiWrite(RuntimeError):
+    """An add_episode attempt may have stored the chunk; never repeat it automatically."""
 
 
 class UnconfirmedEpisodeIdentity(RuntimeError):
@@ -463,14 +470,25 @@ async def ingest_text_document(
                     # IngestClaimLost (no write) if the claim was replaced meanwhile.
                     await mark_ingest_claim_write_attempt(
                         graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token)
+                    if write_started:
+                        # A previous attempt already reached Graphiti and its outcome is
+                        # unknown: another add_episode could store the chunk twice.
+                        raise AmbiguousGraphitiWrite("earlier attempt reached Graphiti; not repeating")
                     write_started = True
-                    return await graphiti.add_episode(
-                        name=chunk_source[:100],
-                        episode_body=chunk,
-                        source_description=source_description,
-                        reference_time=reference_time,
-                        group_id=group_id,
-                    )
+                    try:
+                        return await graphiti.add_episode(
+                            name=chunk_source[:100],
+                            episode_body=chunk,
+                            source_description=source_description,
+                            reference_time=reference_time,
+                            group_id=group_id,
+                        )
+                    except (openai.RateLimitError, GraphitiRateLimitError) as exc:
+                        # Graphiti runs several model calls and database writes inside one
+                        # add_episode; a rate-limit error does not prove nothing was stored,
+                        # so it must not be retried here (the retry wrapper would call again).
+                        raise AmbiguousGraphitiWrite(
+                            f"{type(exc).__name__} from add_episode; write outcome unknown") from exc
 
             episode_result = await with_rate_limit_retry(
                 write_episode,
