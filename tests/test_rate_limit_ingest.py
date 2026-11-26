@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
 import pytest
+from tests.helpers.fence import mock_ingest_revision  # noqa: F401
 
 from api.jobs import _upload_jobs as UPLOAD_JOBS
 from core.rate_limit_retry import with_rate_limit_retry

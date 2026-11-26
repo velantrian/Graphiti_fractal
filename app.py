@@ -83,6 +83,7 @@ async def run_ingest_job(
     source_description: str | None,
     memory_type: str,
     user_id: str,
+    expected_revision: int,
 ) -> None:
     try:
         graphiti = await get_graphiti_client().ensure_ready()
@@ -97,6 +98,7 @@ async def run_ingest_job(
             user_id=user_id,
             group_id=resolve_group_id(memory_type),
             job_id=job_id,
+            expected_revision=expected_revision,
         )
 
         job = get_upload_job(job_id)
@@ -338,6 +340,8 @@ async def upload_file(
     except UnicodeDecodeError:
         content = raw.decode("cp1251", errors="replace")
 
+    graphiti = await get_graphiti_dep()
+    expected_revision, _ = await read_erasure_state(graphiti)
     cleanup_old_jobs()
     job_id = create_upload_job()
     job = get_upload_job(job_id)
@@ -345,7 +349,7 @@ async def upload_file(
         job["timing"]["upload_request_started_at"] = datetime.now(timezone.utc)
 
     spawn(
-        run_ingest_job(job_id, content, source_description, memory_type, owner),
+        run_ingest_job(job_id, content, source_description, memory_type, owner, expected_revision),
         name=f"upload:{job_id}",
     )
     return {"job_id": job_id}

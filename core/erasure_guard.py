@@ -9,6 +9,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
+class ErasureFenceChanged(RuntimeError):
+    """The operation belongs to an obsolete erasure revision."""
+
+
+# The same node/property is locked first by erase and application finalization.
+# Neo4j acquires a write lock before reading a property used in its own SET.
+# This serializes application-owned commit decisions, not upstream Graphiti writes.
+LOCK_ERASURE_CONTROL = """
+    MERGE (gate:FractalErasureControl {key:'global'})
+    SET gate.fence_serial=coalesce(gate.fence_serial,0)+1
+    WITH gate
+"""
+
 # Static Cypher fragments; caller values are parameters.
 ERASURE_PRESENT = """(EXISTS { MATCH (:FractalErasure) }
     OR EXISTS { MATCH (d) WHERE d.deleted = true })"""
@@ -46,22 +59,21 @@ async def erase_node(graphiti, *, uuid: str, hard: bool = False) -> dict:
     await ensure_erasure_constraints(graphiti)
     action = "DETACH DELETE n" if hard else "SET n.deleted=true, n.deleted_at=$ts"
     result = await graphiti.driver.execute_query(
-        """
+        LOCK_ERASURE_CONTROL + """
         MATCH (n {uuid:$uuid})
-        WITH collect(n) AS targets
+        WITH gate,collect(n) AS targets
         WHERE size(targets)=1
-        WITH targets[0] AS n
+        WITH gate,targets[0] AS n
         MERGE (t:FractalErasure {target_uuid:$uuid})
         ON CREATE SET t.created_at=$ts
         SET t.event_id=$event_id, t.group_id=n.group_id, t.mode=$mode
-        MERGE (c:FractalErasureControl {key:'global'})
-        SET c.revision=coalesce(c.revision,0)+1
-        WITH n,c
+        SET gate.revision=coalesce(gate.revision,0)+1
+        WITH n,gate
         OPTIONAL MATCH (run:TaskRun)-[]->(n)
-        WITH n,c,collect(DISTINCT run) AS runs
+        WITH n,gate,collect(DISTINCT run) AS runs
         FOREACH (run IN runs | SET run.erasure_quarantined=true)
         """ + action + """
-        RETURN 1 AS done, c.revision AS revision
+        RETURN 1 AS done, gate.revision AS revision
         """,
         uuid=uuid, ts=datetime.now(timezone.utc).isoformat(),
         mode="hard" if hard else "soft", event_id=str(uuid4()),
@@ -87,6 +99,15 @@ async def read_erasure_state(graphiti) -> tuple[int, bool]:
     return revision, quarantined
 
 
+async def require_erasure_revision(graphiti, expected: int) -> None:
+    """Fresh, fail-closed check before provider work or exposing an operation result."""
+    if type(expected) is not int or expected < 0:
+        raise ValueError("invalid expected erasure revision")
+    revision, _ = await read_erasure_state(graphiti)
+    if revision != expected:
+        raise ErasureFenceChanged("erasure revision changed; start a new authorized operation")
+
+
 def candidate_key(item: dict) -> tuple[str, str, str]:
     return item["type"], item["uuid"], item["group_id"]
 
@@ -108,6 +129,7 @@ async def admit_search_candidates(graphiti, candidates: list[dict]) -> set[tuple
                 OR (candidate.kind='entity' AND n:Entity)
                 OR (candidate.kind='community' AND n:Community))
               AND coalesce(n.deleted,false)=false
+              AND coalesce(n.erasure_quarantined,false)=false
               AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:n.uuid}) }
               AND (NOT quarantined OR """ + ORIGINAL_EPISODE + """)
             RETURN n.uuid AS uuid

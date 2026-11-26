@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 
 from core.config import get_config
+from core.erasure_guard import read_erasure_state, require_erasure_revision
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
 from core.ingest_atomicity import (
@@ -76,6 +77,7 @@ async def episode_exists(
         """
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
+          AND coalesce(e.erasure_quarantined,false)=false
           AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
           AND ($group_id IS NULL OR e.group_id = $group_id)
           AND (e.fingerprint = $fp OR e.content = $content)
@@ -329,6 +331,7 @@ async def ingest_text_document(
     job_id: str | None = None,
     group_id: str | None = None,
     origin_class: str | None = None,
+    expected_revision: int | None = None,
 ) -> dict:
     """Canonical Graphiti-native text ingestion path with durable origin.
 
@@ -359,6 +362,12 @@ async def ingest_text_document(
     if not chunks:
         raise ValueError("text produced no ingestible chunks")
 
+    # Capture once for the entire operation. Queued callers supply the revision
+    # captured BEFORE scheduling, not a new revision when the task wakes up.
+    if expected_revision is None:
+        expected_revision, _ = await read_erasure_state(graphiti)
+    else:
+        await require_erasure_revision(graphiti, expected_revision)
     started = perf_counter()
     total_chunks = len(chunks)
     warnings: list[str] = []
@@ -403,6 +412,7 @@ async def ingest_text_document(
         write_started = False
 
         try:
+            await require_erasure_revision(graphiti, expected_revision)
             if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id,
                                     origin_class=resolved_origin_class, user_id=user_id,
                                     source_description=source_description):
@@ -416,6 +426,7 @@ async def ingest_text_document(
                 graphiti,
                 group_id=group_id,
                 fingerprint=chunk_fp,
+                expected_revision=expected_revision,
             )
             if not claim_token:
                 # Another writer holds the claim: this call did not confirm the chunk.
@@ -428,6 +439,7 @@ async def ingest_text_document(
             async def write_episode():
                 nonlocal write_started
                 async with semaphore:
+                    await require_erasure_revision(graphiti, expected_revision)
                     write_started = True
                     return await graphiti.add_episode(
                         name=chunk_source[:100],
@@ -488,6 +500,7 @@ async def ingest_text_document(
                 degraded_chunks += 1
 
             try:
+                await require_erasure_revision(graphiti, expected_revision)
                 embedding = await get_embedding(chunk[: get_config().app.max_embedding_chars])
                 if embedding is not None:
                     await set_embedding(
@@ -571,6 +584,15 @@ async def ingest_text_document(
                                       degraded_chunks, skipped_claim_held, unconfirmed_existing + unconfirmed_writes),
         "origin_class": resolved_origin_class,
     }
+    # A receipt must not claim completion if a deletion happened during the
+    # operation (including after dedupe or the last chunk's commit).
+    result["erasure_revision"] = expected_revision
+    try:
+        await require_erasure_revision(graphiti, expected_revision)
+    except Exception:
+        result["status"] = "ok"
+        result["completeness"] = "unconfirmed"
+        result["warnings"].append("Erasure revision could not be confirmed at completion")
     if job_id:
         from api.jobs import finish_upload_job
         finish_upload_job(job_id, result, profile={"total_time": elapsed})

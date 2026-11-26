@@ -34,3 +34,7 @@ Exact-head CI and independent live Neo4j validation required. Do not run destruc
 ### Phase 2B surface wiring
 
 HTTP/MCP share deletion; local owner buffers cleared. Knowledge, L2/L3, legacy context, conflict diagnosis and visualization respect quarantine. Cached HTTP export denied during quarantine. Online clear-all returns 409 after authorization/confirmation because a distributed write fence is absent. Existing export files/backups are not scrubbed. Other-process RAM and in-flight writes remain unresolved; no full erasure guarantee.
+
+## Phase 2C — durable write fence (draft)
+
+One erasure revision per document; HTTP upload captures it before enqueue, and direct ingest captures it at entry. Claim admission and finalization serialize with deletion on a Neo4j control node. Provider calls check revision before every attempt; a late raw upstream write cannot receive owner classification via an old claim. Ambiguous known episodes are quarantined. End-of-operation revision mismatch is unconfirmed, not complete. This is an application commit fence, not a distributed transaction with Graphiti or proof of physical deletion. Old pending claims without revision require explicit reconciliation; no migration or replay. Tests simulate a late upstream commit in isolated live Neo4j.

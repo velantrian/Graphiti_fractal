@@ -505,3 +505,68 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
     finally:
         await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
         await driver.close()
+
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization():
+    """Real Neo4j commit boundary; simulate an upstream writer crossing erasure."""
+    import hashlib
+    from core.erasure_guard import erase_node, read_erasure_state, ErasureFenceChanged
+    from core.ingest_atomicity import (
+        mark_ingest_claim_failed, read_ingest_claim,
+    )
+
+    driver = await _connect_with_retry(
+        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
+        os.environ.get("NEO4J_USER", "neo4j"),
+        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
+    )
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'erasure-target',group_id:'knowledge',content:'old'})")
+        revision, _ = await read_erasure_state(graphiti)
+        token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="late",
+                                           expected_revision=revision)
+        assert token
+        assert (await erase_node(GraphitiAdapter(driver), uuid="erasure-target"))["deleted"]
+        with pytest.raises(ErasureFenceChanged):
+            await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="queued",
+                                       expected_revision=revision)
+        # The upstream transaction is outside Fractal's lock and can still land.
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'late-episode',group_id:'knowledge',content:'late'})")
+        await mark_ingest_claim_episode_created(graphiti, group_id="knowledge", fingerprint="late",
+                                               token=token, episode_uuid="late-episode")
+        with pytest.raises(RuntimeError, match="not admitted"):
+            await finalize_episode_identity(
+                graphiti, group_id="knowledge", fingerprint="late", claim_token=token,
+                episode_uuid="late-episode", user_id="owner", origin_class="owner",
+                ingest_quality="complete", content_sha256=hashlib.sha256(b"late").hexdigest())
+        await mark_ingest_claim_failed(graphiti, group_id="knowledge", fingerprint="late",
+                                       token=token, error_type="ErasureFenceChanged")
+        receipt = await read_ingest_claim(graphiti, group_id="knowledge", fingerprint="late")
+        assert receipt["status"] == "unconfirmed"
+        assert receipt["state"] == "RECONCILIATION_REQUIRED"
+        row = (await graphiti.driver.execute_query(
+            "MATCH (e:Episodic {uuid:'late-episode'}) "
+            "RETURN e.origin_class AS origin, e.erasure_quarantined AS quarantine")).records[0]
+        assert row["origin"] is None and row["quarantine"] is True
+        current, _ = await read_erasure_state(graphiti)
+        fresh = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="fresh",
+                                           expected_revision=current)
+        assert fresh
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'fresh-episode',group_id:'knowledge',content:'fresh'})")
+        await mark_ingest_claim_episode_created(graphiti, group_id="knowledge", fingerprint="fresh",
+                                               token=fresh, episode_uuid="fresh-episode")
+        await finalize_episode_identity(
+            graphiti, group_id="knowledge", fingerprint="fresh", claim_token=fresh,
+            episode_uuid="fresh-episode", user_id="owner", origin_class="owner",
+            ingest_quality="complete", content_sha256=hashlib.sha256(b"fresh").hexdigest())
+        assert (await read_ingest_claim(graphiti, group_id="knowledge", fingerprint="fresh"))["status"] == "committed_complete"
+    finally:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await driver.close()

@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from tests.helpers.fence import mock_ingest_revision  # noqa: F401
 from fastapi.testclient import TestClient
 
 import simple_chat_agent
