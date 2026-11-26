@@ -14,6 +14,7 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
 
 from core.datetime_utils import dt_to_iso, normalize_dt
+from core.erasure_guard import admit_search_candidates, candidate_key
 from core.graphrag_policy import apply_mode_weights, plan_retrieval
 from core.recall_telemetry import record_recall
 from core.text_utils import is_correction_text
@@ -50,7 +51,9 @@ def _identity(item: Any) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _merge_best(target: dict[str, dict], item: dict) -> None:
+def _merge_best(target: dict[str, dict], item: dict, scope: str) -> None:
+    if item.get("group_id") != scope:
+        return
     key = item["uuid"]
     current = target.get(key)
     if current is None or item.get("score", 0.0) > current.get("score", 0.0):
@@ -261,7 +264,7 @@ class MemoryOps:
                         "source_description": source_description,
                         "created_at": dt_to_iso(created),
                     }
-                    _merge_best(episodes, item)
+                    _merge_best(episodes, item, scope)
 
             raw_nodes = getattr(result, "nodes", []) or []
             node_scores = getattr(result, "node_reranker_scores", []) or []
@@ -278,7 +281,7 @@ class MemoryOps:
                         "type": "entity",
                         "group_id": getattr(node, "group_id", None) or scope,
                     }
-                    _merge_best(entities, item)
+                    _merge_best(entities, item, scope)
 
             raw_edges = getattr(result, "edges", []) or []
             edge_scores = getattr(result, "edge_reranker_scores", []) or []
@@ -301,7 +304,7 @@ class MemoryOps:
                     "type": "edge",
                     "group_id": getattr(edge, "group_id", None) or scope,
                 }
-                _merge_best(edges, item)
+                _merge_best(edges, item, scope)
 
             raw_communities = getattr(result, "communities", []) or []
             community_scores = getattr(result, "community_reranker_scores", []) or []
@@ -317,11 +320,15 @@ class MemoryOps:
                     "type": "community",
                     "group_id": getattr(community, "group_id", None) or scope,
                 }
-                _merge_best(communities, item)
+                _merge_best(communities, item, scope)
+
+        candidates = [item for bucket in (episodes, entities, edges, communities)
+                      for item in bucket.values()]
+        admitted = await admit_search_candidates(self.graphiti, candidates)
 
         def ranked(values: dict[str, dict]) -> list[dict]:
             return sorted(
-                values.values(),
+                (item for item in values.values() if candidate_key(item) in admitted),
                 key=lambda item: item.get("score", 0.0),
                 reverse=True,
             )[:limit]

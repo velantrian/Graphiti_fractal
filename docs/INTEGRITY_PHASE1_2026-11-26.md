@@ -22,3 +22,11 @@ Exact-head CI and independent live Neo4j validation required. Do not run destruc
 - Non-owner ingestion uses STORED_FOR rather than AUTHORED. Owner origin remains caller-classified, not independent proof of authorship. Existing edges and direct chat attribution are not rewritten.
 - No timestamp-based automatic claim takeover. Upstream failure after a write starts is unconfirmed; hold the claim and read its durable state with read_ingest_claim. This is per-chunk inspection, not a durable whole-document/chat operation receipt or automatic recovery. Claims may require explicit operator reconciliation indefinitely. Rate-limit retry of upstream operations is still a separate risk.
 - Added provider-free live Neo4j tests of quality replay, account association and restart-style claim reads. No owner database accessed.
+
+
+## Phase 2B — GF-02 (draft; conservative containment)
+
+- Separate durable tombstone and erasure revision committed atomically with target deletion. Known parent TaskRuns quarantined.
+- MemoryOps rechecks candidate UUID/kind/namespace after Graphiti search. After erasure or legacy soft deletion, opaque entity/edge/community summaries, unknown-origin and derived episodes are globally quarantined. Explicit original owner/untrusted/system episodes without known derivation markers remain eligible. No automatic quarantine lift; this is an intentional availability trade-off.
+- Provider-free live test uses stale Graphiti-shaped candidates against Neo4j; not actual Graphiti provider E2E. Test-only admission fixtures are isolated from the dedicated erasure tests.
+- Remaining: all other reader/writer surfaces, RAM, upstream transaction fencing, historic hard-deletes, backups, verified rebuild. Not full erasure safety.

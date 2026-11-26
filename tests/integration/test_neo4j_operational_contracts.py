@@ -443,3 +443,65 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery():
     finally:
         await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
         await driver.close()
+
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_original():
+    """GF-02: actual Neo4j, stale search objects, no provider calls."""
+    from types import SimpleNamespace
+    from core.erasure_guard import erase_node, read_erasure_state
+    from core.memory_ops import MemoryOps
+
+    driver = await _connect_with_retry(
+        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
+        os.environ.get("NEO4J_USER", "neo4j"),
+        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
+    )
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.driver.execute_query("""
+            CREATE (a:Episodic {uuid:'erase-me',group_id:'knowledge',content:'secret marker',origin_class:'owner'}),
+                   (b:Episodic {uuid:'keep-me',group_id:'knowledge',content:'independent marker',origin_class:'owner'}),
+                   (d:Episodic {uuid:'derived',group_id:'knowledge',content:'secret marker in summary',
+                                origin_class:'agent_derived',derived_source_ids:['erase-me']}),
+                   (x:Entity {uuid:'x',group_id:'knowledge',summary:'secret marker'}),
+                   (y:Entity {uuid:'y',group_id:'knowledge',summary:'other'}),
+                   (c:Community {uuid:'community',group_id:'knowledge',summary:'secret marker'}),
+                   (a)-[:MENTIONS]->(x),
+                   (c)-[:HAS_MEMBER]->(x),
+                   (x)-[:RELATES_TO {uuid:'edge',group_id:'knowledge',fact:'secret marker'}]->(y)
+        """)
+        async def stale_search(**kwargs):
+            return SimpleNamespace(
+                episodes=[SimpleNamespace(uuid=uid,content=body,group_id='knowledge')
+                          for uid,body in [('erase-me','secret marker'),('keep-me','independent marker'),
+                                           ('derived','secret marker in summary')]],
+                nodes=[SimpleNamespace(uuid='x',name='X',summary='secret marker',group_id='knowledge')],
+                edges=[SimpleNamespace(uuid='edge',fact='secret marker',group_id='knowledge')],
+                communities=[SimpleNamespace(uuid='community',name='C',summary='secret marker',group_id='knowledge')],
+            )
+        graphiti.search_ = stale_search
+        memory = MemoryOps(graphiti, "owner")
+        before = await memory.search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert {e["uuid"] for e in before.episodes} == {"erase-me", "keep-me", "derived"}
+        assert before.entities and before.edges and before.communities
+        assert await read_erasure_state(graphiti) == (0, False)
+        assert (await erase_node(graphiti, uuid="erase-me"))["deleted"] is True
+        assert await read_erasure_state(graphiti) == (1, True)
+        other = GraphitiAdapter(driver)
+        other.search_ = stale_search
+        after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert [e["uuid"] for e in after.episodes] == ["keep-me"]
+        assert not after.entities and not after.edges and not after.communities
+        assert (await erase_node(graphiti, uuid="erase-me", hard=True))["deleted"] is True
+        assert await read_erasure_state(other) == (2, True)
+        after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert [e["uuid"] for e in after.episodes] == ["keep-me"]
+        marker = await graphiti.driver.execute_query(
+            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode")
+        assert marker.records[0]["mode"] == "hard"
+    finally:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await driver.close()

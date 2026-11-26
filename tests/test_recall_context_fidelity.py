@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from core.context_guard import build_context_receipt
 from core.memory_ops import MemoryOps
+from tests.helpers.erasure import mock_admission  # noqa: F401
 
 
 class _Graphiti:
