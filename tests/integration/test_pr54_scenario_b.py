@@ -21,10 +21,11 @@ import pytest_asyncio
 from graphiti_core import Graphiti
 from httpx import ASGITransport, AsyncClient
 
+from core import erasure_scope
 from core.erasure_guard import read_erasure_state
 from core.memory_ops import MemoryOps
 from knowledge.ingest import ingest_text_document
-from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker
+from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker, recording_extractor
 
 GROUP = "knowledge"
 A = "[[Mira Venn]] keeps the vault passphrase ZORBLAX-ALPHA in the [[Amber Cabinet]]."
@@ -115,6 +116,11 @@ async def run_variant(env, monkeypatch, mode, *, filter_previous=False):
     elif mode == "hard":
         from core.erasure_guard import erase_node
         assert (await erase_node(env.graphiti, uuid=a_uuid, hard=True))["deleted"] is True
+    rebuilt = None
+    if mode in ("soft", "hard"):
+        # Variant B pauses model-assisted writes in the affected group until its derived
+        # objects are rebuilt or cleared (refusal itself is covered in test_variant_b_vertical).
+        rebuilt = await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))
     state_before = await read_erasure_state(env.graphiti)
     before = await _snapshot(env)
     residue_before = sorted(f"{k[0]}" for k, v in before.items() if MARK_A in v and k[0] != "episode")
@@ -138,7 +144,7 @@ async def run_variant(env, monkeypatch, mode, *, filter_previous=False):
     changed = {k: v for k, v in after.items() if before.get(k) != v}
     delivered = await _deliver(env)
     return {
-        "mode": mode,
+        "mode": mode, "rebuild": rebuilt,
         "erasure_state_before_after_new_write": [list(state_before), list(state_after)],
         "new_write_completeness": result["completeness"],
         "model_calls_for_new_write": len(env.llm.calls) - mark,
@@ -170,18 +176,9 @@ async def test_scenario_b_observation(env, monkeypatch, mode):
     assert observed["1_model_input"]["valid_marker_present"] is True   # positive control
 
 
-@pytest.mark.asyncio
-async def test_scenario_b_measurement_soft_delete_with_filtered_previous_episodes(env, monkeypatch):
-    observed = await run_variant(env, monkeypatch, "soft", filter_previous=True)
-    print("OBSERVED " + json.dumps(observed, sort_keys=True))
-    assert observed["1_model_input"]["valid_marker_present"] is True
-
-
-# Requirement (task statement): at an unchanged erasure revision a deleted text must
-# not be part of the model input of a new write, while valid context still is.
-# Observed to FAIL for both delete modes on PR #54 @698239b, so the defect is pinned
-# with strict xfail: CI stays green today and turns red the moment the gap is closed.
-@pytest.mark.xfail(strict=True, reason="PR #54 gap: deleted text still reaches the model input of a new write")
+# Requirement (task statement): at an unchanged erasure revision a deleted text must not be
+# part of the model input of a new write, while valid context still is. Failed on PR #54
+# @698239b (strict xfail there); variant B makes it a mandatory passing test.
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["soft", "hard"])
 async def test_requirement_deleted_text_absent_from_model_input(env, monkeypatch, mode):

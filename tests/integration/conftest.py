@@ -104,10 +104,17 @@ class IsolatedGraph:
 async def isolated_graph(neo4j_isolation):
     """Async driver admitted on its own connection pool; closed after the test."""
     driver = await open_admitted_async_driver(neo4j_isolation)
+    graph = IsolatedGraph(driver, neo4j_isolation)
+    # Every test starts and ends on an empty graph (the marker survives), so tombstones or claims
+    # left by one test can never change what the next one observes, whatever the file order.
+    await graph.reset()
     try:
-        yield IsolatedGraph(driver, neo4j_isolation)
+        yield graph
     finally:
-        await driver.close()
+        try:
+            await graph.reset()
+        finally:
+            await driver.close()
 
 
 @pytest_asyncio.fixture

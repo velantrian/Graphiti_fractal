@@ -12,9 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from neo4j.exceptions import ConstraintError
 
-from core.erasure_guard import (
-    ErasureFenceChanged, LOCK_ERASURE_CONTROL, ensure_erasure_constraints,
-)
+from core.erasure_guard import ErasureFenceChanged, LOCK_ERASURE_CONTROL, ensure_erasure_constraints
 
 
 VALID_ORIGIN_CLASSES = {"owner", "agent_derived", "untrusted", "system"}
@@ -54,40 +52,106 @@ async def acquire_ingest_claim(
     now = datetime.now(timezone.utc)
     expires = now + timedelta(seconds=max(30, ttl_seconds))
 
-    # A timestamp is diagnostic, not proof that Graphiti did not write.
-    # Never reclaim a claim automatically: the upstream transaction is not fenced
-    # by our token, and a slow or crashed writer may already have committed.
-    try:
-        result = await graphiti.driver.execute_query(
-            LOCK_ERASURE_CONTROL + """
-            WHERE $expected_revision IS NULL OR coalesce(gate.revision,0)=$expected_revision
-            CREATE (c:FractalIngestClaim {
-                claim_key:$claim_key,
-                group_id:$group_id,
-                fingerprint:$fingerprint,
-                token:$token,
-                state:'PENDING',
-                erasure_revision:coalesce(gate.revision,0),
-                created_at:datetime($now),
-                expires_at:datetime($expires)
-            })
-            RETURN c.token AS token
-            """,
-            claim_key=key,
-            group_id=group_id,
-            fingerprint=fingerprint,
-            token=token,
-            now=now.isoformat(),
-            expires=expires.isoformat(),
-            expected_revision=expected_revision,
-        )
-        if not result.records:
-            raise ErasureFenceChanged("ingest claim not admitted at expected revision")
-        return str(result.records[0]["token"])
-    except ConstraintError:
-        # Only a uniqueness conflict is evidence of an existing claim.
-        # Database outages, auth errors, and query failures must propagate.
-        return None
+    # A timestamp alone is never proof that Graphiti did not write: the upstream
+    # transaction is not fenced by our token. The only proof of "never reached
+    # Graphiti" is the durable write-attempt marker, which the owner commits
+    # (compare-and-set on its token) *before* it calls add_episode. A claim past
+    # its TTL with no marker and no episode UUID can therefore be replaced; any
+    # other existing claim stays until reconciliation.
+    for _ in range(2):
+        try:
+            # Admitted only if no erasure *in this group* happened since the caller observed
+            # revision `expected_revision`; erasures in other groups do not affect this write.
+            result = await graphiti.driver.execute_query(
+                LOCK_ERASURE_CONTROL + """
+                WHERE $expected_revision IS NULL OR NOT EXISTS {
+                    MATCH (t:FractalErasure {group_id:$group_id}) WHERE t.revision > $expected_revision }
+                CREATE (c:FractalIngestClaim {
+                    claim_key:$claim_key,
+                    group_id:$group_id,
+                    fingerprint:$fingerprint,
+                    token:$token,
+                    state:'PENDING',
+                    attempt_protocol:1,
+                    erasure_revision:coalesce(gate.revision,0),
+                    created_at:datetime($now),
+                    expires_at:datetime($expires)
+                })
+                RETURN c.token AS token
+                """,
+                claim_key=key,
+                group_id=group_id,
+                fingerprint=fingerprint,
+                token=token,
+                now=now.isoformat(),
+                expires=expires.isoformat(),
+                expected_revision=expected_revision,
+            )
+            if not result.records:
+                raise ErasureFenceChanged("ingest claim not admitted: an erasure in this group happened meanwhile")
+            return str(result.records[0]["token"])
+        except ConstraintError:
+            # Only a uniqueness conflict is evidence of an existing claim.
+            # Database outages, auth errors, and query failures must propagate.
+            if not await _discard_unattempted_expired_claim(graphiti, key, now):
+                return None
+    return None
+
+
+async def _discard_unattempted_expired_claim(graphiti, key: str, now: datetime) -> bool:
+    """Delete an expired claim only if no write attempt was ever recorded.
+
+    The SET takes the node's write lock first, so the conditions below are read
+    after any concurrent write-attempt marker has committed.
+    """
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (c:FractalIngestClaim {claim_key:$claim_key})
+        SET c.lock_serial = coalesce(c.lock_serial, 0) + 1
+        WITH c
+        WHERE c.state = 'PENDING'
+          AND c.attempt_protocol = 1
+          AND c.episode_uuid IS NULL
+          AND c.write_attempted_at IS NULL
+          AND c.expires_at < datetime($now)
+        DELETE c
+        RETURN 1 AS discarded
+        """,
+        claim_key=key,
+        now=now.isoformat(),
+    )
+    return bool(result.records)
+
+
+class IngestClaimLost(RuntimeError):
+    """The claim is no longer this writer's; Graphiti must not be called."""
+
+
+async def mark_ingest_claim_write_attempt(
+    graphiti, *, group_id: str, fingerprint: str, token: str,
+) -> int:
+    """Durably record, before add_episode, that this owner is about to call Graphiti.
+
+    Compare-and-set on token + PENDING. Raises IngestClaimLost if the claim was
+    discarded or replaced, in which case the caller must not write. Returns the
+    number of attempts recorded (rate-limit retries call Graphiti again).
+    """
+    result = await graphiti.driver.execute_query(
+        """
+        MATCH (c:FractalIngestClaim {claim_key:$claim_key})
+        SET c.lock_serial = coalesce(c.lock_serial, 0) + 1
+        WITH c
+        WHERE c.token = $token AND c.state = 'PENDING'
+        SET c.write_attempts = coalesce(c.write_attempts, 0) + 1,
+            c.write_attempted_at = coalesce(c.write_attempted_at, datetime())
+        RETURN c.write_attempts AS attempts
+        """,
+        claim_key=claim_key(group_id, fingerprint),
+        token=token,
+    )
+    if not result.records:
+        raise IngestClaimLost("ingest claim is no longer held by this writer; not calling Graphiti")
+    return int(result.records[0]["attempts"])
 
 
 async def release_ingest_claim(
@@ -97,19 +161,30 @@ async def release_ingest_claim(
     fingerprint: str,
     token: str,
     confirmed_no_write: bool = False,
-) -> None:
-    """Explicit recovery only, after independent proof no upstream write can land."""
+) -> bool:
+    """Release this writer's own claim; True only if a claim was actually deleted.
+
+    The caller asserts it never reached Graphiti; the database re-checks that
+    independently: the claim must carry this token, still be PENDING, have no
+    episode UUID and no recorded write attempt. A claim of another writer (a
+    different token) or one with possible upstream effects is never touched.
+    """
     if confirmed_no_write is not True:
         raise PermissionError("claim release requires confirmed no-write evidence")
-    await graphiti.driver.execute_query(
+    result = await graphiti.driver.execute_query(
         """
-        MATCH (c:FractalIngestClaim {claim_key:$claim_key, token:$token, state:'PENDING'})
-        WHERE c.episode_uuid IS NULL
+        MATCH (c:FractalIngestClaim {claim_key:$claim_key})
+        SET c.lock_serial = coalesce(c.lock_serial, 0) + 1
+        WITH c
+        WHERE c.token = $token AND c.state = 'PENDING'
+          AND c.episode_uuid IS NULL AND c.write_attempted_at IS NULL
         DELETE c
+        RETURN 1 AS released
         """,
         claim_key=claim_key(group_id, fingerprint),
         token=token,
     )
+    return bool(result.records)
 
 
 async def mark_ingest_claim_episode_created(
@@ -261,10 +336,10 @@ async def finalize_episode_identity(
         MATCH (e:Episodic {uuid:$episode_uuid})
         MATCH (c:FractalIngestClaim {claim_key:$claim_key, token:$claim_token, state:'PENDING'})
         WHERE c.episode_uuid=$episode_uuid
-          AND c.erasure_revision=coalesce(gate.revision,0)
+          AND NOT EXISTS { MATCH (t:FractalErasure {group_id:$group_id}) WHERE t.revision > c.erasure_revision }
           AND coalesce(e.erasure_quarantined,false)=false
-          AND coalesce(e.deleted,false)=false
           AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
+          AND coalesce(e.deleted,false)=false
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
             e.origin_class=$origin_class,
@@ -304,4 +379,4 @@ async def finalize_episode_identity(
         content_sha256=content_sha256,
     )
     if not result.records:
-        raise RuntimeError("episode finalization not admitted: missing target, claim or current erasure revision")
+        raise RuntimeError("episode finalization not admitted: missing target, claim, or an erasure in this group happened meanwhile")

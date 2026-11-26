@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import hashlib
 from datetime import datetime, timezone
 from time import perf_counter
 
+import openai
+from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+
 from core.config import get_config
-from core.erasure_guard import read_erasure_state, require_erasure_revision
+from core.erasure_guard import (
+    GroupWriteRestricted, live_previous_episode_uuids, read_erasure_state, require_erasure_revision,
+    require_group_writable,
+)
 from core.embeddings import get_embedding
 from core.graphiti_client import get_write_semaphore
 from core.ingest_atomicity import (
     VALID_ORIGIN_CLASSES,
     acquire_ingest_claim,
+    claim_key,
     finalize_episode_identity,
     mark_ingest_claim_episode_created,
     mark_ingest_claim_failed,
+    mark_ingest_claim_write_attempt,
+    release_ingest_claim,
 )
 from core.text_utils import fingerprint, split_into_semantic_chunks
 
@@ -57,6 +67,10 @@ async def _resolve_episode_uuid(
             "episode content lookup is ambiguous; supply episode_uuid instead of mutating by content"
         )
     return str(uuids[0])
+
+
+class AmbiguousGraphitiWrite(RuntimeError):
+    """An add_episode attempt may have stored the chunk; never repeat it automatically."""
 
 
 class UnconfirmedEpisodeIdentity(RuntimeError):
@@ -322,6 +336,63 @@ async def remember_text(
     )
 
 
+async def _settle_unfinished_claim(graphiti, *, group_id: str, fingerprint: str, token: str,
+                                   write_started: bool, error_type: str) -> str:
+    """Decide what a claim becomes when its chunk did not finish. Never raises.
+
+    "released": no attempt reached Graphiti (this process never called it and the
+        database holds no write-attempt marker), so only this writer's claim is
+        deleted, by token, and a retry of the same chunk can proceed.
+    "reconciliation": Graphiti may have written (an attempt was made, even one that
+        raised a rate limit or timeout); the claim is kept as RECONCILIATION_REQUIRED.
+    "pending": settlement itself failed (database unreachable). This writer never
+        called Graphiti; the claim stays PENDING and, having no marker, can be
+        replaced once its TTL has passed.
+    """
+    try:
+        if not write_started:
+            if await release_ingest_claim(graphiti, group_id=group_id, fingerprint=fingerprint,
+                                          token=token, confirmed_no_write=True):
+                return "released"
+            # Not deleted: a write-attempt marker exists (its commit may have been
+            # acknowledged ambiguously) or the claim is no longer ours.
+        await mark_ingest_claim_failed(graphiti, group_id=group_id, fingerprint=fingerprint,
+                                       token=token, error_type=error_type)
+        return "reconciliation"
+    except Exception:  # noqa: BLE001 - settlement must not mask the original failure
+        logger.error("Failed to settle unfinished ingest claim")
+        return "reconciliation" if write_started else "pending"
+
+
+async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: int | None,
+                                       episode_uuids: list[str], *, claim_fingerprint: str | None = None) -> None:
+    """An erasure in this group landed while add_episode was running: contain what it wrote.
+
+    Known episode UUIDs: their derived objects are marked (and the claim settled). A chunk whose
+    write reached Graphiti but whose episode is UNKNOWN (reply lost): nothing can be marked, so the
+    erasures it crossed are reopened and held; the claim stays unsettled, which pauses the group
+    until an explicit settlement (core.late_writes). Never raises (it runs inside error handling);
+    if it fails, the durable claim itself still pauses the group (require_group_writable) and the
+    recovery sweep repeats this after a restart.
+    """
+    if since_revision is None:
+        return
+    try:
+        from core.erasure_scope import mark_late_write
+        from core.late_writes import reopen_for_unsettled_writes
+        if episode_uuids:
+            result = await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+            if result.get("events") and claim_fingerprint:
+                await graphiti.driver.execute_query(
+                    "MATCH (c:FractalIngestClaim {claim_key:$k}) WHERE c.late_settled_at IS NULL "
+                    "SET c.late_settled_at=datetime(), c.late_settlement='contained'",
+                    k=claim_key(group_id, claim_fingerprint))
+        elif claim_fingerprint:
+            await reopen_for_unsettled_writes(graphiti)
+    except Exception:  # noqa: BLE001
+        logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
+
+
 async def ingest_text_document(
     graphiti,
     text: str,
@@ -367,7 +438,7 @@ async def ingest_text_document(
     if expected_revision is None:
         expected_revision, _ = await read_erasure_state(graphiti)
     else:
-        await require_erasure_revision(graphiti, expected_revision)
+        await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
     started = perf_counter()
     total_chunks = len(chunks)
     warnings: list[str] = []
@@ -381,6 +452,7 @@ async def ingest_text_document(
     unconfirmed_writes = 0
     reference_time = datetime.now(timezone.utc)
     semaphore = get_write_semaphore()
+    written_uuids: list[str] = []      # episodes this call made Graphiti create
 
     if job_id:
         update_upload_job(
@@ -410,9 +482,11 @@ async def ingest_text_document(
         claim_token: str | None = None
         episode_uuid: str | None = None
         write_started = False
+        chunk_uuid_start = len(written_uuids)
 
         try:
-            await require_erasure_revision(graphiti, expected_revision)
+            await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
+            await require_group_writable(graphiti, group_id)    # pause only groups with unresolved derived objects
             if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id,
                                     origin_class=resolved_origin_class, user_id=user_id,
                                     source_description=source_description):
@@ -439,15 +513,34 @@ async def ingest_text_document(
             async def write_episode():
                 nonlocal write_started
                 async with semaphore:
-                    await require_erasure_revision(graphiti, expected_revision)
+                    # Durable compare-and-set *before* the call: afterwards "no marker"
+                    # proves Graphiti was never called for this claim. Raises
+                    # IngestClaimLost (no write) if the claim was replaced meanwhile.
+                    await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
+                    await require_group_writable(graphiti, group_id)       # re-check right before the call
+                    previous = await live_previous_episode_uuids(graphiti, group_id, reference_time)
+                    await mark_ingest_claim_write_attempt(
+                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token)
+                    if write_started:
+                        # A previous attempt already reached Graphiti and its outcome is
+                        # unknown: another add_episode could store the chunk twice.
+                        raise AmbiguousGraphitiWrite("earlier attempt reached Graphiti; not repeating")
                     write_started = True
-                    return await graphiti.add_episode(
-                        name=chunk_source[:100],
-                        episode_body=chunk,
-                        source_description=source_description,
-                        reference_time=reference_time,
-                        group_id=group_id,
-                    )
+                    try:
+                        return await graphiti.add_episode(
+                            name=chunk_source[:100],
+                            episode_body=chunk,
+                            source_description=source_description,
+                            reference_time=reference_time,
+                            group_id=group_id,
+                            **({} if previous is None else {"previous_episode_uuids": previous}),
+                        )
+                    except (openai.RateLimitError, GraphitiRateLimitError) as exc:
+                        # Graphiti runs several model calls and database writes inside one
+                        # add_episode; a rate-limit error does not prove nothing was stored,
+                        # so it must not be retried here (the retry wrapper would call again).
+                        raise AmbiguousGraphitiWrite(
+                            f"{type(exc).__name__} from add_episode; write outcome unknown") from exc
 
             episode_result = await with_rate_limit_retry(
                 write_episode,
@@ -461,6 +554,7 @@ async def ingest_text_document(
             if not episode_uuid:
                 raise RuntimeError("Graphiti add_episode returned no episode UUID")
             episode_uuid = str(episode_uuid)
+            written_uuids.append(episode_uuid)
             await mark_ingest_claim_episode_created(
                 graphiti, group_id=group_id, fingerprint=chunk_fp,
                 token=claim_token, episode_uuid=episode_uuid,
@@ -500,7 +594,7 @@ async def ingest_text_document(
                 degraded_chunks += 1
 
             try:
-                await require_erasure_revision(graphiti, expected_revision)
+                await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
                 embedding = await get_embedding(chunk[: get_config().app.max_embedding_chars])
                 if embedding is not None:
                     await set_embedding(
@@ -523,19 +617,30 @@ async def ingest_text_document(
             skipped_count += 1
             unconfirmed_existing += 1
             warnings.append(f"Chunk {index}: matching episode identity unconfirmed; reconciliation required")
-        except Exception as exc:  # noqa: BLE001
+        except asyncio.CancelledError:
+            # Cancelled before the call: release (retry possible). After it: keep for
+            # reconciliation. Shielded so settlement completes while cancelled.
             if claim_token:
-                try:
-                    # A transport/provider error is not proof of non-persistence.
-                    # Keep the claim even if no upstream UUID was returned.
-                    await mark_ingest_claim_failed(
-                        graphiti, group_id=group_id, fingerprint=chunk_fp,
-                        token=claim_token, error_type=type(exc).__name__,
-                    )
-                except Exception:
-                    logger.error("Failed to record reconciliation requirement")
+                await asyncio.shield(_settle_unfinished_claim(
+                    graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                    write_started=write_started, error_type="CancelledError"))
+                if write_started:
+                    await asyncio.shield(_contain_if_erased_meanwhile(
+                        graphiti, group_id, expected_revision, written_uuids[chunk_uuid_start:],
+                        claim_fingerprint=chunk_fp))
+            raise
+        except Exception as exc:  # noqa: BLE001
+            settled = "none"
+            if claim_token:
+                settled = await _settle_unfinished_claim(
+                    graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                    write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
             if write_started:
+                await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision,
+                                                   written_uuids[chunk_uuid_start:], claim_fingerprint=chunk_fp)
+            if write_started or settled == "reconciliation":
+                # An attempt may have reached Graphiti: neither a failure nor a success.
                 unconfirmed_writes += 1
                 warnings.append(f"Chunk {index}: {type(exc).__name__}: write outcome unconfirmed")
             else:
@@ -584,12 +689,13 @@ async def ingest_text_document(
                                       degraded_chunks, skipped_claim_held, unconfirmed_existing + unconfirmed_writes),
         "origin_class": resolved_origin_class,
     }
-    # A receipt must not claim completion if a deletion happened during the
+    # A receipt must not claim completion if an erasure happened in this group during the
     # operation (including after dedupe or the last chunk's commit).
     result["erasure_revision"] = expected_revision
     try:
-        await require_erasure_revision(graphiti, expected_revision)
+        await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
     except Exception:
+        await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision, written_uuids)
         result["status"] = "ok"
         result["completeness"] = "unconfirmed"
         result["warnings"].append("Erasure revision could not be confirmed at completion")

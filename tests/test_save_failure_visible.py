@@ -172,6 +172,7 @@ async def test_ingest_honors_degraded_error_status():
     g.driver.execute_query = AsyncMock(return_value=Mock(records=[]))
     with (
         patch("knowledge.ingest.acquire_ingest_claim", new=AsyncMock(return_value="t")),
+        patch("knowledge.ingest.mark_ingest_claim_write_attempt", new=AsyncMock(return_value=1)),
         patch("knowledge.ingest.mark_ingest_claim_episode_created", new=AsyncMock()),
         patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()) as finalize,
         patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),

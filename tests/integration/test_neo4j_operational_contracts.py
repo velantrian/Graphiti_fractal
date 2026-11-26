@@ -321,7 +321,9 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph)
     """Provider-free GF-01/GF-03/GF-04; actual Cypher, no owner database."""
     import hashlib
     from datetime import datetime, timedelta, timezone
-    from core.ingest_atomicity import mark_ingest_claim_failed, read_ingest_claim
+    from core.ingest_atomicity import (
+        mark_ingest_claim_failed, mark_ingest_claim_write_attempt, read_ingest_claim,
+    )
     from knowledge.ingest import episode_exists, UnconfirmedEpisodeIdentity
 
     graphiti = isolated_graph
@@ -363,10 +365,14 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph)
                 with pytest.raises(UnconfirmedEpisodeIdentity):
                     await episode_exists(graphiti, fp, body, "knowledge", **kwargs)
         token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain")
+        # The writer recorded its attempt before calling Graphiti (see
+        # test_ingest_claim_lifecycle.py for expired claims without an attempt).
+        await mark_ingest_claim_write_attempt(
+            graphiti, group_id="knowledge", fingerprint="uncertain", token=token)
         await graphiti.driver.execute_query(
             "MATCH (c:FractalIngestClaim {token:$token}) SET c.expires_at=datetime($past)",
             token=token, past=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat())
-        # Old timestamps do not permit takeover; a slow writer may still commit.
+        # Old timestamps do not permit takeover once an attempt exists; a slow writer may still commit.
         assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
         await mark_ingest_claim_failed(
             graphiti, group_id="knowledge", fingerprint="uncertain", token=token, error_type="TimeoutError")
@@ -423,13 +429,15 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
         after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
         assert [e["uuid"] for e in after.episodes] == ["keep-me"]
         assert not after.entities and not after.edges and not after.communities
-        assert (await erase_node(graphiti, uuid="erase-me", hard=True))["deleted"] is True
-        assert await read_erasure_state(other) == (2, True)
+        upgrade = await erase_node(graphiti, uuid="erase-me", hard=True)
+        assert upgrade["deleted"] is True and upgrade["performed_mode"] == "hard"
+        # hard after soft is the SAME event: physical deletion only, no new revision (idempotency contract)
+        assert await read_erasure_state(other) == (1, True)
         after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
         assert [e["uuid"] for e in after.episodes] == ["keep-me"]
         marker = await graphiti.driver.execute_query(
-            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode")
-        assert marker.records[0]["mode"] == "hard"
+            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode, t.hard_deleted_at AS h")
+        assert marker.records[0]["mode"] == "soft" and marker.records[0]["h"]
     finally:
         await graphiti.reset()
 

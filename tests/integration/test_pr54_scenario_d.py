@@ -80,11 +80,9 @@ async def test_d1_erasure_quarantined_flag_across_read_paths(world, global_quara
            "knowledge_search_returns_it": "MKdocK" in markers(knowledge)}
     print("OBSERVED_D1 " + json.dumps(obs, sort_keys=True))
     assert obs["memory_ops_returns_it"] is (not flagged)       # MemoryOps honours the flag
-    if not flagged:
-        assert obs["knowledge_search_returns_it"] is True       # control: both return it unflagged
+    assert obs["knowledge_search_returns_it"] is (not flagged)  # and so does knowledge search (was a gap in #54)
 
 
-@pytest.mark.xfail(strict=True, reason="PR #54 gap: knowledge search ignores erasure_quarantined")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("global_quarantine", [False, True])
 async def test_d1_requirement_knowledge_search_honours_erasure_quarantined(world, global_quarantine):
@@ -174,9 +172,10 @@ async def test_d3_l3_revision_between_l2_read_and_profile_save(world, delete_bet
     print("OBSERVED_D3 " + json.dumps(obs, sort_keys=True))
     if not delete_between:
         assert obs["profiles_persisted"] == 1 and obs["readable_through_get_l3_fractal_context"] is True
+    else:   # the erasure in the knowledge group after the L2 read stops the stale synthesis
+        assert obs["build_result"] == "raised ErasureFenceChanged" and obs["profiles_persisted"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="PR #54 gap: L3 does not carry the L2 read revision to the profile save")
 @pytest.mark.asyncio
 async def test_d3_requirement_profile_from_a_deleted_source_is_not_saved(world):
     from layers.l3_fractal import build_l3_profile

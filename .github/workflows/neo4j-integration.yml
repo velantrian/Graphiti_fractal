@@ -69,4 +69,14 @@ jobs:
             --target tests/integration/test_pr54_scenario_b.py \
             --target tests/integration/test_pr54_scenario_c.py \
             --target tests/integration/test_pr54_scenario_d.py \
-            --target tests/integration/test_pr54_quarantine_prototype.py
+            --target tests/integration/test_pr54_quarantine_prototype.py \
+            --target tests/integration/test_variant_b_vertical.py \
+            --target tests/integration/test_variant_b_dry_run.py \
+            --target tests/integration/test_variant_b_evidence.py \
+            --target tests/integration/test_variant_b_rebuild_cases.py \
+            --target tests/integration/test_ingest_claim_lifecycle.py \
+            --target tests/integration/test_erasure_idempotency.py \
+            --target tests/integration/test_atomic_event_close.py \
+            --target tests/integration/test_ambiguous_late_write.py \
+            --target tests/integration/test_manual_settlement.py \
+            --target tests/integration/test_chat_answer_gate.py
