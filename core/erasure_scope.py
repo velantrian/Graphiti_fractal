@@ -444,19 +444,34 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
         await _commit(graphiti, rev0, prefix, "edge", cleared_edges)
         await _commit(graphiti, rev0, prefix, "Entity", clear_ents)
 
-        left = await _rows(graphiti, f"""
-            OPTIONAL MATCH (n:Entity|Community) WHERE {marked('n')}
-            WITH collect(DISTINCT n.group_id) AS g1
-            OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE {marked('r')}
-            WITH g1, collect(DISTINCT r.group_id) AS g2
-            RETURN g1 + g2 AS groups""", p=prefix)
-        groups = sorted({g for g in left[0]["groups"] if g})
-        await graphiti.driver.execute_query(
-            "MATCH (t:FractalErasure {event_id:$e}) SET t.blocked_groups=$g, "
-            "t.status=CASE WHEN size($g)=0 THEN 'RESOLVED' ELSE 'SCOPED' END, "
-            "t.resolved_at=CASE WHEN size($g)=0 THEN datetime() ELSE null END, t.owner_decision_needed=$d",
-            e=ev, g=groups, d=derived[0]["n"])
+        await _checkpoint("before_close")      # a late write may be registered right here
+        await _close_event(graphiti, ev, prefix, derived[0]["n"])
     return summary
+
+
+async def _close_event(graphiti, event_id: str, prefix: str, owner_decisions: int) -> str:
+    """Decide RESOLVED vs SCOPED in ONE statement, under the same lock mark_late_write uses.
+
+    Counting the remaining marks and writing the status must not be separate steps: a late write
+    registered between them would be marked (and its group paused) only to be declared RESOLVED
+    right after, from a count that no longer holds. Here the count and the decision are one
+    serialized unit; a late write that comes after finds a RESOLVED event and reopens it."""
+    marked = "any(m IN coalesce({x}.erasure_quarantine,[]) WHERE m STARTS WITH $p)"
+    rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + f"""
+        MATCH (t:FractalErasure {{event_id:$e}})
+        OPTIONAL MATCH (n:Entity|Community) WHERE {marked.format(x='n')}
+        WITH t, collect(DISTINCT n.group_id) AS g1
+        OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE {marked.format(x='r')}
+        WITH t, g1, collect(DISTINCT r.group_id) AS g2
+        WITH t, [g IN g1 + g2 WHERE g IS NOT NULL] AS gs
+        UNWIND CASE WHEN size(gs)=0 THEN [null] ELSE gs END AS g
+        WITH t, collect(DISTINCT g) AS groups
+        SET t.blocked_groups = groups,
+            t.status = CASE WHEN size(groups)=0 THEN 'RESOLVED' ELSE 'SCOPED' END,
+            t.resolved_at = CASE WHEN size(groups)=0 THEN datetime() ELSE null END,
+            t.owner_decision_needed = $d
+        RETURN t.status AS status""", e=event_id, p=prefix, d=owner_decisions)
+    return rows[0]["status"]
 
 
 async def _purge(graphiti, rev: int, label: str, ids: list[str]) -> None:
@@ -490,32 +505,45 @@ async def _commit(graphiti, rev: int, prefix: str, label: str, items: list[dict]
         raise ErasureFenceChanged("erasure revision changed during rebuild; nothing was reopened")
 
 
-async def mark_late_write(graphiti, group_id: str, since_revision: int, episode_uuids: list[str]) -> dict:
-    """Contain objects of a write that was already in flight when an erasure happened in its group.
+async def mark_late_write(graphiti, group_id: str | None, since_revision: int, episode_uuids: list[str],
+                          *, any_group: bool = False) -> dict:
+    """Contain objects of a write that was already in flight when an erasure happened.
 
     add_episode reads its context, calls the model and writes its derived objects in one long
     call; an erasure that lands meanwhile cannot have scoped objects that did not exist yet.
-    Every entity/edge derived from the given episodes is marked as exposed to each erasure of the
-    group newer than ``since_revision`` (its tombstone is reopened, so the group is paused), and
-    the episodes themselves are isolated until reconciliation.
+    Every entity/edge derived from the given episodes is marked as exposed to each erasure newer
+    than ``since_revision`` (of this group, or of any group with ``any_group`` - the chat path is
+    fenced globally), the episodes themselves are isolated until reconciliation, and each of those
+    events is reopened (a RESOLVED one included) and its group paused.
+
+    ONE statement under the erasure control lock: registration is serialized against
+    _close_event(), so the event is never closed on a count that predates this write.
     """
     if not episode_uuids:
-        return {"marked": 0}
-    tombs = await _rows(graphiti, "MATCH (t:FractalErasure {group_id:$g}) WHERE t.revision > $r "
-                                  "RETURN t.event_id AS e, t.status AS s", g=group_id, r=since_revision)
-    if not tombs:
-        return {"marked": 0}
-    ents = [r["u"] for r in await _rows(graphiti, "MATCH (e:Episodic)-[:MENTIONS]->(n:Entity) WHERE e.uuid IN $u "
-                                                  "RETURN DISTINCT n.uuid AS u", u=episode_uuids)]
-    edges = [r["u"] for r in await _rows(graphiti, "MATCH ()-[r:RELATES_TO {group_id:$g}]->() "
-                                                   "WHERE any(x IN coalesce(r.episodes,[]) WHERE x IN $u) "
-                                                   "RETURN DISTINCT r.uuid AS u", g=group_id, u=episode_uuids)]
-    await graphiti.driver.execute_query(
-        "MATCH (e:Episodic) WHERE e.uuid IN $u SET e.erasure_quarantined = true", u=episode_uuids)
-    for t in tombs:
-        await _mark(graphiti, t["e"], "Entity", {u: "exposed" for u in ents})
-        await _mark(graphiti, t["e"], "edge", {u: "exposed" for u in edges})
-        await graphiti.driver.execute_query(
-            "MATCH (t:FractalErasure {event_id:$e}) SET t.blocked_groups=[$g], "
-            "t.status=CASE WHEN t.status = 'PENDING_SCOPE' THEN 'PENDING_SCOPE' ELSE 'SCOPED' END", e=t["e"], g=group_id)
-    return {"marked": len(ents) + len(edges), "events": [t["e"] for t in tombs]}
+        return {"marked": 0, "events": []}
+    rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
+        MATCH (t:FractalErasure) WHERE t.revision > $r AND ($any OR t.group_id = $g)
+        WITH gate, collect(t) AS tombs WHERE size(tombs) > 0
+        OPTIONAL MATCH (e:Episodic) WHERE e.uuid IN $u
+        WITH gate, tombs, collect(DISTINCT e) AS eps
+        OPTIONAL MATCH (e2:Episodic)-[:MENTIONS]->(n:Entity) WHERE e2.uuid IN $u
+        WITH gate, tombs, eps, collect(DISTINCT n) AS ents
+        OPTIONAL MATCH ()-[r:RELATES_TO]->()
+          WHERE r.group_id = coalesce($g, r.group_id) AND any(x IN coalesce(r.episodes,[]) WHERE x IN $u)
+        WITH gate, tombs, eps, ents, collect(DISTINCT r) AS rels
+        FOREACH (e IN eps | SET e.erasure_quarantined = true)
+        FOREACH (t IN tombs |
+          FOREACH (n IN ents | SET n.erasure_quarantine =
+            [m IN coalesce(n.erasure_quarantine,[]) WHERE NOT m STARTS WITH t.event_id + ':'] + [t.event_id + ':exposed'])
+          FOREACH (r IN rels | SET r.erasure_quarantine =
+            [m IN coalesce(r.erasure_quarantine,[]) WHERE NOT m STARTS WITH t.event_id + ':'] + [t.event_id + ':exposed'])
+          SET t.blocked_groups = [x IN coalesce(t.blocked_groups,[]) WHERE x <> coalesce($g, '')]
+                                 + CASE WHEN $g IS NULL THEN [] ELSE [$g] END,
+              t.status = CASE WHEN t.status = 'PENDING_SCOPE' THEN 'PENDING_SCOPE' ELSE 'SCOPED' END,
+              t.resolved_at = null,
+              t.late_writes = coalesce(t.late_writes,0) + 1)
+        RETURN size(ents) + size(rels) AS marked, [t IN tombs | t.event_id] AS events""",
+        r=since_revision, g=group_id, any=any_group, u=episode_uuids)
+    if not rows:
+        return {"marked": 0, "events": []}
+    return {"marked": rows[0]["marked"], "events": rows[0]["events"]}
