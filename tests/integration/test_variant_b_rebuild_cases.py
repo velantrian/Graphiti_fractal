@@ -61,8 +61,9 @@ async def test_r1_a_fact_confirmed_only_by_the_second_live_source_reopens_the_ed
     a = await env.uuid_of(MARK_A)
     s1, s2 = await env.uuid_of("Dock Master"), await env.uuid_of("Harbor Office")
     # A merged edge as Graphiti keeps it: first source S1, then S2; its text blends the erased text in.
+    stored = "Mira Venn asks about the opening hours of the Harbor Office."     # exactly what S2 states
     await env.q("MATCH (:Entity {name:'Mira Venn'})-[r:RELATES_TO]->(:Entity {name:'Harbor Office'}) "
-                "SET r.episodes=[$s1,$s2], r.fact='Mira Venn keeps ZORBLAX-ALPHA near the Harbor Office'", s1=s1, s2=s2)
+                "SET r.episodes=[$s1,$s2], r.fact=$f", s1=s1, s2=s2, f=stored)
     await erase_node(env.graphiti, uuid=a, hard=True)
     assert (await edge_rows(env, "t.name='Harbor Office'"))[0]["marks"] == 1
 
@@ -72,7 +73,7 @@ async def test_r1_a_fact_confirmed_only_by_the_second_live_source_reopens_the_ed
                                        "evidence": edge[0]["ev"] if edge else None, "summary": summary}, default=str))
     assert len(edge) == 1, "the edge supported by the second source was deleted"
     assert edge[0]["marks"] == 0 and edge[0]["episodes"] == [s1, s2]
-    assert "ZORBLAX" not in edge[0]["fact"] and "opening hours" in edge[0]["fact"]
+    assert edge[0]["fact"] == stored                                              # same text, same UUID
     assert any(":re_extracted:" in e and ":src2:" in e and f":via{s2[:8]}" in e for e in edge[0]["ev"])    # both live sources were consulted
 
 
@@ -107,9 +108,9 @@ async def entity_uuid(env, name):
 async def test_r2_different_and_opposite_relations_keep_direction_and_meaning(env, isolated_graph):
     await isolated_graph.reset()
     await relation_world(env, [
-        ("e-visits", "Mira Venn", "Harbor Office", "VISITS", "STALE visits ZORBLAX"),
-        ("e-owns", "Mira Venn", "Harbor Office", "OWNS", "STALE owns ZORBLAX"),
-        ("e-employs", "Harbor Office", "Mira Venn", "EMPLOYS", "STALE employs ZORBLAX")])
+        ("e-visits", "Mira Venn", "Harbor Office", "VISITS", "Mira Venn visits the Harbor Office weekly."),
+        ("e-owns", "Mira Venn", "Harbor Office", "OWNS", "Mira Venn owns the Harbor Office."),
+        ("e-employs", "Harbor Office", "Mira Venn", "EMPLOYS", "The Harbor Office employs Mira Venn.")])
     m, h = await entity_uuid(env, "Mira Venn"), await entity_uuid(env, "Harbor Office")
     summary = await erasure_scope.rebuild_area(env.graphiti, extractor=scripted([
         (h, m, "EMPLOYS", "The Harbor Office employs Mira Venn."),          # listed first on purpose
@@ -141,7 +142,7 @@ async def test_r2_unclear_matches_stay_restricted_for_reconciliation(env, isolat
     assert rows and all(r["marks"] == 1 for r in rows)                                   # still restricted
     assert all("ZORBLAX" in r["fact"] and r["ev"] is None for r in rows)                  # nothing was rewritten
     assert summary["re_extracted_edges"] == 0 and summary["purged_unsupported_edges"] == 0
-    assert (summary["held_ambiguous_edges"] if case == "ambiguous_same_relation" else summary["held_unmatched_edges"]) == len(rows)
+    assert (summary["held_reworded_edges"] if case == "ambiguous_same_relation" else summary["held_unmatched_edges"]) == len(rows)
     visible = await env.q("MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) WHERE r.uuid STARTS WITH 'e-' AND "
                           + visible_edge("r", "s", "t") + " RETURN count(r) AS c")
     assert visible[0]["c"] == 0 and (await env.add("[[Mira Venn]] asks [[Budget Sheet]] NEWQ9.", K))["completeness"] == "failed"
@@ -226,10 +227,71 @@ async def test_r4_changed_date_or_number_keeps_the_old_edge_restricted_and_exact
                                        "two": {k: rows["e-two"][k] for k in ("fact", "marks", "ev")}, "summary": summary}))
     # the old UUID keeps its old meaning and stays restricted for reconciliation
     assert rows["e-old"]["fact"] == old_text and rows["e-old"]["marks"] == 1 and rows["e-old"]["ev"] is None
-    assert summary["held_meaning_changed_edges"] == 1
+    assert summary["held_reworded_edges"] == 1
     # the exact confirmation of the second source is taken into account
     assert rows["e-two"]["fact"] == stored_two and rows["e-two"]["marks"] == 0
     assert any(f":via{s2[:8]}" in e and ":src2:" in e for e in rows["e-two"]["ev"])
     assert "7 May" not in rows["e-two"]["fact"]
     tomb = await env.q("MATCH (t:FractalErasure {target_uuid:$u}) RETURN t.status AS s", u=a)
     assert tomb[0]["s"] == "SCOPED"                                               # the group stays paused for the held edge
+
+
+# --- R5: only an exact statement reopens an edge under its old UUID --------------------------------
+async def two_source_world(env, stored, name="STATES"):
+    """A (erased), then S1 and S2 mentioning Mira and the Harbor Office; one hand-made edge between them."""
+    await env.add("[[Mira Venn]] keeps the vault passphrase ZORBLAX-ALPHA.")
+    await env.add("[[Mira Venn]] and the [[Harbor Office]] met in the morning.")
+    await env.add("[[Mira Venn]] and the [[Harbor Office]] met again in the evening.")
+    a, s1, s2 = await env.uuid_of(MARK_A), await env.uuid_of("in the morning"), await env.uuid_of("in the evening")
+    await env.q("MATCH (:Entity {name:'Mira Venn'})-[r:RELATES_TO]->(:Entity {name:'Harbor Office'}) DELETE r")
+    await env.q("MATCH (a:Entity {name:'Mira Venn'}), (b:Entity {name:'Harbor Office'}) CREATE (a)-[:RELATES_TO {uuid:'e-r5', "
+                "group_id:'knowledge', name:$n, fact:$f, episodes:[$s1,$s2], created_at:$ts, fact_embedding:[0.1,0.1]}]->(b)",
+                n=name, f=stored, s1=s1, s2=s2, ts=TS)
+    await erase_node(env.graphiti, uuid=a, hard=True)
+    return a, s1, s2, await entity_uuid(env, "Mira Venn"), await entity_uuid(env, "Harbor Office")
+
+
+def per_source(s1, s2, m, h, name, first, second):
+    by = {s1: [(m, h, name, f) for f in first], s2: [(m, h, name, f) for f in second]}
+
+    async def extract(ep):
+        return [{"source": x, "target": y, "name": n, "fact": f, "input_sha256": "scripted"} for x, y, n, f in by[ep]]
+    return extract
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored, stated", [
+    ("Mira Venn is not employed by the Harbor Office.", "Mira Venn is employed by the Harbor Office."),   # negation
+    ("Mira Venn is employed by the Harbor Office.", "Mira Venn is not employed by the Harbor Office."),   # negation, reversed
+    ("The balance changed by -5 units.", "The balance changed by 5 units."),                                # -5 against 5
+    ("The balance changed by −5 units.", "The balance changed by 5 units."),                          # minus sign U+2212
+    ("The balance changed by -5 units.", "The balance changed by −5 units."),                         # two different minus signs
+    ("Mira Venn owns the Harbor Office.", "Mira Venn owns the harbor office."),                            # case
+    ("Mira Venn owns the Harbor Office.", "Mira Venn owns the Harbor Office"),                             # punctuation
+    ("Mira Venn owns the Harbor Office.", "Mira Venn owns the Harbor Office!")])
+async def test_r5_a_reworded_statement_never_reopens_the_old_edge(env, isolated_graph, stored, stated):
+    await isolated_graph.reset()
+    a, s1, s2, m, h = await two_source_world(env, stored)
+    # both live sources state something similar, none states the stored text exactly
+    summary = await erasure_scope.rebuild_area(env.graphiti, extractor=per_source(s1, s2, m, h, "STATES", [stated], [stated]))
+    edge = (await edge_rows(env, "r.uuid = 'e-r5'"))[0]
+    assert edge["fact"] == stored and edge["marks"] == 1 and edge["ev"] is None       # untouched, restricted
+    assert summary["held_reworded_edges"] == 1 and summary["re_extracted_edges"] == 0
+    assert (await env.q("MATCH (t:FractalErasure {target_uuid:$u}) RETURN t.status AS s", u=a))[0]["s"] == "SCOPED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored, first_says", [
+    ("Mira Venn is employed by the Harbor Office.", "Mira Venn is not employed by the Harbor Office."),
+    ("The balance changed by 5 units.", "The balance changed by -5 units."),
+    ("The balance changed by −5 units.", "The balance changed by 5 units.")])
+async def test_r5_an_exact_statement_from_the_second_source_reopens_it_whatever_the_first_says(
+        env, isolated_graph, stored, first_says):
+    await isolated_graph.reset()
+    a, s1, s2, m, h = await two_source_world(env, stored)
+    # the first source says a similar but different (even opposite) thing, the second says it exactly
+    summary = await erasure_scope.rebuild_area(env.graphiti, extractor=per_source(s1, s2, m, h, "STATES", [first_says], [stored]))
+    edge = (await edge_rows(env, "r.uuid = 'e-r5'"))[0]
+    assert edge["fact"] == stored and edge["marks"] == 0                              # same text, same UUID, reopened
+    assert any(":re_extracted:" in e and ":src2:" in e and f":via{s2[:8]}" in e for e in edge["ev"])
+    assert summary["re_extracted_edges"] == 1 and summary["held_reworded_edges"] == 0

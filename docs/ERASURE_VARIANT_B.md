@@ -41,16 +41,16 @@ Other groups are never paused.
 
 **B. Show a specific rebuilt object again.** Per object, tombstone kept. A mark is removed only with a
 recorded `erasure_evidence` entry `<event>:<kind>:rev<N>:...` of one of two kinds:
-* `re_extracted`: the edge's fact was extracted again from its **live source episodes** by the extractor
-  (`graphiti_edge_extractor`: Graphiti's own `extract_edges`, one episode, no previous episodes; the
-  entry carries the input hash and how many live sources were consulted). **Every** live source is
-  consulted before the edge's fate is decided, pooled: an exact confirmation from any source counts,
-  whatever similar-but-different fact another source states. A fact is matched only with the same
-  direction and relation name, and a one-edge/one-fact match only if both state the same numbers and
-  dates: another date or number would give the old UUID a different meaning, so that edge stays
-  restricted. An edge with no live source at all is deleted. If sources exist
-  but the match is ambiguous, only in the reverse direction, or the extraction skipped the fact, the edge
-  is **kept restricted for reconciliation** (a skipped fact cannot be told from an unsupported one).
+* `re_extracted`: **at least one live source states the stored statement exactly**: same direction, same
+  relation name, identical text. The comparison is byte for byte: case, punctuation, signs (`-5`, the
+  U+2212 minus and `5` are three different statements), negation and whitespace all count; nothing is
+  normalized or scored. The extractor is `graphiti_edge_extractor` (Graphiti's own `extract_edges`, one
+  episode, no previous episodes); the entry records the input hash, how many live sources were consulted
+  and which one confirmed. Every live source is consulted, and an exact confirmation from any of them
+  counts whatever a different source says. The edge's text is **never rewritten**. A reworded, opposite or
+  merely similar statement, an ambiguous one, a fact only in the reverse direction, or a fact the
+  extraction skipped leaves the edge **restricted for reconciliation** (a skipped fact cannot be told from an
+  unsupported one; there is no number/date heuristic). An edge with no live source at all is deleted.
 * `rebuilt_from_clean_edges`: an entity summary recomputed from the facts of its incident edges, allowed
   only once every incident edge is clean or re-derived. An entity no live source mentions is deleted.
 

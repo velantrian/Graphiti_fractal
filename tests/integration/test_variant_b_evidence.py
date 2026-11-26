@@ -119,7 +119,7 @@ async def test_paraphrase_that_no_live_source_states_stays_restricted_for_reconc
         assert len(set(re.findall(r"QUIBBLE\d|NEWQ\d", call.text))) <= 1   # one live episode per call, no window
     print("OBSERVED_E " + str({"mode": mode, **summary}))
     assert summary["re_extracted_edges"] >= 3                            # the clean edges are reopened with evidence
-    assert summary["held_unmatched_edges"] >= 1 and summary["purged_unsupported_edges"] == 0
+    assert summary["held_unmatched_edges"] + summary["held_reworded_edges"] >= 1 and summary["purged_unsupported_edges"] == 0
     assert await edges_with(env, "strongbox") == 1                       # kept for reconciliation, not deleted
     assert await visible_edges_with(env, "strongbox") == 0               # but never served
     evidence = await env.q("MATCH ()-[r:RELATES_TO]->() WHERE r.erasure_evidence IS NOT NULL "

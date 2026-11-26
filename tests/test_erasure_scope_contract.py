@@ -57,11 +57,23 @@ def test_rebuild_never_widens_a_named_event_and_never_decides_from_one_source():
     assert 'c["source"] == r["s"] and c["target"] == r["t"]' in source        # direction is part of the match
 
 
-def test_a_changed_number_or_date_is_never_taken_as_the_same_edge():
-    from core.erasure_scope import _quantities
-    assert _quantities("meets the courier on 5 May") != _quantities("meets the courier on 7 May")
-    assert _quantities("owns 3 offices") != _quantities("owns 5 offices")
-    assert _quantities("встреча 5 мая") != _quantities("встреча 7 мая")
-    assert _quantities("Mira knows the office") == _quantities("The office is known to Mira")
+def test_only_an_exact_statement_confirms_the_stored_one():
+    from core.erasure_scope import confirms
+    ok = "Mira Venn is employed by the Harbor Office."
+    assert confirms(ok, ok)
+    assert not confirms(ok, "Mira Venn is not employed by the Harbor Office.")           # negation, both ways
+    assert not confirms("Mira Venn is not employed by the Harbor Office.", ok)
+    assert not confirms("The balance changed by -5 units.", "The balance changed by 5 units.")   # sign
+    assert not confirms("The balance changed by \u22125 units.", "The balance changed by 5 units.")
+    assert not confirms("The balance changed by -5 units.", "The balance changed by \u22125 units.")  # two minus signs
+    assert not confirms("Mira Venn owns the Harbor Office.", "Mira Venn owns the harbor office.")      # case
+    assert not confirms("Mira Venn owns the Harbor Office.", "Mira Venn owns the Harbor Office")       # punctuation
+    assert not confirms("Mira Venn owns the Harbor Office.", " Mira Venn owns the Harbor Office.")     # whitespace
+    assert not confirms(None, ok) and not confirms(ok, None)
+
+
+def test_no_normalization_or_quantity_heuristic_decides_an_edge():
     source = (ROOT / "core/erasure_scope.py").read_text(encoding="utf-8")
-    assert "held_meaning_changed_edges" in source and "pool.setdefault" in source   # all sources pooled
+    assert "_norm" not in source and "_quantities" not in source and "_MONTHS" not in source
+    assert "held_reworded_edges" in source and "confirms(r[\"fact\"]" in source
+    assert '"fact": r["fact"]' in source                      # the stored text is kept, never rewritten

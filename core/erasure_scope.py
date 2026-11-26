@@ -23,7 +23,6 @@ content carries none of its tokens.
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass, field
 
 from core.erasure_guard import (
@@ -246,20 +245,15 @@ async def _live_hashes(graphiti, group_id: str) -> set[str]:
     return out
 
 
-def _norm(text: str) -> str:
-    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+def confirms(stored: str | None, stated: str | None) -> bool:
+    """A live source confirms the stored statement only if it states it *exactly*.
 
-
-_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-           "янв", "фев", "мар", "апр", "мая", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
-
-
-def _quantities(text: str) -> list[str]:
-    """Numbers, dates and month names a fact states. A different value is a different claim."""
-    lowered = (text or "").lower()
-    found = re.findall(r"\d+(?:[.,:/-]\d+)*", lowered)
-    found += [m for m in _MONTHS if re.search(rf"\b{m}", lowered)]
-    return sorted(found)
+    Byte-for-byte: case, punctuation, signs (``-5``, the U+2212 minus and ``5`` are three different
+    statements), negation and every other wording difference all count. Nothing is normalized or
+    scored: a reworded or opposite statement is a different claim under an old UUID and is left to
+    reconciliation.
+    """
+    return stored is not None and stated is not None and stored == stated
 
 
 def _sha(text: str) -> str:
@@ -294,16 +288,14 @@ def graphiti_edge_extractor(graphiti):
 async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None) -> dict:
     """Re-derive or delete what open erasures marked; reopen objects only with such evidence.
 
-    * edges (exposed/mixed): all live source episodes are found and ALL are consulted before the edge's
-      fate is decided. No live source -> nothing can support it: deleted. Otherwise the fact must be
-      stated by a source with the same direction and relation name, pooled over ALL live sources (an
-      exact confirmation from any source counts, whatever similar-but-different fact another source
-      states). The match must be unambiguous: own text equal to one clean fact, or one edge and one
-      fact that states the same numbers and dates (a different date or number gives the old UUID a
-      different meaning: held). An ambiguous match, a fact only in the reverse direction, or a fact the
-      extraction skipped leaves the edge restricted for reconciliation (it is NOT deleted: a skipped fact is
-      indistinguishable from an unsupported one). A re-derived fact that still fails the token screen
-      stays hidden. Without an extractor edges stay hidden.
+    * edges (exposed/mixed): all live source episodes are found and ALL are consulted. The edge reopens
+      under its old UUID only if at least one live source states the STORED statement exactly (same
+      direction, same relation name, identical text: case, punctuation, signs and negation included).
+      The text is never rewritten. A reworded, opposite or merely similar statement, an ambiguous
+      one, a fact only in the reverse direction, or a fact the extraction skipped leaves the edge
+      restricted for reconciliation; it is NOT deleted (a skipped fact cannot be told from an
+      unsupported one). Deletion is only for an edge with no live source at all. Without an extractor
+      edges stay hidden.
     * entities (exposed/mixed): no live source mentions them -> deleted; otherwise the summary is
       rebuilt from the facts of its incident edges once every incident edge is clean or re-derived.
     * communities carry erased text that cannot be separated without a model: they stay hidden.
@@ -312,8 +304,7 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
     require an unchanged erasure revision (ErasureFenceChanged otherwise; nothing is reopened).
     """
     summary = {"re_extracted_edges": 0, "purged_unsupported_edges": 0, "purged_unsupported_entities": 0,
-               "rebuilt_entities": 0, "held_edges": 0, "held_unmatched_edges": 0, "held_ambiguous_edges": 0,
-               "held_meaning_changed_edges": 0,
+               "rebuilt_entities": 0, "held_edges": 0, "held_unmatched_edges": 0, "held_reworded_edges": 0,
                "held_entities": 0, "held_communities": 0, "held_for_missing_extractor": 0,
                "owner_decision_needed": 0}
     all_open = await _rows(graphiti, f"MATCH (t:FractalErasure) WHERE t.status IN {OPEN_STATUSES} "
@@ -387,48 +378,22 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
                     if c["source"] == r["s"] and c["target"] == r["t"]
                     and (r["name"] is None or c.get("name") in (None, r["name"]))]
 
-        groups: dict[tuple, list[dict]] = {}
         for r, live in pending:
-            if not any(candidates(ep, r) for ep in live):   # no source states it (or extraction skipped it)
+            stated = [(ep, c) for ep in live for c in candidates(ep, r)]   # ALL live sources, same direction and name
+            if not stated:                                # no source states anything for this edge
                 held_edge_ids.add(r["uuid"]); summary["held_unmatched_edges"] += 1
                 continue
-            groups.setdefault((r["s"], r["t"], r["name"], tuple(live)), []).append(r)
-        for (s_uuid, t_uuid, rname, live_t), members in groups.items():
-            # One pool from ALL live sources, so an exact confirmation from any source is seen
-            # whatever the order and whatever similar-but-different fact an earlier source states.
-            pool: dict[str, tuple[dict, str]] = {}
-            for ep in live_t:
-                for c in candidates(ep, members[0]):
-                    pool.setdefault(_norm(c["fact"]), (c, ep))
-            clean = {_norm(x["fact"]) for x in await _rows(graphiti, """
-                MATCH (:Entity {uuid:$s})-[r:RELATES_TO]->(:Entity {uuid:$t})
-                WHERE any(x IN coalesce(r.episodes,[]) WHERE x IN $eps)
-                  AND size(coalesce(r.erasure_quarantine,[])) = 0 AND ($n IS NULL OR r.name = $n)
-                RETURN r.fact AS fact""", s=s_uuid, t=t_uuid, eps=list(live_t), n=rname)}
-            free = [v for k, v in pool.items() if k not in clean]       # (candidate, source)
-            remaining, pairs = list(members), []
-            for r in list(remaining):                    # the edge's own text equals a fact some source states
-                hit = next((v for v in free if _norm(v[0]["fact"]) == _norm(r["fact"])), None)
-                if hit is not None:
-                    pairs.append((r, hit)); remaining.remove(r); free.remove(hit)
-            if len(remaining) == 1 and len(free) == 1:   # one edge, one fact: unambiguous only if it means the same
-                r, hit = remaining[0], free[0]
-                if _quantities(r["fact"]) != _quantities(hit[0]["fact"]):
-                    held_edge_ids.add(r["uuid"]); summary["held_meaning_changed_edges"] += 1
-                else:
-                    pairs.append((r, hit))
-                remaining = []
-            for r in remaining:
-                held_edge_ids.add(r["uuid"])
-                # no fact left for it: nothing states it (or extraction skipped it); otherwise the choice is unclear
-                summary["held_unmatched_edges" if not free else "held_ambiguous_edges"] += 1
-            for r, (item, source) in pairs:
-                if await dirty(item["fact"], r["g"]):
-                    held_edge_ids.add(r["uuid"])         # even the clean derivation carries erased tokens
-                    continue
-                cleared_edges.append({"uuid": r["uuid"], "fact": item["fact"], "evidence":
-                                      f"{ev}:re_extracted:rev{rev0}:in{item['input_sha256']}:out{_sha(item['fact'])}"
-                                      f":src{len(live_t)}:via{source[:8]}"})
+            hit = next(((ep, c) for ep, c in stated if confirms(r["fact"], c["fact"])), None)
+            if hit is None:                               # similar, reworded or opposite is not confirmation
+                held_edge_ids.add(r["uuid"]); summary["held_reworded_edges"] += 1
+                continue
+            ep, item = hit
+            if await dirty(item["fact"], r["g"]):
+                held_edge_ids.add(r["uuid"])              # post-check only: the confirmed text carries erased tokens
+                continue
+            cleared_edges.append({"uuid": r["uuid"], "fact": r["fact"], "evidence":
+                                  f"{ev}:re_extracted:rev{rev0}:in{item['input_sha256']}:out{_sha(item['fact'])}"
+                                  f":src{len(live)}:via{ep[:8]}"})
         summary["held_edges"] += len(held_edge_ids)
         fact_of = {c["uuid"]: c["fact"] for c in cleared_edges}
         gone_edges = set(purge_edges)
