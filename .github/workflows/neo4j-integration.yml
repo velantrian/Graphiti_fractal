@@ -69,4 +69,5 @@ jobs:
             --target tests/integration/test_pr54_scenario_b.py \
             --target tests/integration/test_pr54_scenario_c.py \
             --target tests/integration/test_pr54_scenario_d.py \
-            --target tests/integration/test_pr54_quarantine_prototype.py
+            --target tests/integration/test_pr54_quarantine_prototype.py \
+            --target tests/integration/test_ingest_claim_lifecycle.py

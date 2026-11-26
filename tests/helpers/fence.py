@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 def mock_ingest_revision(monkeypatch):
     monkeypatch.setattr("knowledge.ingest.read_erasure_state", AsyncMock(return_value=(0, False)))
     monkeypatch.setattr("knowledge.ingest.require_erasure_revision", AsyncMock())
+    monkeypatch.setattr("knowledge.ingest.require_group_writable", AsyncMock())
+    monkeypatch.setattr("knowledge.ingest.live_previous_episode_uuids", AsyncMock(return_value=None))
 
 
 

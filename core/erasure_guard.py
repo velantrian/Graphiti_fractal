@@ -142,13 +142,24 @@ async def last_erasure_at(graphiti):
     return datetime.fromisoformat(value) if value else None
 
 
-async def require_erasure_revision(graphiti, expected: int) -> None:
-    """Fresh, fail-closed check before provider work or exposing an operation result."""
+async def require_erasure_revision(graphiti, expected: int, group_id: str | None = None) -> None:
+    """Fresh, fail-closed check before provider work or exposing an operation result.
+
+    With ``group_id`` only erasures in that group invalidate the operation (document ingest
+    reads only that group); without it any erasure does (chat reads every group).
+    """
     if type(expected) is not int or expected < 0:
         raise ValueError("invalid expected erasure revision")
-    revision, _ = await read_erasure_state(graphiti)
-    if revision != expected:
-        raise ErasureFenceChanged("erasure revision changed; start a new authorized operation")
+    if group_id is None:
+        revision, _ = await read_erasure_state(graphiti)
+        if revision != expected:
+            raise ErasureFenceChanged("erasure revision changed; start a new authorized operation")
+        return
+    result = await graphiti.driver.execute_query(
+        "OPTIONAL MATCH (t:FractalErasure {group_id:$g}) WHERE t.revision > $r RETURN count(t) AS n",
+        g=group_id, r=expected)
+    if int(result.records[0]["n"]) > 0:
+        raise ErasureFenceChanged("an erasure in this group happened meanwhile; start a new authorized operation")
 
 
 async def require_erasure_state(graphiti, expected: tuple[int, bool]) -> None:
@@ -234,7 +245,7 @@ async def erase_node(graphiti, *, uuid: str, hard: bool = False) -> dict:
         SET t.event_id=$event_id, t.group_id=n.group_id, t.mode=$mode, t.status='PENDING_SCOPE',
             t.target_label=head(labels(n)), t.valid_at=toString(n.valid_at),
             t.seed_entities=mentioned, t.seed_edges=edges, t.token_hashes=$hashes,
-            t.blocked_groups=[n.group_id], t.erased_at=$ts
+            t.blocked_groups=[n.group_id], t.erased_at=$ts, t.revision=coalesce(gate.revision,0)+1
         SET gate.revision=coalesce(gate.revision,0)+1
         WITH n,gate
         OPTIONAL MATCH (run:TaskRun)-[]->(n)

@@ -264,8 +264,11 @@ async def test_visualization_export_uses_d3_edge_contract_and_prelimit_node_set(
 
 def test_visualization_queries_filter_deleted_nodes_and_irrelevant_edges_before_limit():
     source = Path("visualization/visualization_export.py").read_text(encoding="utf-8")
-    assert "coalesce(n.deleted, false) = false" in source
-    assert "coalesce(m.deleted, false) = false" in source
+    # Deleted/tombstoned/quarantined state is filtered by the shared object-level predicate
+    # (node endpoints and the edge itself) before LIMIT; it contains the deleted check.
+    assert 'visible_node("n")' in source and 'visible_edge("r", "n", "m")' in source
+    from core.erasure_guard import visible_node
+    assert "coalesce(n.deleted,false) = true" in visible_node("n")
     assert "(n:Entity OR n:Community)" in source
     assert "(m:Entity OR m:Community)" in source
     assert "n.uuid IN $node_uuids" in source

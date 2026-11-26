@@ -15,7 +15,7 @@ def _fake_execute_query(query, **kwargs):
     # claim CREATE, claim finalization) only needs a truthy record.
     if "e.fingerprint = $fp OR e.content = $content" in query:
         return MagicMock(records=[])
-    return MagicMock(records=[{"token": "test-token", "uuid": "test-uuid"}])
+    return MagicMock(records=[{"token": "test-token", "uuid": "test-uuid", "attempts": 1}])
 
 
 class MockGraphiti:
@@ -72,28 +72,24 @@ async def test_retry_wrapper_logic(_disable_retry_wall_clock):
 
 
 @pytest.mark.asyncio
-async def test_ingest_flow_with_retry(_disable_retry_wall_clock):
-    """Test the ingest flow with mocked Graphiti and job-status updates."""
+async def test_rate_limit_from_add_episode_is_not_retried_and_is_unconfirmed(_disable_retry_wall_clock):
+    """Graphiti may have stored the episode before the error surfaced: a second
+    add_episode could duplicate it, so the outcome is unconfirmed, not retried."""
     graphiti = MockGraphiti()
     error_429 = openai.RateLimitError(
         message="Rate limit reached. Please try again in 0.1s.",
         response=MagicMock(),
         body=None,
     )
-    graphiti.add_episode.side_effect = [error_429, error_429, {"uuid": "123", "name": "Success"}]
+    graphiti.add_episode.side_effect = [error_429, {"uuid": "123", "name": "Success"}]
 
     job_id = "test_job_retry"
-    UPLOAD_JOBS[job_id] = {
-        "status": "pending",
-        "stage": "starting",
-        "timing": {},
-    }
+    UPLOAD_JOBS[job_id] = {"status": "pending", "stage": "starting", "timing": {}}
 
-    # ingest_text_document imports update_upload_job locally from api.jobs
-    # (not the api-package re-export), so the patch target must match that.
     with (
         patch("api.jobs.update_upload_job") as mock_update,
         patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),
+        patch("knowledge.ingest.mark_ingest_claim_write_attempt", new=AsyncMock(return_value=1)),
     ):
         def side_effect_update(jid, **kwargs):
             if jid in UPLOAD_JOBS:
@@ -108,16 +104,9 @@ async def test_ingest_flow_with_retry(_disable_retry_wall_clock):
             source_description="retry_test",
         )
 
-        assert result["status"] == "ok"
-        assert result["added"] == 1
-        assert graphiti.add_episode.call_count == 3
-        assert _disable_retry_wall_clock.await_count == 2
-
-        rate_limit_calls = [
-            call
-            for call in mock_update.mock_calls
-            if "stage" in call.kwargs and call.kwargs["stage"] == "rate_limited"
-        ]
-        assert len(rate_limit_calls) == 2
-        assert rate_limit_calls[0].kwargs["attempt"] == 1
-        assert rate_limit_calls[1].kwargs["attempt"] == 2
+    assert result["added"] == 0
+    assert result["completeness"] == "unconfirmed"
+    assert result["unconfirmed_writes"] == 1
+    assert graphiti.add_episode.call_count == 1
+    assert _disable_retry_wall_clock.await_count == 0
+    assert not [c for c in mock_update.mock_calls if c.kwargs.get("stage") == "rate_limited"]
