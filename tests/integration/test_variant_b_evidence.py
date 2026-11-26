@@ -104,7 +104,8 @@ async def test_without_an_extractor_nothing_is_reopened_and_the_group_stays_paus
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["soft", "hard"])
-async def test_paraphrase_is_removed_by_rederivation_and_the_next_write_is_clean(env, isolated_graph, mode):
+async def test_paraphrase_that_no_live_source_states_stays_restricted_for_reconciliation(env, isolated_graph, mode):
+    """The extraction cannot tell an unsupported fact from one it skipped, so it never deletes it."""
     await isolated_graph.reset()
     ids = await contaminated_world(env)
     await delete(env, ids["A"], mode)
@@ -117,23 +118,21 @@ async def test_paraphrase_is_removed_by_rederivation_and_the_next_write_is_clean
         assert MARK_A not in call.text and "strongbox" not in call.text and "ochre" not in call.text
         assert len(set(re.findall(r"QUIBBLE\d|NEWQ\d", call.text))) <= 1   # one live episode per call, no window
     print("OBSERVED_E " + str({"mode": mode, **summary}))
-    assert summary["re_extracted_edges"] >= 3 and summary["purged_unsupported_edges"] >= 1
-    assert await edges_with(env, "strongbox") == 0                       # unsupported by its clean source: deleted
+    assert summary["re_extracted_edges"] >= 3                            # the clean edges are reopened with evidence
+    assert summary["held_unmatched_edges"] >= 1 and summary["purged_unsupported_edges"] == 0
+    assert await edges_with(env, "strongbox") == 1                       # kept for reconciliation, not deleted
+    assert await visible_edges_with(env, "strongbox") == 0               # but never served
     evidence = await env.q("MATCH ()-[r:RELATES_TO]->() WHERE r.erasure_evidence IS NOT NULL "
                            "UNWIND r.erasure_evidence AS e RETURN DISTINCT e AS e")
     assert evidence and all(":re_extracted:" in e["e"] for e in evidence)
     assert not any(":content_screen:" in e["e"] for e in evidence)
-    assert (await tombstone(env, ids["A"]))["status"] == "RESOLVED"
-
+    assert (await tombstone(env, ids["A"]))["status"] == "SCOPED"        # the group stays paused until reconciled
     mark = env.llm.mark()
-    done = await env.add("[[Mira Venn]] asks about the [[Budget Sheet]] NEWQ2 today.", K)
-    model_input = env.llm.input_since(mark)
-    assert done["completeness"] == "complete"
-    assert MARK_A not in model_input and "strongbox" not in model_input and "ochre" not in model_input
-    assert "QUIBBLE3" in model_input                                     # valid context is still used
+    paused = await env.add("[[Mira Venn]] asks about the [[Budget Sheet]] NEWQ2 today.", K)
+    assert paused["completeness"] == "failed" and "GroupWriteRestricted" in " ".join(paused["warnings"])
+    assert env.llm.input_since(mark) == ""                               # nothing reached the model
     delivered = await env.delivered(K)
-    assert MARK_A not in delivered["all"] and await edges_with(env, "strongbox") == 0
-    assert (await every_holder_is_hidden(env, MARK_A))[0]
+    assert MARK_A not in delivered["all"] and "strongbox" not in str(delivered)
 
 
 @pytest.mark.asyncio

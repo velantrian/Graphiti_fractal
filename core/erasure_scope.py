@@ -23,6 +23,7 @@ content carries none of its tokens.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 
 from core.erasure_guard import (
@@ -245,6 +246,10 @@ async def _live_hashes(graphiti, group_id: str) -> set[str]:
     return out
 
 
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()[:16]
 
@@ -254,7 +259,8 @@ def graphiti_edge_extractor(graphiti):
 
     The input is exactly the episode text plus the names of the entities it mentions, with no
     previous episodes, so it cannot contain text of an erased episode. Returns
-    ``[{"source": uuid, "target": uuid, "fact": str, "input_sha256": str}]``.
+    ``[{"source": uuid, "target": uuid, "name": relation type, "fact": str, "input_sha256": str}]``.
+    Direction (source -> target) and relation name are part of what a fact states and are matched on.
     """
     from graphiti_core.nodes import EntityNode, EpisodicNode
     from graphiti_core.utils.maintenance.edge_operations import extract_edges
@@ -266,7 +272,8 @@ def graphiti_edge_extractor(graphiti):
         nodes = await EntityNode.get_by_uuids(graphiti.driver, mentioned)
         edges = await extract_edges(graphiti.clients, episode, nodes, [], {("Entity", "Entity"): []}, episode.group_id)
         digest = _sha(episode.content + "|" + "|".join(sorted(n.name for n in nodes)))
-        return [{"source": e.source_node_uuid, "target": e.target_node_uuid, "fact": e.fact, "input_sha256": digest}
+        return [{"source": e.source_node_uuid, "target": e.target_node_uuid, "name": e.name, "fact": e.fact,
+                 "input_sha256": digest}
                 for e in edges]
 
     return extract
@@ -275,10 +282,14 @@ def graphiti_edge_extractor(graphiti):
 async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None) -> dict:
     """Re-derive or delete what open erasures marked; reopen objects only with such evidence.
 
-    * edges (exposed/mixed): live source episodes are found; none -> the edge is unsupported and
-      deleted; otherwise ``extractor(episode_uuid)`` re-extracts the fact from the clean source
-      and the edge is reopened with ``re_extracted`` evidence. A re-derived fact that still fails
-      the token screen stays hidden. Without an extractor edges stay hidden.
+    * edges (exposed/mixed): all live source episodes are found and ALL are consulted before the edge's
+      fate is decided. No live source -> nothing can support it: deleted. Otherwise the fact must be
+      stated by a source with the same direction and relation name; the first source that states it
+      decides. The match must be unambiguous (own text equal to one clean fact, or one edge and one
+      fact); an ambiguous match, a fact only in the reverse direction, or a fact the extraction
+      skipped leaves the edge restricted for reconciliation (it is NOT deleted: a skipped fact is
+      indistinguishable from an unsupported one). A re-derived fact that still fails the token screen
+      stays hidden. Without an extractor edges stay hidden.
     * entities (exposed/mixed): no live source mentions them -> deleted; otherwise the summary is
       rebuilt from the facts of its incident edges once every incident edge is clean or re-derived.
     * communities carry erased text that cannot be separated without a model: they stay hidden.
@@ -286,13 +297,28 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
     The group's write pause lasts while any Graphiti-derived object remains marked. All commits
     require an unchanged erasure revision (ErasureFenceChanged otherwise; nothing is reopened).
     """
-    await scope_pending_erasures(graphiti)
+    summary = {"re_extracted_edges": 0, "purged_unsupported_edges": 0, "purged_unsupported_entities": 0,
+               "rebuilt_entities": 0, "held_edges": 0, "held_unmatched_edges": 0, "held_ambiguous_edges": 0,
+               "held_entities": 0, "held_communities": 0, "held_for_missing_extractor": 0,
+               "owner_decision_needed": 0}
+    all_open = await _rows(graphiti, f"MATCH (t:FractalErasure) WHERE t.status IN {OPEN_STATUSES} "
+                                     "RETURN t.event_id AS e, t.group_id AS g, t.token_hashes AS h, t.status AS s")
+    if event_id is not None:
+        # One named event and nothing else: an unknown or closed id returns before any write, and a
+        # valid id never scopes, clears or rewrites another event.
+        target = [o for o in all_open if o["e"] == event_id]
+        if not target:
+            return {**summary, "status": "unknown_or_closed_event", "event_id": event_id}
+        if target[0]["s"] == "PENDING_SCOPE":
+            await scope_erasure(graphiti, event_id)
+        opens = target
+    else:
+        await scope_pending_erasures(graphiti)
+        opens = await _rows(graphiti, f"MATCH (t:FractalErasure) WHERE t.status IN {OPEN_STATUSES} "
+                                      "RETURN t.event_id AS e, t.group_id AS g, t.token_hashes AS h")
     rev0, _ = await read_erasure_state(graphiti)
-    opens = await _rows(graphiti, f"MATCH (t:FractalErasure) WHERE t.status IN {OPEN_STATUSES} "
-                                  "RETURN t.event_id AS e, t.group_id AS g, t.token_hashes AS h")
-    if event_id:
-        opens = [o for o in opens if o["e"] == event_id] or opens
-    erased_hashes: set[str] = {h for o in opens for h in (o["h"] or [])}
+    # screen hashes of every open event are read (never written) so the post-check is as strict as possible
+    erased_hashes: set[str] = {h for o in all_open for h in (o["h"] or [])}
     live_cache: dict[str, set[str]] = {}
 
     async def dirty(text: str, group: str) -> bool:     # post-check only, never the basis
@@ -306,16 +332,13 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
         return [r["u"] for r in await _rows(graphiti, "MATCH (e:Episodic) WHERE e.uuid IN $u AND NOT "
                                             + blocked_node("e") + " RETURN e.uuid AS u", u=episode_ids)]
 
-    summary = {"re_extracted_edges": 0, "purged_unsupported_edges": 0, "purged_unsupported_entities": 0,
-               "rebuilt_entities": 0, "held_edges": 0, "held_entities": 0, "held_communities": 0,
-               "held_for_missing_extractor": 0, "owner_decision_needed": 0}
     for ev in [o["e"] for o in opens]:
         prefix = ev + ":"
         marked = lambda x: f"any(m IN coalesce({x}.erasure_quarantine,[]) WHERE m STARTS WITH $p)"  # noqa: E731
         edges = await _rows(graphiti, f"""
             MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) WHERE {marked('r')}
-            RETURN r.uuid AS uuid, r.group_id AS g, r.fact AS fact, coalesce(r.episodes,[]) AS episodes,
-                   s.uuid AS s, t.uuid AS t""", p=prefix)
+            RETURN r.uuid AS uuid, r.group_id AS g, r.fact AS fact, r.name AS name,
+                   coalesce(r.episodes,[]) AS episodes, s.uuid AS s, t.uuid AS t""", p=prefix)
         ents = await _rows(graphiti, f"""
             MATCH (n:Entity) WHERE {marked('n')}
             RETURN n.uuid AS uuid, n.group_id AS g, n.name AS name""", p=prefix)
@@ -325,32 +348,62 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
         summary["held_communities"] += comms[0]["n"]
 
         extracted_cache: dict[str, list[dict]] = {}
-        used: dict[str, set[int]] = {}
         purge_edges, cleared_edges, held_edge_ids = [], [], set()
+        pending: list[tuple[dict, list[str]]] = []
         for r in edges:
-            live = await live_sources(r["episodes"])
+            live_set = set(await live_sources(r["episodes"]))
+            live = [u for u in r["episodes"] if u in live_set]       # keep the edge's own source order
             if not live:
-                purge_edges.append(r["uuid"])            # no live source supports this edge
+                purge_edges.append(r["uuid"])            # no live source exists that could support it
                 continue
             if extractor is None:
                 held_edge_ids.add(r["uuid"]); summary["held_for_missing_extractor"] += 1
                 continue
-            ep = live[0]
-            if ep not in extracted_cache:
-                extracted_cache[ep] = await extractor(ep)
-            pair = {r["s"], r["t"]}
-            pick = next((i for i, c in enumerate(extracted_cache[ep])
-                         if {c["source"], c["target"]} == pair and i not in used.setdefault(ep, set())), None)
-            if pick is None:
-                purge_edges.append(r["uuid"])            # the clean source does not state this fact
+            pending.append((r, live))
+        # Consult EVERY live source of every edge before any decision about any edge.
+        for _, live in pending:
+            for ep in live:
+                if ep not in extracted_cache:
+                    extracted_cache[ep] = await extractor(ep)
+
+        def candidates(ep: str, r: dict) -> list[dict]:
+            """Facts a source states for exactly this edge: same direction and same relation name."""
+            return [c for c in extracted_cache[ep]
+                    if c["source"] == r["s"] and c["target"] == r["t"]
+                    and (r["name"] is None or c.get("name") in (None, r["name"]))]
+
+        groups: dict[tuple, list[dict]] = {}
+        for r, live in pending:
+            primary = next((ep for ep in live if candidates(ep, r)), None)
+            if primary is None:                          # no source states it (or extraction skipped it)
+                held_edge_ids.add(r["uuid"]); summary["held_unmatched_edges"] += 1
                 continue
-            used[ep].add(pick)
-            item = extracted_cache[ep][pick]
-            if await dirty(item["fact"], r["g"]):
-                held_edge_ids.add(r["uuid"])             # even the clean derivation carries erased tokens
-                continue
-            cleared_edges.append({"uuid": r["uuid"], "fact": item["fact"], "evidence":
-                                  f"{ev}:re_extracted:rev{rev0}:in{item['input_sha256']}:out{_sha(item['fact'])}"})
+            groups.setdefault((primary, r["s"], r["t"], r["name"], len(live)), []).append(r)
+        for (primary, s_uuid, t_uuid, rname, n_live), members in groups.items():
+            facts = candidates(primary, members[0])
+            # a clean sibling edge of the same relation already carries one of these facts
+            clean = {_norm(x["fact"]) for x in await _rows(graphiti, """
+                MATCH (:Entity {uuid:$s})-[r:RELATES_TO]->(:Entity {uuid:$t})
+                WHERE $ep IN coalesce(r.episodes,[]) AND size(coalesce(r.erasure_quarantine,[])) = 0
+                  AND ($n IS NULL OR r.name = $n) RETURN r.fact AS fact""", s=s_uuid, t=t_uuid, ep=primary, n=rname)}
+            free = [c for c in {_norm(c["fact"]): c for c in facts}.values() if _norm(c["fact"]) not in clean]
+            remaining, pairs = list(members), []
+            for r in list(remaining):                    # the edge's own text already equals a clean fact
+                hit = next((c for c in free if _norm(c["fact"]) == _norm(r["fact"])), None)
+                if hit is not None:
+                    pairs.append((r, hit)); remaining.remove(r); free.remove(hit)
+            if len(remaining) == 1 and len(free) == 1:   # one edge, one fact: unambiguous
+                pairs.append((remaining[0], free[0])); remaining = []
+            for r in remaining:
+                held_edge_ids.add(r["uuid"])
+                # no fact left for it: nothing states it (or extraction skipped it); otherwise the choice is unclear
+                summary["held_unmatched_edges" if not free else "held_ambiguous_edges"] += 1
+            for r, item in pairs:
+                if await dirty(item["fact"], r["g"]):
+                    held_edge_ids.add(r["uuid"])         # even the clean derivation carries erased tokens
+                    continue
+                cleared_edges.append({"uuid": r["uuid"], "fact": item["fact"], "evidence":
+                                      f"{ev}:re_extracted:rev{rev0}:in{item['input_sha256']}:out{_sha(item['fact'])}:src{n_live}"})
         summary["held_edges"] += len(held_edge_ids)
         fact_of = {c["uuid"]: c["fact"] for c in cleared_edges}
         gone_edges = set(purge_edges)

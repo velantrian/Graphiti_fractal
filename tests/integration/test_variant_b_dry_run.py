@@ -76,7 +76,8 @@ async def test_diagnostics_list_objects_without_lineage_and_seedless_tombstones_
     # objects lineage cannot reach: reported, and honestly labelled as not restricted
     gap = reasons["LINEAGE_GAP"]
     assert {r["grp"]: r["n"] for r in gap["entities_without_mentions"]}["knowledge"] >= 1
-    assert "not restricted" in gap["effect"]
+    assert "not restricted" in gap["effect"] and "UNKNOWN" in gap["effect"] and gap["content"] == "unknown"
+    assert "UNKNOWN" in render(report)                                       # the text report says so too
     assert {"uuid": "orphan-entity", "group": "knowledge", "label": "Entity"} in detail["LINEAGE_GAP"]["objects"]
     # derived-kind episodes without lineage, per object
     unknown = {(o["uuid"], o["kind"]) for o in detail["UNKNOWN_LINEAGE_DERIVED_KIND"]["objects"]}

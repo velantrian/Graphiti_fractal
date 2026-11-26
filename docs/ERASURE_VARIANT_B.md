@@ -41,9 +41,13 @@ Other groups are never paused.
 
 **B. Show a specific rebuilt object again.** Per object, tombstone kept. A mark is removed only with a
 recorded `erasure_evidence` entry `<event>:<kind>:rev<N>:...` of one of two kinds:
-* `re_extracted`: the edge's fact was extracted again from its **live source episode** by the extractor
+* `re_extracted`: the edge's fact was extracted again from its **live source episodes** by the extractor
   (`graphiti_edge_extractor`: Graphiti's own `extract_edges`, one episode, no previous episodes; the
-  entry carries the input hash). An edge no live source states is deleted instead.
+  entry carries the input hash and how many live sources were consulted). **Every** live source is
+  consulted before the edge's fate is decided; the first source that states the fact with the same
+  direction and relation name decides. An edge with no live source at all is deleted. If sources exist
+  but the match is ambiguous, only in the reverse direction, or the extraction skipped the fact, the edge
+  is **kept restricted for reconciliation** (a skipped fact cannot be told from an unsupported one).
 * `rebuilt_from_clean_edges`: an entity summary recomputed from the facts of its incident edges, allowed
   only once every incident edge is clean or re-derived. An entity no live source mentions is deleted.
 
@@ -70,4 +74,5 @@ usual re-derivation. Erasures in other groups do not disturb a running write (pe
 * Experience keeps its own conditions and is outside this model.
 * Migration of legacy flags and `lineage_reviewed` marking are owner actions; nothing here runs them.
   `scripts/erasure_dry_run.py [--details]` lists, read-only and without content: flagged objects, derived-kind
-  episodes without lineage, objects lineage cannot reach (not restricted by this model), tombstones without a seed.
+  episodes without lineage, objects lineage cannot reach (`LINEAGE_GAP`: not restricted by this model, and their
+  **content is unknown**: the report never reads it and an erasure cannot find them), tombstones without a seed.

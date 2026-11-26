@@ -52,7 +52,7 @@ def render(report: dict) -> str:
         f"GROUP_WRITE_PAUSE: {r['GROUP_WRITE_PAUSE']}",
         f"UNKNOWN_LINEAGE_DERIVED_KIND: {r['UNKNOWN_LINEAGE_DERIVED_KIND']['total']} "
         f"({json.dumps(r['UNKNOWN_LINEAGE_DERIVED_KIND']['by_group_and_kind'])})",
-        f"LINEAGE_GAP: {r['LINEAGE_GAP']['total']} (not restricted; an erasure cannot reach them)",
+        f"LINEAGE_GAP: {r['LINEAGE_GAP']['total']} objects, content UNKNOWN (not read; not restricted; an erasure cannot reach them)",
         f"TOMBSTONE_WITHOUT_SEED: {r['TOMBSTONE_WITHOUT_SEED']['total']}",
         f"groups touched after migration: {report['groups_touched_after_migration']}; "
         f"untouched: {report['groups_untouched_after_migration']}",

@@ -73,4 +73,5 @@ jobs:
             --target tests/integration/test_variant_b_vertical.py \
             --target tests/integration/test_variant_b_dry_run.py \
             --target tests/integration/test_variant_b_evidence.py \
+            --target tests/integration/test_variant_b_rebuild_cases.py \
             --target tests/integration/test_ingest_claim_lifecycle.py

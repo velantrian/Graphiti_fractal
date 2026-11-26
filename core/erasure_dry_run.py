@@ -12,8 +12,10 @@ Reason codes:
   UNKNOWN_LINEAGE_DERIVED_KIND chat/summary/L3 episodes without recorded lineage; restricted once any
                                tombstone exists, until the owner reviews them (lineage_reviewed=true)
   LINEAGE_GAP                  Graphiti-derived objects lineage cannot reach (entity without MENTIONS, edge
-                               without episodes, community without members). NOT restricted by variant B:
-                               an erasure cannot find them, so erased text inside them would not be found
+                               without episodes, community without members). NOT restricted by variant B.
+                               Their CONTENT IS UNKNOWN: this report never reads it, and an erasure cannot
+                               find them, so erased text inside them would not be found. Counting them says
+                               nothing about whether they are clean or contaminated
   TOMBSTONE_WITHOUT_SEED       tombstone not created by this code: no area can be computed; its group's
                                derived objects are held until the owner decides
 
@@ -103,7 +105,9 @@ async def dry_run(graphiti, *, details: bool = False, limit: int = 200) -> dict:
                 "entities_without_mentions": gap_entities, "edges_without_episodes": gap_edges,
                 "communities_without_members": gap_comms,
                 "total": sum(r["n"] for r in gap_entities + gap_edges + gap_comms),
-                "effect": "not restricted by variant B; an erasure cannot reach them"},
+                "content": "unknown",
+                "effect": "not restricted by variant B; lineage cannot reach them, so whether they contain erased "
+                          "text is UNKNOWN (never read here; an erasure cannot find them)"},
             "TOMBSTONE_WITHOUT_SEED": {
                 "total": len(seedless), "tombstones": [{"uuid": t["uuid"], "group": t["grp"]} for t in seedless],
                 "effect": "area unknown: derived objects of that group are held until decided"},

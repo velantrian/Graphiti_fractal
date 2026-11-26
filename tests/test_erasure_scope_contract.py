@@ -48,3 +48,10 @@ def test_a_token_screen_is_never_recorded_as_evidence_and_rebuild_needs_an_extra
     assert ":re_extracted:" in source and ":rebuilt_from_clean_edges:" in source
     assert "if extractor is None:" in source                       # without it edges stay held
     assert "async def mark_late_write" in source
+
+
+def test_rebuild_never_widens_a_named_event_and_never_decides_from_one_source():
+    source = (ROOT / "core/erasure_scope.py").read_text(encoding="utf-8")
+    assert "or opens" not in source and "unknown_or_closed_event" in source   # no silent fallback to other events
+    assert "live[0]" not in source                                            # every live source is consulted
+    assert 'c["source"] == r["s"] and c["target"] == r["t"]' in source        # direction is part of the match
