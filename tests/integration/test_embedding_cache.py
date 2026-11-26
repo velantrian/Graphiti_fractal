@@ -10,6 +10,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import tempfile
 
+# Local cache only: no Neo4j admission needed.
+pytestmark = pytest.mark.no_neo4j
+
 
 @pytest.mark.asyncio
 async def test_cache_lru_eviction():

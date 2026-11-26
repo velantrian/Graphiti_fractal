@@ -3,7 +3,7 @@ PYTHON?=$(VENV)/bin/python
 PIP?=$(VENV)/bin/pip
 CONTRACT_TESTS?=tests/contract_suite.txt
 
-.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test test-contracts test-collect test-integration migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
+.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test test-contracts test-collect test-integration test-integration-provisioned test-isolation migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
 
 venv:
 	python -m venv $(VENV)
@@ -54,9 +54,20 @@ test-contracts:
 test-collect:
 	$(PYTHON) -m pytest --collect-only -q tests
 
-# Requires an explicitly configured isolated Neo4j/Graphiti integration environment.
+# Integration tests only ever touch a disposable, marker-verified Neo4j; runtime
+# NEO4J_* / .env settings are never used (docs/TEST_DATABASE_ISOLATION.md).
+# Starts a fresh container (Docker required) and removes it afterwards.
 test-integration:
+	$(PYTHON) scripts/test_neo4j.py run -- $(PYTHON) -m pytest -q tests/integration
+
+# Same suite against a fresh database supplied by other infrastructure and
+# marked with `scripts/test_neo4j.py provision` (FRACTAL_TEST_* must be set).
+test-integration-provisioned:
 	$(PYTHON) -m pytest -q tests/integration
+
+# Acceptance for the guard itself: integration run + decoy database rejection.
+test-isolation:
+	$(PYTHON) scripts/test_neo4j.py acceptance
 
 migrate:
 	$(PYTHON) main.py migrate
