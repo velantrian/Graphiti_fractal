@@ -1,9 +1,6 @@
-import asyncio
 import json
-import os
 
 import pytest
-from neo4j import AsyncGraphDatabase
 
 from core.ingest_atomicity import (
     acquire_ingest_claim,
@@ -16,48 +13,11 @@ from experience.writer import ingest_experience
 from layers.l2_semantic import get_l2_semantic_context_with_sources
 
 
-class ResultAdapter:
-    def __init__(self, records):
-        self.records = records
-
-
-class DriverAdapter:
-    def __init__(self, driver):
-        self._driver = driver
-
-    async def execute_query(self, query, **kwargs):
-        records, _, _ = await self._driver.execute_query(query, parameters_=kwargs)
-        return ResultAdapter(records)
-
-
-class GraphitiAdapter:
-    def __init__(self, driver):
-        self.driver = DriverAdapter(driver)
-
-
-async def _connect_with_retry(uri: str, user: str, password: str):
-    driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
-    last = None
-    for _ in range(30):
-        try:
-            await driver.verify_connectivity()
-            return driver
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            await asyncio.sleep(1)
-    await driver.close()
-    raise RuntimeError(f"Neo4j did not become ready: {last}")
-
-
 @pytest.mark.asyncio
-async def test_live_neo4j_recall_telemetry_is_non_authoritative_and_tracks_query_diversity():
-    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
-    driver = await _connect_with_retry(uri, user, password)
-    graphiti = GraphitiAdapter(driver)
+async def test_live_neo4j_recall_telemetry_is_non_authoritative_and_tracks_query_diversity(isolated_graph):
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         first = await record_recall(
             graphiti,
             user_id="integration-owner",
@@ -99,18 +59,14 @@ async def test_live_neo4j_recall_telemetry_is_non_authoritative_and_tracks_query
         assert result.records[0]["invalid_at"] is None
         assert result.records[0]["fact"] is None
     finally:
-        await driver.close()
+        await graphiti.reset()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
-    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
-    driver = await _connect_with_retry(uri, user, password)
-    graphiti = GraphitiAdapter(driver)
+async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic(isolated_graph):
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         token = await acquire_ingest_claim(
             graphiti,
             group_id="knowledge",
@@ -163,18 +119,14 @@ async def test_live_neo4j_ingest_claim_is_unique_and_finalization_is_atomic():
         assert record["state"] == "COMMITTED"
         assert record["episode_uuid"] == "episode-atomic-1"
     finally:
-        await driver.close()
+        await graphiti.reset()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_l2_requires_explicit_owner_origin_and_rejects_mixed_provenance():
-    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
-    driver = await _connect_with_retry(uri, user, password)
-    graphiti = GraphitiAdapter(driver)
+async def test_live_neo4j_l2_requires_explicit_owner_origin_and_rejects_mixed_provenance(isolated_graph):
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         await graphiti.driver.execute_query(
             """
             CREATE (c:Community {uuid:'community-owner', group_id:'knowledge', level:0})
@@ -236,17 +188,12 @@ async def test_live_neo4j_l2_requires_explicit_owner_origin_and_rejects_mixed_pr
         assert context is None
         assert source_ids == []
     finally:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
-        await driver.close()
+        await graphiti.reset()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_experience_nested_tool_args_use_scalar_representation():
-    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
-    driver = await _connect_with_retry(uri, user, password)
-    graphiti = GraphitiAdapter(driver)
+async def test_live_neo4j_experience_nested_tool_args_use_scalar_representation(isolated_graph):
+    graphiti = isolated_graph
     try:
         await graphiti.driver.execute_query(
             "MATCH (n) WHERE n.group_id = 'experience' DETACH DELETE n"
@@ -288,16 +235,11 @@ async def test_live_neo4j_experience_nested_tool_args_use_scalar_representation(
             "MATCH (n) WHERE n.uuid = $run_id OR n.group_id = 'experience' DETACH DELETE n",
             run_id="experience-args-integration",
         )
-        await driver.close()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_experience_secret_values_are_redacted_before_persistence():
-    uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "fractal-test-password")
-    driver = await _connect_with_retry(uri, user, password)
-    graphiti = GraphitiAdapter(driver)
+async def test_live_neo4j_experience_secret_values_are_redacted_before_persistence(isolated_graph):
+    graphiti = isolated_graph
     secrets = [
         "bearer-secret",
         "quoted-bearer-secret",
@@ -372,26 +314,19 @@ async def test_live_neo4j_experience_secret_values_are_redacted_before_persisten
         await graphiti.driver.execute_query(
             "MATCH (n) WHERE n.group_id = 'experience' DETACH DELETE n"
         )
-        await driver.close()
-
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_quality_attribution_and_claim_recovery():
+async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph):
     """Provider-free GF-01/GF-03/GF-04; actual Cypher, no owner database."""
     import hashlib
     from datetime import datetime, timedelta, timezone
     from core.ingest_atomicity import mark_ingest_claim_failed, read_ingest_claim
     from knowledge.ingest import episode_exists, UnconfirmedEpisodeIdentity
 
-    driver = await _connect_with_retry(
-        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
-        os.environ.get("NEO4J_USER", "neo4j"),
-        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
-    )
-    graphiti = GraphitiAdapter(driver)
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         for quality in ("complete", "degraded"):
             body = "body-" + quality
             fp = "fp-" + quality
@@ -407,7 +342,7 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery():
                 graphiti, episode_uuid=uid, group_id="knowledge", fingerprint=fp,
                 claim_token=token, user_id="owner", origin_class="agent_derived",
                 ingest_quality=quality, content_sha256=hashlib.sha256(body.encode()).hexdigest())
-            receipt = await read_ingest_claim(GraphitiAdapter(driver), group_id="knowledge", fingerprint=fp)
+            receipt = await read_ingest_claim(isolated_graph.sibling(), group_id="knowledge", fingerprint=fp)
             assert receipt["status"] == "committed_" + quality
             assert receipt["episode_uuid"] == uid
             attribution = await graphiti.driver.execute_query(
@@ -435,32 +370,25 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery():
         assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
         await mark_ingest_claim_failed(
             graphiti, group_id="knowledge", fingerprint="uncertain", token=token, error_type="TimeoutError")
-        receipt = await read_ingest_claim(GraphitiAdapter(driver), group_id="knowledge", fingerprint="uncertain")
+        receipt = await read_ingest_claim(isolated_graph.sibling(), group_id="knowledge", fingerprint="uncertain")
         assert receipt["state"] == "RECONCILIATION_REQUIRED"
         assert receipt["status"] == "unconfirmed"
         assert receipt["episode_uuid"] is None
         assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
     finally:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
-        await driver.close()
-
+        await graphiti.reset()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_original():
+async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_original(isolated_graph):
     """GF-02: actual Neo4j, stale search objects, no provider calls."""
     from types import SimpleNamespace
     from core.erasure_guard import erase_node, read_erasure_state
     from core.memory_ops import MemoryOps
 
-    driver = await _connect_with_retry(
-        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
-        os.environ.get("NEO4J_USER", "neo4j"),
-        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
-    )
-    graphiti = GraphitiAdapter(driver)
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         await graphiti.driver.execute_query("""
             CREATE (a:Episodic {uuid:'erase-me',group_id:'knowledge',content:'secret marker',origin_class:'owner'}),
                    (b:Episodic {uuid:'keep-me',group_id:'knowledge',content:'independent marker',origin_class:'owner'}),
@@ -490,7 +418,7 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
         assert await read_erasure_state(graphiti) == (0, False)
         assert (await erase_node(graphiti, uuid="erase-me"))["deleted"] is True
         assert await read_erasure_state(graphiti) == (1, True)
-        other = GraphitiAdapter(driver)
+        other = isolated_graph.sibling()
         other.search_ = stale_search
         after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
         assert [e["uuid"] for e in after.episodes] == ["keep-me"]
@@ -503,13 +431,11 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
             "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode")
         assert marker.records[0]["mode"] == "hard"
     finally:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
-        await driver.close()
-
+        await graphiti.reset()
 
 
 @pytest.mark.asyncio
-async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization():
+async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization(isolated_graph):
     """Real Neo4j commit boundary; simulate an upstream writer crossing erasure."""
     import hashlib
     from core.erasure_guard import erase_node, read_erasure_state, ErasureFenceChanged
@@ -517,21 +443,16 @@ async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization(
         mark_ingest_claim_failed, read_ingest_claim,
     )
 
-    driver = await _connect_with_retry(
-        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
-        os.environ.get("NEO4J_USER", "neo4j"),
-        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
-    )
-    graphiti = GraphitiAdapter(driver)
+    graphiti = isolated_graph
     try:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await graphiti.reset()
         await graphiti.driver.execute_query(
             "CREATE (:Episodic {uuid:'erasure-target',group_id:'knowledge',content:'old'})")
         revision, _ = await read_erasure_state(graphiti)
         token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="late",
                                            expected_revision=revision)
         assert token
-        assert (await erase_node(GraphitiAdapter(driver), uuid="erasure-target"))["deleted"]
+        assert (await erase_node(isolated_graph.sibling(), uuid="erasure-target"))["deleted"]
         with pytest.raises(ErasureFenceChanged):
             await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="queued",
                                        expected_revision=revision)
@@ -568,5 +489,4 @@ async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization(
             ingest_quality="complete", content_sha256=hashlib.sha256(b"fresh").hexdigest())
         assert (await read_ingest_claim(graphiti, group_id="knowledge", fingerprint="fresh"))["status"] == "committed_complete"
     finally:
-        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
-        await driver.close()
+        await graphiti.reset()

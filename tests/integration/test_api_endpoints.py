@@ -1,15 +1,10 @@
 """Integration tests for the authenticated single-tenant FastAPI surface."""
 
-import os
-
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv("NEO4J_URI"),
-    reason="NEO4J_URI not set - skipping integration tests",
-)
+# Database admission and skipping are handled by tests/integration/conftest.py.
 
 TEST_TOKEN = "integration-test-token"
 TEST_USER = "api_test_user"
