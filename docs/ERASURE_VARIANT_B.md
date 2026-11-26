@@ -44,8 +44,11 @@ recorded `erasure_evidence` entry `<event>:<kind>:rev<N>:...` of one of two kind
 * `re_extracted`: the edge's fact was extracted again from its **live source episodes** by the extractor
   (`graphiti_edge_extractor`: Graphiti's own `extract_edges`, one episode, no previous episodes; the
   entry carries the input hash and how many live sources were consulted). **Every** live source is
-  consulted before the edge's fate is decided; the first source that states the fact with the same
-  direction and relation name decides. An edge with no live source at all is deleted. If sources exist
+  consulted before the edge's fate is decided, pooled: an exact confirmation from any source counts,
+  whatever similar-but-different fact another source states. A fact is matched only with the same
+  direction and relation name, and a one-edge/one-fact match only if both state the same numbers and
+  dates: another date or number would give the old UUID a different meaning, so that edge stays
+  restricted. An edge with no live source at all is deleted. If sources exist
   but the match is ambiguous, only in the reverse direction, or the extraction skipped the fact, the edge
   is **kept restricted for reconciliation** (a skipped fact cannot be told from an unsupported one).
 * `rebuilt_from_clean_edges`: an entity summary recomputed from the facts of its incident edges, allowed

@@ -73,7 +73,7 @@ async def test_r1_a_fact_confirmed_only_by_the_second_live_source_reopens_the_ed
     assert len(edge) == 1, "the edge supported by the second source was deleted"
     assert edge[0]["marks"] == 0 and edge[0]["episodes"] == [s1, s2]
     assert "ZORBLAX" not in edge[0]["fact"] and "opening hours" in edge[0]["fact"]
-    assert any(":re_extracted:" in e and e.endswith(":src2") for e in edge[0]["ev"])    # both live sources were consulted
+    assert any(":re_extracted:" in e and ":src2:" in e and f":via{s2[:8]}" in e for e in edge[0]["ev"])    # both live sources were consulted
 
 
 # --- R2 ---------------------------------------------------------------------------------------
@@ -185,3 +185,51 @@ async def test_r3_unknown_or_closed_event_id_changes_nothing_with_two_open_event
     assert after[ev_a] == "RESOLVED" and after[ev_p] == "SCOPED" and after["evt-pending"] == "PENDING_SCOPE"
     assert marks_p_before == await env.q("MATCH (n) WHERE any(m IN coalesce(n.erasure_quarantine,[]) WHERE m STARTS WITH $p) "
                                          "RETURN n.uuid AS u ORDER BY u", p=ev_p + ":")
+
+
+# --- R4 ---------------------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_text, new_text", [
+    ("Mira Venn meets the courier on 5 May.", "Mira Venn meets the courier on 7 May."),          # another date
+    ("Mira Venn owns 3 offices at the harbor.", "Mira Venn owns 5 offices at the harbor.")])    # another number
+async def test_r4_changed_date_or_number_keeps_the_old_edge_restricted_and_exact_second_source_wins(
+        env, isolated_graph, old_text, new_text):
+    """One edge, one clean fact with the same ends, direction and relation but another date or number:
+    the old UUID must not take a different meaning. In the same run an edge whose exact statement is
+    confirmed by the second source is reopened although the first source says a similar, different fact."""
+    await isolated_graph.reset()
+    await env.add("[[Mira Venn]] keeps the vault passphrase ZORBLAX-ALPHA.")
+    await env.add("[[Mira Venn]] and the [[Harbor Office]] met in the morning.")                   # first source
+    await env.add("[[Mira Venn]] and the [[Harbor Office]] met again in the evening.")             # second source
+    a, s1, s2 = await env.uuid_of(MARK_A), await env.uuid_of("in the morning"), await env.uuid_of("in the evening")
+    await env.q("MATCH (:Entity {name:'Mira Venn'})-[r:RELATES_TO]->(:Entity {name:'Harbor Office'}) DELETE r")
+    stored_two = "Mira Venn reports to the Harbor Office on 5 May."
+    for key, name, fact, episodes in (("e-old", "MEETS", old_text, [s1]),
+                                       ("e-two", "REPORTS", stored_two, [s1, s2])):
+        await env.q("MATCH (a:Entity {name:'Mira Venn'}), (b:Entity {name:'Harbor Office'}) CREATE (a)-[:RELATES_TO {uuid:$u, "
+                    "group_id:'knowledge', name:$n, fact:$f, episodes:$e, created_at:$ts, fact_embedding:[0.1,0.1]}]->(b)",
+                    u=key, n=name, f=fact, e=episodes, ts=TS)
+    await erase_node(env.graphiti, uuid=a, hard=True)
+    m, h = await entity_uuid(env, "Mira Venn"), await entity_uuid(env, "Harbor Office")
+    by_episode = {
+        s1: [(m, h, "MEETS", new_text),                                           # same relation, other date/number
+             (m, h, "REPORTS", "Mira Venn reports to the Harbor Office on 7 May.")],   # similar but different fact
+        s2: [(m, h, "REPORTS", stored_two)]}                                      # exact confirmation, second source
+
+    async def extractor(episode_uuid):
+        return [{"source": x, "target": y, "name": n, "fact": f, "input_sha256": "scripted"}
+                for x, y, n, f in by_episode[episode_uuid]]
+
+    summary = await erasure_scope.rebuild_area(env.graphiti, extractor=extractor)
+    rows = {r["uuid"]: r for r in await edge_rows(env, "r.uuid STARTS WITH 'e-'")}
+    print("OBSERVED_R4 " + json.dumps({"old": {k: rows["e-old"][k] for k in ("fact", "marks", "ev")},
+                                       "two": {k: rows["e-two"][k] for k in ("fact", "marks", "ev")}, "summary": summary}))
+    # the old UUID keeps its old meaning and stays restricted for reconciliation
+    assert rows["e-old"]["fact"] == old_text and rows["e-old"]["marks"] == 1 and rows["e-old"]["ev"] is None
+    assert summary["held_meaning_changed_edges"] == 1
+    # the exact confirmation of the second source is taken into account
+    assert rows["e-two"]["fact"] == stored_two and rows["e-two"]["marks"] == 0
+    assert any(f":via{s2[:8]}" in e and ":src2:" in e for e in rows["e-two"]["ev"])
+    assert "7 May" not in rows["e-two"]["fact"]
+    tomb = await env.q("MATCH (t:FractalErasure {target_uuid:$u}) RETURN t.status AS s", u=a)
+    assert tomb[0]["s"] == "SCOPED"                                               # the group stays paused for the held edge

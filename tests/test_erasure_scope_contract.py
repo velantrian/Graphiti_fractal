@@ -55,3 +55,13 @@ def test_rebuild_never_widens_a_named_event_and_never_decides_from_one_source():
     assert "or opens" not in source and "unknown_or_closed_event" in source   # no silent fallback to other events
     assert "live[0]" not in source                                            # every live source is consulted
     assert 'c["source"] == r["s"] and c["target"] == r["t"]' in source        # direction is part of the match
+
+
+def test_a_changed_number_or_date_is_never_taken_as_the_same_edge():
+    from core.erasure_scope import _quantities
+    assert _quantities("meets the courier on 5 May") != _quantities("meets the courier on 7 May")
+    assert _quantities("owns 3 offices") != _quantities("owns 5 offices")
+    assert _quantities("встреча 5 мая") != _quantities("встреча 7 мая")
+    assert _quantities("Mira knows the office") == _quantities("The office is known to Mira")
+    source = (ROOT / "core/erasure_scope.py").read_text(encoding="utf-8")
+    assert "held_meaning_changed_edges" in source and "pool.setdefault" in source   # all sources pooled
