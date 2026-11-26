@@ -16,6 +16,7 @@ from mcp_server import server
     ([], False),
     ([{"uuid": "episode", "confirmed": True}], True),
     ([{"uuid": "orphan", "confirmed": False}], None),
+    ([{"uuid": "episode", "confirmed": True}, {"uuid": "other", "confirmed": False}], None),
 ])
 async def test_existing_episode_requires_confirmed_identity(records, expected):
     driver = SimpleNamespace(execute_query=AsyncMock(return_value=SimpleNamespace(records=records)))
@@ -29,6 +30,9 @@ async def test_existing_episode_requires_confirmed_identity(records, expected):
     assert "c.state = 'COMMITTED'" in query
     assert "c.episode_uuid = e.uuid" in query
     assert ":AUTHORED" in query
+    assert ":STORED_FOR" in query
+    assert "c.ingest_quality = 'complete'" in query
+    assert "e.ingest_quality = 'complete'" in query
 
 
 def test_unconfirmed_existing_is_not_success():

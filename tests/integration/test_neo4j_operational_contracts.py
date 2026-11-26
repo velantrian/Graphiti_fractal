@@ -373,3 +373,73 @@ async def test_live_neo4j_experience_secret_values_are_redacted_before_persisten
             "MATCH (n) WHERE n.group_id = 'experience' DETACH DELETE n"
         )
         await driver.close()
+
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_quality_attribution_and_claim_recovery():
+    """Provider-free GF-01/GF-03/GF-04; actual Cypher, no owner database."""
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    from core.ingest_atomicity import mark_ingest_claim_failed, read_ingest_claim
+    from knowledge.ingest import episode_exists, UnconfirmedEpisodeIdentity
+
+    driver = await _connect_with_retry(
+        os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
+        os.environ.get("NEO4J_USER", "neo4j"),
+        os.environ.get("NEO4J_PASSWORD", "fractal-test-password"),
+    )
+    graphiti = GraphitiAdapter(driver)
+    try:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        for quality in ("complete", "degraded"):
+            body = "body-" + quality
+            fp = "fp-" + quality
+            uid = "episode-" + quality
+            token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint=fp)
+            await graphiti.driver.execute_query(
+                "CREATE (:Episodic {uuid:$uuid, content:$content, source_description:'source-a'})",
+                uuid=uid, content=body,
+            )
+            await mark_ingest_claim_episode_created(
+                graphiti, group_id="knowledge", fingerprint=fp, token=token, episode_uuid=uid)
+            await finalize_episode_identity(
+                graphiti, episode_uuid=uid, group_id="knowledge", fingerprint=fp,
+                claim_token=token, user_id="owner", origin_class="agent_derived",
+                ingest_quality=quality, content_sha256=hashlib.sha256(body.encode()).hexdigest())
+            receipt = await read_ingest_claim(GraphitiAdapter(driver), group_id="knowledge", fingerprint=fp)
+            assert receipt["status"] == "committed_" + quality
+            assert receipt["episode_uuid"] == uid
+            attribution = await graphiti.driver.execute_query(
+                """
+                MATCH (e:Episodic {uuid:$uuid})
+                RETURN EXISTS { MATCH (e)-[:STORED_FOR]->(:User {user_id:'owner'}) } AS stored_for,
+                       EXISTS { MATCH (:User {user_id:'owner'})-[:AUTHORED]->(e) } AS authored
+                """, uuid=uid)
+            assert attribution.records[0]["stored_for"] is True
+            assert attribution.records[0]["authored"] is False
+            kwargs = dict(origin_class="agent_derived", user_id="owner", source_description="source-a")
+            if quality == "complete":
+                assert await episode_exists(graphiti, fp, body, "knowledge", **kwargs)
+                with pytest.raises(UnconfirmedEpisodeIdentity):
+                    await episode_exists(graphiti, fp, body, "knowledge",
+                                         **{**kwargs, "source_description": "source-b"})
+            else:
+                with pytest.raises(UnconfirmedEpisodeIdentity):
+                    await episode_exists(graphiti, fp, body, "knowledge", **kwargs)
+        token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain")
+        await graphiti.driver.execute_query(
+            "MATCH (c:FractalIngestClaim {token:$token}) SET c.expires_at=datetime($past)",
+            token=token, past=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat())
+        # Old timestamps do not permit takeover; a slow writer may still commit.
+        assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
+        await mark_ingest_claim_failed(
+            graphiti, group_id="knowledge", fingerprint="uncertain", token=token, error_type="TimeoutError")
+        receipt = await read_ingest_claim(GraphitiAdapter(driver), group_id="knowledge", fingerprint="uncertain")
+        assert receipt["state"] == "RECONCILIATION_REQUIRED"
+        assert receipt["status"] == "unconfirmed"
+        assert receipt["episode_uuid"] is None
+        assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
+    finally:
+        await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
+        await driver.close()

@@ -63,7 +63,7 @@ def _outcome(status: str, episode_uuid, exc) -> dict:
             "error": None if exc is None else f"{type(exc).__name__}: {exc}"}
 
 
-_DOC_COUNTERS = ("chunks", "added", "skipped_existing", "skipped_claim_held", "unconfirmed_existing", "failed_chunks", "degraded_chunks")
+_DOC_COUNTERS = ("chunks", "added", "skipped_existing", "skipped_claim_held", "unconfirmed_existing", "unconfirmed_writes", "failed_chunks", "degraded_chunks")
 
 
 def _document_outcome(result) -> dict:

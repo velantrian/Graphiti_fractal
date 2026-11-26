@@ -86,7 +86,7 @@ def finish_upload_job(job_id: str, result: dict, **fields) -> bool:
              else "done_with_warnings")
     counters = {key: result[key] for key in (
         "chunks", "added", "skipped_existing", "skipped_claim_held",
-        "unconfirmed_existing", "failed_chunks", "degraded_chunks"
+        "unconfirmed_existing", "unconfirmed_writes", "failed_chunks", "degraded_chunks"
     ) if key in result}
     if "chunks" in result:
         fields.update(total_chunks=result["chunks"], processed_chunks=result["chunks"])

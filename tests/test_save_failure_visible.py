@@ -172,10 +172,12 @@ async def test_ingest_honors_degraded_error_status():
     with (
         patch("knowledge.ingest.acquire_ingest_claim", new=AsyncMock(return_value="t")),
         patch("knowledge.ingest.mark_ingest_claim_episode_created", new=AsyncMock()),
-        patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()),
+        patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()) as finalize,
         patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),
     ):
         res = await ingest_text_document(g, "Short text", source_description="d")
     assert res["degraded_chunks"] == 1
+    assert finalize.await_args.kwargs["ingest_quality"] == "degraded"
+    assert res["completeness"] == "partial"
     assert any("DEGRADED_ERROR" in w and "1 entities" in w for w in res["warnings"])
     assert any("dropped 1 entities" in w for w in res["warnings"])
