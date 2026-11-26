@@ -75,6 +75,25 @@ def update_upload_job(job_id: str, **fields) -> bool:
     return True
 
 
+def finish_upload_job(job_id: str, result: dict, **fields) -> bool:
+    """Publish explicit completeness and counters, not inferred HTTP success."""
+    completeness = result.get("completeness")
+    if completeness not in {"complete", "partial", "failed", "unconfirmed"}:
+        completeness = "unknown"
+    warnings = result.get("warnings", [])
+    stage = ("error" if completeness == "failed" or result.get("status") == "error"
+             else "done" if completeness == "complete" and not warnings
+             else "done_with_warnings")
+    counters = {key: result[key] for key in (
+        "chunks", "added", "skipped_existing", "skipped_claim_held",
+        "unconfirmed_existing", "unconfirmed_writes", "failed_chunks", "degraded_chunks"
+    ) if key in result}
+    if "chunks" in result:
+        fields.update(total_chunks=result["chunks"], processed_chunks=result["chunks"])
+    return update_upload_job(job_id, stage=stage, completeness=completeness,
+                             counters=counters, warnings=warnings, **fields)
+
+
 def get_upload_job(job_id: str) -> Optional[UploadJobStatus]:
     """
     Get job status by ID.

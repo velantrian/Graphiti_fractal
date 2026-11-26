@@ -64,7 +64,7 @@ async def test_ingest_validation_failure_is_fail_closed():
             "knowledge.ingest.acquire_ingest_claim",
             new=AsyncMock(return_value="test-claim-token"),
         ),
-        patch("knowledge.ingest.release_ingest_claim", new=AsyncMock()) as release_claim,
+        patch("knowledge.ingest.mark_ingest_claim_failed", new=AsyncMock()) as hold_claim,
         patch(
             "knowledge.ingest.mark_ingest_claim_episode_created",
             new=AsyncMock(),
@@ -81,10 +81,11 @@ async def test_ingest_validation_failure_is_fail_closed():
             user_id="test-user",
         )
 
-    assert result["status"] == "error"
+    assert result["completeness"] == "unconfirmed"
+    assert result["unconfirmed_writes"] == 1
     assert result["added"] == 0
     assert result["skipped"] == 0
     assert any("ValidationError" in warning for warning in result["warnings"])
-    release_claim.assert_awaited_once()
+    hold_claim.assert_awaited_once()
     mark_created.assert_not_awaited()
     finalize.assert_not_awaited()

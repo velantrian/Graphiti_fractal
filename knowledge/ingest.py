@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from datetime import datetime, timezone
 from time import perf_counter
 
@@ -13,7 +14,6 @@ from core.ingest_atomicity import (
     finalize_episode_identity,
     mark_ingest_claim_episode_created,
     mark_ingest_claim_failed,
-    release_ingest_claim,
 )
 from core.text_utils import fingerprint, split_into_semantic_chunks
 
@@ -58,27 +58,59 @@ async def _resolve_episode_uuid(
     return str(uuids[0])
 
 
+class UnconfirmedEpisodeIdentity(RuntimeError):
+    """Matching episode exists but its ingest identity is not confirmed."""
+
+
 async def episode_exists(
-    graphiti,
-    fp: str,
-    content: str,
-    group_id: str | None = None,
+    graphiti, fp: str, content: str, group_id: str | None = None, *,
+    origin_class: str | None = None, user_id: str | None = None,
+    source_description: str | None = None,
 ) -> bool:
-    """Check exact duplicate identity, scoped to group_id when supplied."""
+    """Confirm exact content, committed claim, origin and requested authorship.
+
+    Legacy, orphaned and normalization-colliding records require reconciliation,
+    not an automatic rewrite or a success receipt.
+    """
     result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
           AND ($group_id IS NULL OR e.group_id = $group_id)
           AND (e.fingerprint = $fp OR e.content = $content)
-        RETURN e.uuid AS uuid
-        LIMIT 1
+        OPTIONAL MATCH (c:FractalIngestClaim)
+        WHERE c.group_id = e.group_id AND c.fingerprint = e.fingerprint
+          AND c.episode_uuid = e.uuid AND c.state = 'COMMITTED'
+          AND c.ingest_quality = 'complete'
+          AND c.content_sha256 = $content_sha256
+          AND c.token = e.ingest_event_id
+        WITH e, count(c) AS committed
+        RETURN e.uuid AS uuid,
+               coalesce(committed = 1 AND e.content = $content AND e.fingerprint = $fp
+                AND e.ingest_quality = 'complete'
+                AND e.content_sha256 = $content_sha256
+                AND ($source_description IS NULL OR e.source_description = $source_description)
+                AND e.origin_class IN ['owner','agent_derived','untrusted','system']
+                AND ($origin_class IS NULL OR e.origin_class = $origin_class)
+                AND ($user_id IS NULL OR EXISTS {
+                    MATCH (e)-[:STORED_FOR]->(:User {user_id:$user_id})
+                })
+                AND (e.origin_class <> 'owner' OR $user_id IS NULL OR EXISTS {
+                    MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e)
+                }), false) AS confirmed
+        ORDER BY confirmed DESC
+        LIMIT 2
         """,
-        fp=fp,
-        content=content,
-        group_id=group_id,
+        fp=fp, content=content, group_id=group_id,
+        origin_class=origin_class, user_id=user_id, source_description=source_description,
+        content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
     )
-    return bool(result.records)
+    if not result.records:
+        return False
+    # Any competing matching record is an ambiguity, not confirmation.
+    if len(result.records) == 1 and result.records[0].get("confirmed") is True:
+        return True
+    raise UnconfirmedEpisodeIdentity("matching episode identity unconfirmed; reconciliation required")
 
 
 async def find_similar_episode(
@@ -335,6 +367,8 @@ async def ingest_text_document(
     skipped_count = 0
     skipped_existing = 0
     skipped_claim_held = 0
+    unconfirmed_existing = 0
+    unconfirmed_writes = 0
     reference_time = datetime.now(timezone.utc)
     semaphore = get_write_semaphore()
 
@@ -365,9 +399,12 @@ async def ingest_text_document(
         )
         claim_token: str | None = None
         episode_uuid: str | None = None
+        write_started = False
 
         try:
-            if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id):
+            if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id,
+                                    origin_class=resolved_origin_class, user_id=user_id,
+                                    source_description=source_description):
                 skipped_count += 1
                 skipped_existing += 1
                 if job_id:
@@ -388,7 +425,9 @@ async def ingest_text_document(
                 continue
 
             async def write_episode():
+                nonlocal write_started
                 async with semaphore:
+                    write_started = True
                     return await graphiti.add_episode(
                         name=chunk_source[:100],
                         episode_body=chunk,
@@ -402,11 +441,24 @@ async def ingest_text_document(
                 op_name=f"add_episode:upload:{index}",
                 on_rate_limit=on_rate_limit,
             )
+            episode = getattr(episode_result, "episode", episode_result)
+            episode_uuid = (
+                episode.get("uuid") if isinstance(episode, dict) else getattr(episode, "uuid", None)
+            )
+            if not episode_uuid:
+                raise RuntimeError("Graphiti add_episode returned no episode UUID")
+            episode_uuid = str(episode_uuid)
+            await mark_ingest_claim_episode_created(
+                graphiti, group_id=group_id, fingerprint=chunk_fp,
+                token=claim_token, episode_uuid=episode_uuid,
+            )
+
             safety = filter_graphiti_results(episode_result)
+            degraded = safety.get("status") == "DEGRADED_ERROR" or bool(
+                safety["dropped_entities"] or safety["dropped_edges"]
+            )
             if safety.get("status") == "DEGRADED_ERROR":
-                # Validation itself raised: the extraction result is not trustworthy,
-                # which is different from "malformed elements were dropped".
-                degraded_chunks += 1
+                # Validation itself raised: extraction quality is not established.
                 warnings.append(
                     f"Chunk {index}: DEGRADED_ERROR — validation raised for "
                     f"{safety.get('errored_entities', 0)} entities and "
@@ -420,21 +472,6 @@ async def ingest_text_document(
                     f"and {invalid_edges} edges"
                 )
 
-            episode = getattr(episode_result, "episode", episode_result)
-            episode_uuid = (
-                episode.get("uuid") if isinstance(episode, dict) else getattr(episode, "uuid", None)
-            )
-            if not episode_uuid:
-                raise RuntimeError("Graphiti add_episode returned no episode UUID")
-            episode_uuid = str(episode_uuid)
-
-            await mark_ingest_claim_episode_created(
-                graphiti,
-                group_id=group_id,
-                fingerprint=chunk_fp,
-                token=claim_token,
-                episode_uuid=episode_uuid,
-            )
             await finalize_episode_identity(
                 graphiti,
                 episode_uuid=episode_uuid,
@@ -443,7 +480,11 @@ async def ingest_text_document(
                 claim_token=claim_token,
                 user_id=user_id,
                 origin_class=resolved_origin_class,
+                ingest_quality="degraded" if degraded else "complete",
+                content_sha256=hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
             )
+            if degraded:
+                degraded_chunks += 1
 
             try:
                 embedding = await get_embedding(chunk[: get_config().app.max_embedding_chars])
@@ -464,28 +505,27 @@ async def ingest_text_document(
                 warnings.append(f"Chunk {index}: embedding unavailable")
 
             added_count += 1
+        except UnconfirmedEpisodeIdentity:
+            skipped_count += 1
+            unconfirmed_existing += 1
+            warnings.append(f"Chunk {index}: matching episode identity unconfirmed; reconciliation required")
         except Exception as exc:  # noqa: BLE001
             if claim_token:
                 try:
-                    if episode_uuid:
-                        await mark_ingest_claim_failed(
-                            graphiti,
-                            group_id=group_id,
-                            fingerprint=chunk_fp,
-                            token=claim_token,
-                            error_type=type(exc).__name__,
-                        )
-                    else:
-                        await release_ingest_claim(
-                            graphiti,
-                            group_id=group_id,
-                            fingerprint=chunk_fp,
-                            token=claim_token,
-                        )
-                except Exception:  # preserve original ingest error
-                    logger.exception("Failed to settle ingest claim after chunk error")
-            logger.exception("Ingest chunk %d/%d failed", index, total_chunks)
-            errors.append(f"Chunk {index}: {type(exc).__name__}: {exc}")
+                    # A transport/provider error is not proof of non-persistence.
+                    # Keep the claim even if no upstream UUID was returned.
+                    await mark_ingest_claim_failed(
+                        graphiti, group_id=group_id, fingerprint=chunk_fp,
+                        token=claim_token, error_type=type(exc).__name__,
+                    )
+                except Exception:
+                    logger.error("Failed to record reconciliation requirement")
+            logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
+            if write_started:
+                unconfirmed_writes += 1
+                warnings.append(f"Chunk {index}: {type(exc).__name__}: write outcome unconfirmed")
+            else:
+                errors.append(f"Chunk {index}: {type(exc).__name__}")
 
         if job_id:
             update_upload_job(
@@ -496,26 +536,12 @@ async def ingest_text_document(
             )
 
     elapsed = perf_counter() - started
-    if errors and added_count == 0 and skipped_count == 0:
+    if errors and added_count == 0 and skipped_count == 0 and unconfirmed_writes == 0:
         status = "error"
-        stage = "error"
-    elif warnings or errors:
-        status = "ok"
-        stage = "done_with_warnings"
     else:
         status = "ok"
-        stage = "done"
 
     warnings.extend(errors)
-    if job_id:
-        update_upload_job(
-            job_id,
-            stage=stage,
-            total_chunks=total_chunks,
-            processed_chunks=total_chunks,
-            profile={"total_time": elapsed},
-            warnings=warnings,
-        )
 
     logger.info(
         "Document ingest complete source=%r group=%s origin=%s added=%d skipped=%d total=%d elapsed=%.3fs",
@@ -527,7 +553,7 @@ async def ingest_text_document(
         total_chunks,
         elapsed,
     )
-    return {
+    result = {
         "status": status,
         "added": added_count,
         "skipped": skipped_count,
@@ -538,23 +564,30 @@ async def ingest_text_document(
         "failed_chunks": len(errors),
         "skipped_existing": skipped_existing,
         "skipped_claim_held": skipped_claim_held,
+        "unconfirmed_existing": unconfirmed_existing,
+        "unconfirmed_writes": unconfirmed_writes,
         "completeness": _completeness(total_chunks, added_count, skipped_existing, len(errors),
-                                      degraded_chunks, skipped_claim_held),
+                                      degraded_chunks, skipped_claim_held, unconfirmed_existing + unconfirmed_writes),
         "origin_class": resolved_origin_class,
     }
+    if job_id:
+        from api.jobs import finish_upload_job
+        finish_upload_job(job_id, result, profile={"total_time": elapsed})
+    return result
 
 
 def _completeness(total: int, added: int, existing: int, failed: int, degraded: int,
-                  claim_held: int) -> str:
+                  claim_held: int, unconfirmed_existing: int = 0) -> str:
     """complete: every chunk confirmed stored (written now or already present), none degraded.
     unconfirmed: no chunk definitely failed or degraded here, but some (or all) are held by
     another in-flight writer, so this call can neither confirm nor deny them; also used when
     nothing was confirmed and at least one chunk is held elsewhere. failed: nothing confirmed
     and nothing held elsewhere. partial: some confirmed, some definitely failed/degraded."""
     confirmed = added + existing
-    if confirmed == total and not failed and not degraded and not claim_held:
+    uncertain = claim_held + unconfirmed_existing
+    if confirmed == total and not failed and not degraded and not uncertain:
         return "complete"
-    if claim_held and (confirmed == 0 or (not failed and not degraded)):
+    if uncertain and (confirmed == 0 or (not failed and not degraded)):
         return "unconfirmed"
     if confirmed == 0:
         return "failed"

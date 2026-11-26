@@ -119,7 +119,7 @@ async def test_parallel_documents_get_unique_ids_and_outcomes(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("second doc failed")
-        return {"status": "ok"}
+        return {"status": "ok", "completeness": "complete"}
 
     monkeypatch.setattr("knowledge.ingest.ingest_text_document", ingest)
     monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid: Mock())
@@ -172,10 +172,12 @@ async def test_ingest_honors_degraded_error_status():
     with (
         patch("knowledge.ingest.acquire_ingest_claim", new=AsyncMock(return_value="t")),
         patch("knowledge.ingest.mark_ingest_claim_episode_created", new=AsyncMock()),
-        patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()),
+        patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()) as finalize,
         patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),
     ):
         res = await ingest_text_document(g, "Short text", source_description="d")
     assert res["degraded_chunks"] == 1
+    assert finalize.await_args.kwargs["ingest_quality"] == "degraded"
+    assert res["completeness"] == "partial"
     assert any("DEGRADED_ERROR" in w and "1 entities" in w for w in res["warnings"])
     assert any("dropped 1 entities" in w for w in res["warnings"])
