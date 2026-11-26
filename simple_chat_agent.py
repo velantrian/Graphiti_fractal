@@ -20,8 +20,8 @@ from core.config import get_config
 from core.context_guard import build_context_receipt, degraded_context, recall_guard_fields
 from core.conversation_buffer import clear_user_buffer, get_user_conversation_buffer
 from core.erasure_guard import (
-    ErasureFenceChanged, read_erasure_state, require_erasure_state,
-    quarantine_unconfirmed_episode,
+    ErasureFenceChanged, live_previous_episode_uuids, read_erasure_state, require_erasure_state,
+    require_group_writable, quarantine_unconfirmed_episode,
 )
 from core.graphiti_client import get_write_semaphore
 from core.graphrag_policy import plan_retrieval
@@ -267,9 +267,9 @@ class SimpleChatAgent:
                           "episode_kind": "chat_turn", "is_correction": is_correction_text(conversation_text),
                           "summarized": False, **recall_guard_fields(context_receipt)},
             )
-            # Opaque summaries remain quarantined; don't spend a provider call
-            # to create an artifact that cannot be admitted to durable recall.
-            if turn_index % 10 == 0 and not expected_state[1]:
+            # A summary is admitted only if every source turn is still visible (finalize checks
+            # each one); an erasure elsewhere does not stop summaries.
+            if turn_index % 10 == 0:
                 await self._create_persisted_summary(conversation_id=conversation_id, end_turn_index=turn_index,
                                                      expected_state=expected_state)
             await require_erasure_state(graphiti, expected_state)
@@ -318,7 +318,13 @@ class SimpleChatAgent:
         async def write():
             async with semaphore:
                 await require_erasure_state(graphiti, expected_state)
-                return await graphiti.add_episode(name=name, episode_body=body, source_description="chat", reference_time=datetime.now(timezone.utc), group_id=get_config().memory.personal_group_id)
+                group = get_config().memory.personal_group_id
+                await require_group_writable(graphiti, group)
+                now = datetime.now(timezone.utc)
+                previous = await live_previous_episode_uuids(graphiti, group, now)
+                return await graphiti.add_episode(
+                    name=name, episode_body=body, source_description="chat", reference_time=now, group_id=group,
+                    **({} if previous is None else {"previous_episode_uuids": previous}))
         result = await with_rate_limit_retry(write, op_name=op_name, request_id=request_id)
         episode_uuid = _episode_uuid(result)
         if not episode_uuid:
@@ -330,8 +336,6 @@ class SimpleChatAgent:
                                          expected_state: tuple[int, bool]) -> None:
         graphiti = self.memory.graphiti
         await require_erasure_state(graphiti, expected_state)
-        if expected_state[1]:
-            return
         turns = await fetch_persisted_turn_window(
             graphiti, user_id=self.memory.user_id, conversation_id=conversation_id,
             end_turn_index=end_turn_index, window_size=10, wait_timeout=25.0,

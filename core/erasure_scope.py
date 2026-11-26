@@ -325,10 +325,11 @@ async def rebuild_area(graphiti, event_id: str | None = None) -> dict:
         await _commit(graphiti, rev0, prefix, "Entity", clear_ents)
 
         left = await _rows(graphiti, f"""
-            OPTIONAL MATCH (n) WHERE (n:Entity OR n:Community) AND {marked('n')}
+            OPTIONAL MATCH (n:Entity|Community) WHERE {marked('n')}
             WITH collect(DISTINCT n.group_id) AS g1
             OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE {marked('r')}
-            RETURN g1 + collect(DISTINCT r.group_id) AS groups""", p=prefix)
+            WITH g1, collect(DISTINCT r.group_id) AS g2
+            RETURN g1 + g2 AS groups""", p=prefix)
         groups = sorted({g for g in left[0]["groups"] if g})
         await graphiti.driver.execute_query(
             "MATCH (t:FractalErasure {event_id:$e}) SET t.blocked_groups=$g, "

@@ -43,6 +43,9 @@ async def _mark_l3_derived_origin(graphiti, episode_uuid: str) -> None:
 
 async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = None) -> str | None:
     """Synthesize one bounded non-authoritative profile with exact L2 lineage."""
+    # The revision observed BEFORE the L2 read follows the profile to its save: if anything is
+    # erased in the knowledge group meanwhile, ingest refuses the stale synthesis.
+    expected_revision, _ = await read_erasure_state(graphiti)
     l2_context, source_ids = await get_l2_semantic_context_with_sources(graphiti, entity_name)
     if not l2_context:
         logger.warning("No trusted L2 context for %r", entity_name)
@@ -91,6 +94,7 @@ async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = Non
         user_id=owner,
         group_id=resolve_group_id("knowledge"),
         origin_class="agent_derived",
+        expected_revision=expected_revision,
     )
     if result.get("status") != "ok" or result.get("completeness") != "complete":
         raise RuntimeError("L3 profile ingest not confirmed complete")

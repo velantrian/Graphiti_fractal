@@ -19,7 +19,8 @@ from tests.support import scenario_a_dataset as data
 from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker
 
 ROOT = Path(__file__).resolve().parents[2]
-CODE = {"main": os.environ.get("FRACTAL_SCENARIO_MAIN_ROOT"), "pr54": os.environ.get("FRACTAL_SCENARIO_PR54_ROOT")}
+CODE = {"main": os.environ.get("FRACTAL_SCENARIO_MAIN_ROOT"), "pr54": os.environ.get("FRACTAL_SCENARIO_PR54_ROOT"),
+        "variant_b": str(ROOT)}   # this tree
 
 pytestmark = pytest.mark.skipif(not all(CODE.values()),
                                 reason="set FRACTAL_SCENARIO_MAIN_ROOT and FRACTAL_SCENARIO_PR54_ROOT")
@@ -57,7 +58,7 @@ async def test_scenario_a_same_data_main_vs_pr54(indexes, variant):
         results[name] = _probe(code_root)
     print("SCENARIO_A " + json.dumps({"variant": variant, **results}, sort_keys=True))
     # Harness validity: with nothing deleted, main must see the data (otherwise the probe is blind).
-    main, pr54 = results["main"], results["pr54"]
+    main, pr54, vb = results["main"], results["pr54"], results["variant_b"]
     for letter in data.GROUPS:   # harness validity: main sees the data in every variant
         assert main["groups"][letter]["recall"] and main["groups"][letter]["knowledge_search"]
     if variant == "none":

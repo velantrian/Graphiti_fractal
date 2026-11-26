@@ -210,6 +210,10 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
                 return SimpleNamespace(records=[{"uuid": "l3-episode", "tainted_entities": 1}])
             raise AssertionError(f"unexpected query: {query}")
 
+    async def fake_state(graphiti):
+        return 7, False
+
+    monkeypatch.setattr(l3, "read_erasure_state", fake_state)   # the DB-backed revision read is covered live
     graphiti = SimpleNamespace(driver=Driver())
     monkeypatch.setattr(l3, "get_l2_semantic_context_with_sources", fake_l2)
     monkeypatch.setattr(l3, "llm_chat_response", fake_llm)
@@ -224,6 +228,7 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
     assert text == "Derived profile"
     assert ingest_kwargs["origin_class"] == "agent_derived"
     assert ingest_kwargs["group_id"] == "knowledge"
+    assert ingest_kwargs["expected_revision"] == 7   # revision observed before the L2 read
     assert ingest_kwargs["user_id"] == "owner"
 
     messages = captured["messages"]

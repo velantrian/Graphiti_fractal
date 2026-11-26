@@ -33,6 +33,7 @@ LOCK_ERASURE_CONTROL = """
 """
 
 OPEN_STATUSES = "['PENDING_SCOPE','SCOPED']"
+OPEN_TOMBSTONE = "(t.status IS NULL OR t.status IN " + OPEN_STATUSES + ")"   # callers bind `t` themselves
 
 _TOKEN = re.compile(r"[A-Za-z0-9Ѐ-ӿ][A-Za-z0-9Ѐ-ӿ_-]{4,}")
 
@@ -52,7 +53,7 @@ def _sub(template: str, alias: str) -> str:
 
 
 _DERIVED_KIND = """(@N:Episodic AND (
-    @N.episode_kind IN ['chat_turn','chat_summary'] OR @N.name IN ['chat_turn','chat_summary']
+    coalesce(@N.episode_kind,'') IN ['chat_turn','chat_summary'] OR coalesce(@N.name,'') IN ['chat_turn','chat_summary']
     OR coalesce(@N.source_description,'') = 'chat'
     OR coalesce(@N.source_description,'') STARTS WITH 'l3_profile:'))"""
 
@@ -61,14 +62,18 @@ _UNKNOWN_LINEAGE = """(""" + _DERIVED_KIND + """
     AND size(coalesce(@N.derived_source_ids,[])) = 0 AND size(coalesce(@N.recall_source_ids,[])) = 0
     AND size(coalesce(@N.summarized_turns,[])) = 0)"""
 
-_ORIGINAL = """(@N:Episodic AND @N.origin_class IN ['owner','untrusted','system']
+_ORIGINAL = """(@N:Episodic AND coalesce(@N.origin_class,'') IN ['owner','untrusted','system']
     AND coalesce(@N.recall_derived,false) = false
     AND size(coalesce(@N.derived_source_ids,[])) = 0 AND size(coalesce(@N.recall_source_ids,[])) = 0
     AND size(coalesce(@N.summarized_turns,[])) = 0 AND @N.provenance_id IS NULL
     AND NOT (""" + _DERIVED_KIND + """))"""
 
-_PENDING_GROUP = "EXISTS { MATCH (:FractalErasure {status:'PENDING_SCOPE', group_id:@N.group_id}) }"
-_PENDING_ANY = "EXISTS { MATCH (:FractalErasure {status:'PENDING_SCOPE'}) }"
+# A tombstone whose area is not (yet) computed: being scoped, or created without a lineage seed.
+# Fail closed for its own group's derived objects only.
+# (variable names inside EXISTS must not collide with the caller's, e.g. edge endpoints `t`)
+_UNSCOPED = "(fz_t.status IS NULL OR fz_t.status = 'PENDING_SCOPE')"
+_PENDING_GROUP = "EXISTS { MATCH (fz_t:FractalErasure {group_id:@N.group_id}) WHERE " + _UNSCOPED + " }"
+_PENDING_ANY = "EXISTS { MATCH (fz_t:FractalErasure) WHERE " + _UNSCOPED + " }"
 _ANY_TOMBSTONE = "EXISTS { MATCH (:FractalErasure) }"
 
 
@@ -124,7 +129,7 @@ async def read_erasure_state(graphiti) -> tuple[int, bool]:
     result = await graphiti.driver.execute_query(
         "OPTIONAL MATCH (c:FractalErasureControl {key:'global'}) "
         "WITH coalesce(c.revision,0) AS revision "
-        "RETURN revision, EXISTS { MATCH (t:FractalErasure) WHERE t.status IN " + OPEN_STATUSES + " } AS open"
+        "RETURN revision, EXISTS { MATCH (t:FractalErasure) WHERE " + OPEN_TOMBSTONE + " } AS open"
     )
     if len(result.records) != 1:
         raise RuntimeError("erasure state unavailable or ambiguous")
@@ -177,7 +182,7 @@ async def require_group_writable(graphiti, group_id: str) -> None:
     them at read time does not help. Other groups are unaffected.
     """
     result = await graphiti.driver.execute_query(
-        "OPTIONAL MATCH (t:FractalErasure) WHERE t.status IN " + OPEN_STATUSES
+        "OPTIONAL MATCH (t:FractalErasure) WHERE " + OPEN_TOMBSTONE
         + " AND $g IN coalesce(t.blocked_groups, [t.group_id]) RETURN count(t) AS n",
         g=group_id,
     )
