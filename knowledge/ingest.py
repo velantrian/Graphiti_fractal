@@ -76,6 +76,7 @@ async def episode_exists(
         """
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
+          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
           AND ($group_id IS NULL OR e.group_id = $group_id)
           AND (e.fingerprint = $fp OR e.content = $content)
         OPTIONAL MATCH (c:FractalIngestClaim)

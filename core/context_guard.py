@@ -104,6 +104,7 @@ async def persist_recall_guard_metadata(
         SET e.recall_derived=$recall_derived,
             e.recall_context_sha256=$context_sha256,
             e.recall_query_sha256=$query_sha256,
+            e.recall_source_ids=$source_ids,
             e.recall_guard_authoritative=false
         RETURN e.uuid AS uuid
         """,
@@ -111,6 +112,7 @@ async def persist_recall_guard_metadata(
         recall_derived=derived,
         context_sha256=digest,
         query_sha256=query_hash,
+        source_ids=list(context_receipt.source_ids) if derived and context_receipt else [],
     )
     if not result.records:
         raise LookupError(f"episode not found for recall guard metadata: {episode_uuid}")

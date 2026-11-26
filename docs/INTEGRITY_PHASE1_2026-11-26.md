@@ -30,3 +30,7 @@ Exact-head CI and independent live Neo4j validation required. Do not run destruc
 - MemoryOps rechecks candidate UUID/kind/namespace after Graphiti search. After erasure or legacy soft deletion, opaque entity/edge/community summaries, unknown-origin and derived episodes are globally quarantined. Explicit original owner/untrusted/system episodes without known derivation markers remain eligible. No automatic quarantine lift; this is an intentional availability trade-off.
 - Provider-free live test uses stale Graphiti-shaped candidates against Neo4j; not actual Graphiti provider E2E. Test-only admission fixtures are isolated from the dedicated erasure tests.
 - Remaining: all other reader/writer surfaces, RAM, upstream transaction fencing, historic hard-deletes, backups, verified rebuild. Not full erasure safety.
+
+### Phase 2B surface wiring
+
+HTTP/MCP share deletion; local owner buffers cleared. Knowledge, L2/L3, legacy context, conflict diagnosis and visualization respect quarantine. Cached HTTP export denied during quarantine. Online clear-all returns 409 after authorization/confirmation because a distributed write fence is absent. Existing export files/backups are not scrubbed. Other-process RAM and in-flight writes remain unresolved; no full erasure guarantee.

@@ -243,6 +243,7 @@ async def finalize_episode_identity(
         MATCH (c:FractalIngestClaim {claim_key:$claim_key, token:$claim_token, state:'PENDING'})
         WHERE c.episode_uuid=$episode_uuid
           AND coalesce(e.deleted,false)=false
+          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
             e.origin_class=$origin_class,

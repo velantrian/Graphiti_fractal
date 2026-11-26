@@ -91,8 +91,8 @@ async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = Non
         group_id=resolve_group_id("knowledge"),
         origin_class="agent_derived",
     )
-    if result.get("status") != "ok":
-        raise RuntimeError(f"L3 profile ingest failed: {result}")
+    if result.get("status") != "ok" or result.get("completeness") != "complete":
+        raise RuntimeError("L3 profile ingest not confirmed complete")
 
     # Resolve and repair metadata on every build, including a deduplicated replay.
     # This closes the old gap where a failed provenance update could never be repaired
@@ -148,6 +148,10 @@ async def get_l3_fractal_context(graphiti, entity_name: str) -> str:
         MATCH (e:Episodic)
         WHERE e.source_description=$source
           AND coalesce(e.deleted, false)=false
+          AND e.origin_class='agent_derived'
+          AND size(coalesce(e.derived_source_ids,[])) > 0
+          AND NOT EXISTS { MATCH (:FractalErasure) }
+          AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
         RETURN coalesce(e.content, e.episode_body, '') AS content,
                coalesce(e.created_at, e.valid_at) AS created_at
         ORDER BY coalesce(e.created_at, e.valid_at) DESC

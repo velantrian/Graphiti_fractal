@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.config import get_config
+from core.erasure_guard import ERASURE_PRESENT, ORIGINAL_EPISODE
 from core.memory_import import IMPORT_GROUP_ID
 
 
@@ -31,8 +32,10 @@ async def search_knowledge(
           CALL db.index.fulltext.queryNodes('episode_content', $q) YIELD node, score
           RETURN node, score, 'Episodic' AS kind
         }
-        WITH node, score, kind
+        WITH node, score, kind, node AS n
         WHERE coalesce(node.deleted,false) = false
+          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:node.uuid}) }
+          AND (NOT """ + ERASURE_PRESENT + """ OR """ + ORIGINAL_EPISODE + """)
           AND (node.group_id IS NULL OR node.group_id <> $experience_group_id)
           AND (
             $group_id = $imports_group_id

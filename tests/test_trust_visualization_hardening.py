@@ -195,7 +195,7 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
 
     async def fake_ingest(graphiti, text, **kwargs):
         captured["ingest"] = (text, kwargs)
-        return {"status": "ok", "added": 0, "skipped": 1, "warnings": []}
+        return {"status": "ok", "completeness": "complete", "added": 0, "skipped": 1, "warnings": []}
 
     async def fake_persist(graphiti, episode_uuid, metadata):
         captured["persist"] = (episode_uuid, metadata)

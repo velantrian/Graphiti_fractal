@@ -73,6 +73,8 @@ async def get_l2_semantic_context_with_sources(
     MATCH (matched:Entity)
     WHERE toLower(matched.name) CONTAINS toLower($name)
       AND coalesce(matched.deleted, false) = false
+      AND NOT EXISTS { MATCH (:FractalErasure) }
+      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
       AND matched.group_id IN $allowed_groups
     MATCH (c:Community)-[:HAS_MEMBER]->(matched)
     WHERE coalesce(c.deleted, false) = false

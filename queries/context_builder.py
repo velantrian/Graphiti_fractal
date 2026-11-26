@@ -84,6 +84,8 @@ async def build_agent_context(graphiti, entity_name: str, context_size: str = "f
     fetch_query = """
     MATCH (n)
     WHERE n.uuid IN $uuids
+      AND NOT EXISTS { MATCH (:FractalErasure) }
+      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
     RETURN n.uuid as uuid,
            labels(n) as labels,
            n.name as name,
