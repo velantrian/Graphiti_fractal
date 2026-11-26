@@ -11,17 +11,11 @@ permissions:
 jobs:
   neo4j-operational-contracts:
     runs-on: ubuntu-latest
-    services:
-      neo4j:
-        image: neo4j:5.26.29-community
-        env:
-          NEO4J_AUTH: neo4j/fractal-test-password
-        ports:
-          - 7687:7687
+    # No service container and no NEO4J_* here: scripts/test_neo4j.py starts
+    # disposable containers with random credentials and a per-run marker, the
+    # same admission path as `make test-integration` on a developer machine.
     env:
-      NEO4J_URI: bolt://127.0.0.1:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: fractal-test-password
+      FRACTAL_TEST_NEO4J_IMAGE: neo4j:5.26.29-community
     steps:
       - name: Checkout exact validation target
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,8 +50,9 @@ jobs:
 
       - name: Compile integration surface
         run: |
-          python -m compileall -q core tests/integration
+          python -m compileall -q core tests/integration tests/isolation tests/support scripts/test_neo4j.py
 
-      - name: Run provider-free live Neo4j contracts
+      - name: Live Neo4j contracts on an admitted disposable database, then decoy rejection
         run: |
-          python -m pytest -q tests/integration/test_neo4j_operational_contracts.py
+          python scripts/test_neo4j.py acceptance \
+            --target tests/integration/test_neo4j_operational_contracts.py

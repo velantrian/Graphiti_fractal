@@ -1,0 +1,284 @@
+"""Admission guard for disposable Neo4j test databases.
+
+A test process may mutate a Neo4j database only after it has proven, with a
+read-only query, that the database is the disposable resource provisioned for
+*this* run:
+
+* Test configuration comes only from ``FRACTAL_TEST_NEO4J_*`` and
+  ``FRACTAL_TEST_RUN_ID``. Runtime ``NEO4J_*`` variables and ``.env`` are never
+  used as a fallback.
+* Test infrastructure (``scripts/test_neo4j.py``) creates exactly one
+  ``(:FractalTestDatabase {run_id, purpose})`` marker, and only in a database
+  that is empty (no nodes, no constraints, no non-lookup indexes). A database
+  that already holds data can therefore never be marked by the tooling.
+* Test code only *reads* the marker, in a READ_ACCESS session, which Neo4j
+  enforces server-side (``Neo.ClientError.Statement.AccessMode``).
+* Full-graph cleanup re-verifies the marker and keeps the marker node, so the
+  proof survives every reset and every ``finally`` block.
+
+Admission must happen before a Graphiti client is constructed: graphiti_core's
+``Neo4jDriver.__init__`` schedules ``build_indices_and_constraints()`` as soon
+as it is created inside a running event loop.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping
+
+from neo4j import READ_ACCESS, WRITE_ACCESS
+
+MARKER_LABEL = "FractalTestDatabase"
+MARKER_PURPOSE = "disposable-integration-test"
+
+ENV_URI = "FRACTAL_TEST_NEO4J_URI"
+ENV_USER = "FRACTAL_TEST_NEO4J_USER"
+ENV_PASSWORD = "FRACTAL_TEST_NEO4J_PASSWORD"
+ENV_DATABASE = "FRACTAL_TEST_NEO4J_DATABASE"
+ENV_RUN_ID = "FRACTAL_TEST_RUN_ID"
+# Set by CI and scripts/test_neo4j.py: a missing test database is an error,
+# not a silent skip.
+ENV_REQUIRE = "FRACTAL_REQUIRE_TEST_NEO4J"
+
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{24,128}$")
+
+MARKER_QUERY = (
+    f"MATCH (m:{MARKER_LABEL}) "
+    "RETURN m.run_id AS run_id, m.purpose AS purpose"
+)
+
+# Executed only after a successful read-only admission. The marker condition is
+# repeated inside the write transaction, and the marker itself is never deleted.
+RESET_QUERY = f"""
+MATCH (m:{MARKER_LABEL} {{run_id:$run_id, purpose:$purpose}})
+WITH count(m) AS markers
+WHERE markers = 1
+CALL () {{
+    MATCH (n) WHERE NOT n:{MARKER_LABEL}
+    DETACH DELETE n
+}}
+RETURN markers
+"""
+
+PROVISION_QUERY = f"""
+CALL () {{ MATCH (n) RETURN count(n) AS existing }}
+WITH existing
+WHERE existing = 0
+CREATE (m:{MARKER_LABEL} {{
+    run_id:$run_id,
+    purpose:$purpose,
+    created_at:datetime(),
+    provisioned_by:'scripts/test_neo4j.py'
+}})
+RETURN m.run_id AS run_id
+"""
+
+
+class IsolationNotConfigured(RuntimeError):
+    """No disposable test database was configured for this process."""
+
+
+class IsolationRejected(RuntimeError):
+    """The configured database is not the disposable resource of this run."""
+
+
+@dataclass(frozen=True)
+class IsolatedNeo4jSettings:
+    uri: str
+    user: str
+    password: str = field(repr=False)
+    database: str
+    run_id: str
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "IsolatedNeo4jSettings":
+        env = os.environ if environ is None else environ
+        required = (ENV_URI, ENV_USER, ENV_PASSWORD, ENV_RUN_ID)
+        missing = [name for name in required if not env.get(name)]
+        if missing:
+            raise IsolationNotConfigured(
+                "isolated test Neo4j is not configured (missing "
+                + ", ".join(missing)
+                + "); runtime NEO4J_* settings are never used by tests. "
+                "Run `make test-integration` to start a disposable database."
+            )
+        run_id = env[ENV_RUN_ID]
+        if not RUN_ID_PATTERN.match(run_id):
+            raise IsolationRejected(
+                f"{ENV_RUN_ID} must be a random token of 24-128 [A-Za-z0-9_-] characters"
+            )
+        return cls(
+            uri=env[ENV_URI],
+            user=env[ENV_USER],
+            password=env[ENV_PASSWORD],
+            database=env.get(ENV_DATABASE) or "neo4j",
+            run_id=run_id,
+        )
+
+    def runtime_environment(self) -> dict[str, str]:
+        """NEO4J_* values for application code, valid only after admission."""
+        return {
+            "NEO4J_URI": self.uri,
+            "NEO4J_USER": self.user,
+            "NEO4J_PASSWORD": self.password,
+            "NEO4J_DATABASE": self.database,
+        }
+
+
+def require_test_database() -> bool:
+    return os.environ.get(ENV_REQUIRE) == "1"
+
+
+def _field(record: Any, key: str) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(key)
+    return record[key]
+
+
+def check_marker_records(records: Iterable[Any], settings: IsolatedNeo4jSettings) -> None:
+    rows = list(records)
+    if not rows:
+        raise IsolationRejected(
+            f"no {MARKER_LABEL} marker in database {settings.database!r} at {settings.uri}; "
+            "refusing to use a database that test infrastructure did not provision"
+        )
+    if len(rows) != 1:
+        raise IsolationRejected(
+            f"expected exactly one {MARKER_LABEL} marker, found {len(rows)}; refusing ambiguous database"
+        )
+    run_id = _field(rows[0], "run_id")
+    purpose = _field(rows[0], "purpose")
+    if purpose != MARKER_PURPOSE:
+        raise IsolationRejected(f"marker purpose {purpose!r} is not {MARKER_PURPOSE!r}")
+    if run_id != settings.run_id:
+        raise IsolationRejected(
+            f"marker belongs to another run; {ENV_RUN_ID} does not match the database marker"
+        )
+
+
+# --- read-only admission -----------------------------------------------------
+
+def verify_marker_sync(driver: Any, settings: IsolatedNeo4jSettings) -> None:
+    with driver.session(database=settings.database, default_access_mode=READ_ACCESS) as session:
+        records = list(session.run(MARKER_QUERY))
+    check_marker_records(records, settings)
+
+
+async def verify_marker_async(driver: Any, settings: IsolatedNeo4jSettings) -> None:
+    async with driver.session(database=settings.database, default_access_mode=READ_ACCESS) as session:
+        result = await session.run(MARKER_QUERY)
+        records = [record async for record in result]
+    check_marker_records(records, settings)
+
+
+def wait_until_reachable_sync(driver: Any, uri: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            driver.verify_connectivity()
+            return
+        except Exception as exc:  # noqa: BLE001 - readiness probe only, no writes
+            if time.monotonic() >= deadline:
+                raise IsolationRejected(f"test Neo4j at {uri} not reachable: {type(exc).__name__}")
+            time.sleep(1)
+
+
+def admit_sync(settings: IsolatedNeo4jSettings, *, timeout: float = 60.0) -> None:
+    """Open a throwaway sync driver, wait for readiness, verify the marker, close."""
+    from neo4j import GraphDatabase
+
+    driver = GraphDatabase.driver(settings.uri, auth=(settings.user, settings.password))
+    try:
+        wait_until_reachable_sync(driver, settings.uri, timeout)
+        verify_marker_sync(driver, settings)
+    finally:
+        driver.close()
+
+
+async def open_admitted_async_driver(settings: IsolatedNeo4jSettings, *, timeout: float = 60.0):
+    """Return an AsyncDriver whose own connection pool has passed admission."""
+    from neo4j import AsyncGraphDatabase
+
+    driver = AsyncGraphDatabase.driver(settings.uri, auth=(settings.user, settings.password))
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                await driver.verify_connectivity()
+                break
+            except Exception as exc:  # noqa: BLE001
+                if time.monotonic() >= deadline:
+                    raise IsolationRejected(
+                        f"test Neo4j at {settings.uri} not reachable: {type(exc).__name__}"
+                    )
+                await asyncio.sleep(1)
+        await verify_marker_async(driver, settings)
+    except BaseException:
+        await driver.close()
+        raise
+    return driver
+
+
+# --- guarded mutation --------------------------------------------------------
+
+async def reset_test_graph(driver: Any, settings: IsolatedNeo4jSettings) -> None:
+    """Delete every node except the marker, after re-verifying admission."""
+    await verify_marker_async(driver, settings)
+    async with driver.session(database=settings.database, default_access_mode=WRITE_ACCESS) as session:
+        result = await session.run(RESET_QUERY, run_id=settings.run_id, purpose=MARKER_PURPOSE)
+        records = [record async for record in result]
+    if len(records) != 1:
+        raise IsolationRejected("marker disappeared before reset; nothing was deleted")
+
+
+# --- infrastructure only -----------------------------------------------------
+
+def describe_contents_sync(driver: Any, database: str = "neo4j") -> dict[str, Any]:
+    """Read-only inventory used for provisioning and acceptance snapshots."""
+    with driver.session(database=database, default_access_mode=READ_ACCESS) as session:
+        nodes = [
+            {"labels": sorted(r["labels"]), "properties": _jsonable(r["properties"])}
+            for r in session.run("MATCH (n) RETURN labels(n) AS labels, properties(n) AS properties")
+        ]
+        rels = [
+            {"type": r["type"], "properties": _jsonable(r["properties"])}
+            for r in session.run("MATCH ()-[r]->() RETURN type(r) AS type, properties(r) AS properties")
+        ]
+        constraints = sorted(r["name"] for r in session.run("SHOW CONSTRAINTS YIELD name RETURN name"))
+        indexes = sorted(
+            r["name"]
+            for r in session.run("SHOW INDEXES YIELD name, type WHERE type <> 'LOOKUP' RETURN name")
+        )
+    nodes.sort(key=repr)
+    rels.sort(key=repr)
+    return {"nodes": nodes, "relationships": rels, "constraints": constraints, "indexes": indexes}
+
+
+def provision_marker_sync(driver: Any, *, run_id: str, database: str = "neo4j") -> None:
+    """Mark a *fresh, empty* database as this run's disposable test resource."""
+    if not RUN_ID_PATTERN.match(run_id):
+        raise IsolationRejected("run id must be a random token of 24-128 characters")
+    contents = describe_contents_sync(driver, database)
+    if contents["nodes"] or contents["relationships"] or contents["constraints"] or contents["indexes"]:
+        raise IsolationRejected(
+            "refusing to provision a non-empty database "
+            f"({len(contents['nodes'])} nodes, {len(contents['constraints'])} constraints, "
+            f"{len(contents['indexes'])} indexes); only a fresh disposable database can be marked"
+        )
+    with driver.session(database=database, default_access_mode=WRITE_ACCESS) as session:
+        records = list(session.run(PROVISION_QUERY, run_id=run_id, purpose=MARKER_PURPOSE))
+    if len(records) != 1:
+        raise IsolationRejected("database stopped being empty during provisioning; no marker created")
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
