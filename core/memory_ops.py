@@ -44,9 +44,10 @@ def _score(scores: list, index: int, default: float) -> float:
     return default
 
 
-def _identity(item: Any, *, prefix: str, scope: str, index: int) -> str:
+def _identity(item: Any) -> str | None:
+    """Missing source identity is not evidence; never fabricate a UUID."""
     value = getattr(item, "uuid", None)
-    return str(value) if value else f"{prefix}:{scope}:{index}"
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _merge_best(target: dict[str, dict], item: dict) -> None:
@@ -74,6 +75,7 @@ class MemoryOps:
         source_description: str = "ingest_pipeline",
         memory_type: str = "knowledge",
         group_id: Optional[str] = None,
+        origin_class: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Delegate to the canonical Graphiti-native ingestion path."""
         target_group = group_id or resolve_group_id(memory_type)
@@ -83,6 +85,7 @@ class MemoryOps:
             source_description=source_description,
             user_id=self.user_id,
             group_id=target_group,
+            origin_class=origin_class,
         )
 
     async def remember_text(
@@ -91,6 +94,7 @@ class MemoryOps:
         *,
         memory_type: Optional[str] = None,
         source_description: Optional[str] = None,
+        origin_class: Optional[str] = None,
     ) -> Dict[str, Any]:
         cleaned = text.strip()
         if not cleaned:
@@ -104,8 +108,9 @@ class MemoryOps:
             cleaned,
             source_description=source_description or "memory_ops",
             memory_type=routed_type,
+            origin_class=origin_class,
         )
-        if result.get("status") == "ok":
+        if result.get("completeness") == "complete":
             max_size = get_config().app.recent_memories_max_size
             if max_size > 0:
                 memories = _recent_memories.setdefault(self.user_id, deque(maxlen=max_size))
@@ -241,8 +246,11 @@ class MemoryOps:
                     if correction:
                         score += 0.5
                     created = normalize_dt(getattr(episode, "created_at", None))
+                    source_uuid = _identity(episode)
+                    if source_uuid is None:
+                        continue
                     item = {
-                        "uuid": _identity(episode, prefix="episode", scope=scope, index=index),
+                        "uuid": source_uuid,
                         "content": str(content)[:8000],
                         "name": getattr(episode, "name", "Episode") or "Episode",
                         "score": score,
@@ -259,8 +267,11 @@ class MemoryOps:
             node_scores = getattr(result, "node_reranker_scores", []) or []
             if include_entities:
                 for index, node in enumerate(raw_nodes):
+                    source_uuid = _identity(node)
+                    if source_uuid is None:
+                        continue
                     item = {
-                        "uuid": _identity(node, prefix="entity", scope=scope, index=index),
+                        "uuid": source_uuid,
                         "name": getattr(node, "name", "") or "",
                         "summary": getattr(node, "summary", "") or "",
                         "score": _score(node_scores, index, 0.7),
@@ -272,8 +283,11 @@ class MemoryOps:
             raw_edges = getattr(result, "edges", []) or []
             edge_scores = getattr(result, "edge_reranker_scores", []) or []
             for index, edge in enumerate(raw_edges):
+                source_uuid = _identity(edge)
+                if source_uuid is None:
+                    continue
                 item = {
-                    "uuid": _identity(edge, prefix="edge", scope=scope, index=index),
+                    "uuid": source_uuid,
                     "fact": getattr(edge, "fact", "") or "",
                     "subject": getattr(edge, "subject", None)
                     or getattr(edge, "source_name", None),
@@ -292,8 +306,11 @@ class MemoryOps:
             raw_communities = getattr(result, "communities", []) or []
             community_scores = getattr(result, "community_reranker_scores", []) or []
             for index, community in enumerate(raw_communities):
+                source_uuid = _identity(community)
+                if source_uuid is None:
+                    continue
                 item = {
-                    "uuid": _identity(community, prefix="community", scope=scope, index=index),
+                    "uuid": source_uuid,
                     "name": getattr(community, "name", "") or "",
                     "summary": getattr(community, "summary", "") or "",
                     "score": _score(community_scores, index, 0.4),

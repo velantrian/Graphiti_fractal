@@ -63,7 +63,7 @@ def _outcome(status: str, episode_uuid, exc) -> dict:
             "error": None if exc is None else f"{type(exc).__name__}: {exc}"}
 
 
-_DOC_COUNTERS = ("chunks", "added", "skipped_existing", "skipped_claim_held", "failed_chunks", "degraded_chunks")
+_DOC_COUNTERS = ("chunks", "added", "skipped_existing", "skipped_claim_held", "unconfirmed_existing", "failed_chunks", "degraded_chunks")
 
 
 def _document_outcome(result) -> dict:
@@ -71,8 +71,8 @@ def _document_outcome(result) -> dict:
     if not isinstance(result, dict):
         return {**_outcome(PERSIST_UNKNOWN, None, None), "error": "ingest returned no summary"}
     completeness = result.get("completeness")
-    if completeness is None:  # legacy summary without counters: only "error" is definite
-        status = PERSIST_FAILED if result.get("status") == "error" else PERSIST_PERSISTED
+    if completeness is None:  # legacy summary cannot confirm persistence
+        status = PERSIST_FAILED if result.get("status") == "error" else PERSIST_UNKNOWN
     else:
         status = {"complete": PERSIST_PERSISTED, "partial": PERSIST_PARTIAL, "failed": PERSIST_FAILED,
                   "unconfirmed": PERSIST_UNCONFIRMED}.get(
@@ -282,7 +282,7 @@ class SimpleChatAgent:
         semaphore = get_write_semaphore()
         async def write():
             async with semaphore:
-                return await graphiti.add_episode(name=name, episode_body=body, source_description="chat", reference_time=datetime.now(timezone.utc), group_id="personal")
+                return await graphiti.add_episode(name=name, episode_body=body, source_description="chat", reference_time=datetime.now(timezone.utc), group_id=get_config().memory.personal_group_id)
         result = await with_rate_limit_retry(write, op_name=op_name, request_id=request_id)
         episode_uuid = _episode_uuid(result)
         if not episode_uuid:
@@ -328,7 +328,7 @@ class SimpleChatAgent:
         self.last_persist_id = doc_persist_id
         async def store_document():
             try:
-                result = await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id="personal")
+                result = await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id=get_config().memory.personal_group_id)
                 outcome = _document_outcome(result)
             except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                 self._record_persist_outcome(doc_persist_id, _outcome(PERSIST_UNKNOWN, None, exc))

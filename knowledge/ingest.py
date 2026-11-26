@@ -58,27 +58,47 @@ async def _resolve_episode_uuid(
     return str(uuids[0])
 
 
+class UnconfirmedEpisodeIdentity(RuntimeError):
+    """Matching episode exists but its ingest identity is not confirmed."""
+
+
 async def episode_exists(
-    graphiti,
-    fp: str,
-    content: str,
-    group_id: str | None = None,
+    graphiti, fp: str, content: str, group_id: str | None = None, *,
+    origin_class: str | None = None, user_id: str | None = None,
 ) -> bool:
-    """Check exact duplicate identity, scoped to group_id when supplied."""
+    """Confirm exact content, committed claim, origin and requested authorship.
+
+    Legacy, orphaned and normalization-colliding records require reconciliation,
+    not an automatic rewrite or a success receipt.
+    """
     result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic)
         WHERE coalesce(e.deleted, false) = false
           AND ($group_id IS NULL OR e.group_id = $group_id)
           AND (e.fingerprint = $fp OR e.content = $content)
-        RETURN e.uuid AS uuid
-        LIMIT 1
+        OPTIONAL MATCH (c:FractalIngestClaim)
+        WHERE c.group_id = e.group_id AND c.fingerprint = e.fingerprint
+          AND c.episode_uuid = e.uuid AND c.state = 'COMMITTED'
+        WITH e, count(c) AS committed
+        RETURN e.uuid AS uuid,
+               coalesce(committed > 0 AND e.content = $content AND e.fingerprint = $fp
+                AND e.origin_class IN ['owner','agent_derived','untrusted','system']
+                AND ($origin_class IS NULL OR e.origin_class = $origin_class)
+                AND ($user_id IS NULL OR EXISTS {
+                    MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e)
+                }), false) AS confirmed
+        ORDER BY confirmed DESC
+        LIMIT 2
         """,
-        fp=fp,
-        content=content,
-        group_id=group_id,
+        fp=fp, content=content, group_id=group_id,
+        origin_class=origin_class, user_id=user_id,
     )
-    return bool(result.records)
+    if not result.records:
+        return False
+    if any(record.get("confirmed") is True for record in result.records):
+        return True
+    raise UnconfirmedEpisodeIdentity("matching episode identity unconfirmed; reconciliation required")
 
 
 async def find_similar_episode(
@@ -335,6 +355,7 @@ async def ingest_text_document(
     skipped_count = 0
     skipped_existing = 0
     skipped_claim_held = 0
+    unconfirmed_existing = 0
     reference_time = datetime.now(timezone.utc)
     semaphore = get_write_semaphore()
 
@@ -367,7 +388,8 @@ async def ingest_text_document(
         episode_uuid: str | None = None
 
         try:
-            if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id):
+            if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id,
+                                    origin_class=resolved_origin_class, user_id=user_id):
                 skipped_count += 1
                 skipped_existing += 1
                 if job_id:
@@ -464,6 +486,10 @@ async def ingest_text_document(
                 warnings.append(f"Chunk {index}: embedding unavailable")
 
             added_count += 1
+        except UnconfirmedEpisodeIdentity:
+            skipped_count += 1
+            unconfirmed_existing += 1
+            warnings.append(f"Chunk {index}: matching episode identity unconfirmed; reconciliation required")
         except Exception as exc:  # noqa: BLE001
             if claim_token:
                 try:
@@ -498,24 +524,10 @@ async def ingest_text_document(
     elapsed = perf_counter() - started
     if errors and added_count == 0 and skipped_count == 0:
         status = "error"
-        stage = "error"
-    elif warnings or errors:
-        status = "ok"
-        stage = "done_with_warnings"
     else:
         status = "ok"
-        stage = "done"
 
     warnings.extend(errors)
-    if job_id:
-        update_upload_job(
-            job_id,
-            stage=stage,
-            total_chunks=total_chunks,
-            processed_chunks=total_chunks,
-            profile={"total_time": elapsed},
-            warnings=warnings,
-        )
 
     logger.info(
         "Document ingest complete source=%r group=%s origin=%s added=%d skipped=%d total=%d elapsed=%.3fs",
@@ -527,7 +539,7 @@ async def ingest_text_document(
         total_chunks,
         elapsed,
     )
-    return {
+    result = {
         "status": status,
         "added": added_count,
         "skipped": skipped_count,
@@ -538,23 +550,29 @@ async def ingest_text_document(
         "failed_chunks": len(errors),
         "skipped_existing": skipped_existing,
         "skipped_claim_held": skipped_claim_held,
+        "unconfirmed_existing": unconfirmed_existing,
         "completeness": _completeness(total_chunks, added_count, skipped_existing, len(errors),
-                                      degraded_chunks, skipped_claim_held),
+                                      degraded_chunks, skipped_claim_held, unconfirmed_existing),
         "origin_class": resolved_origin_class,
     }
+    if job_id:
+        from api.jobs import finish_upload_job
+        finish_upload_job(job_id, result, profile={"total_time": elapsed})
+    return result
 
 
 def _completeness(total: int, added: int, existing: int, failed: int, degraded: int,
-                  claim_held: int) -> str:
+                  claim_held: int, unconfirmed_existing: int = 0) -> str:
     """complete: every chunk confirmed stored (written now or already present), none degraded.
     unconfirmed: no chunk definitely failed or degraded here, but some (or all) are held by
     another in-flight writer, so this call can neither confirm nor deny them; also used when
     nothing was confirmed and at least one chunk is held elsewhere. failed: nothing confirmed
     and nothing held elsewhere. partial: some confirmed, some definitely failed/degraded."""
     confirmed = added + existing
-    if confirmed == total and not failed and not degraded and not claim_held:
+    uncertain = claim_held + unconfirmed_existing
+    if confirmed == total and not failed and not degraded and not uncertain:
         return "complete"
-    if claim_held and (confirmed == 0 or (not failed and not degraded)):
+    if uncertain and (confirmed == 0 or (not failed and not degraded)):
         return "unconfirmed"
     if confirmed == 0:
         return "failed"

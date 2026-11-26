@@ -119,7 +119,7 @@ async def test_parallel_documents_get_unique_ids_and_outcomes(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("second doc failed")
-        return {"status": "ok"}
+        return {"status": "ok", "completeness": "complete"}
 
     monkeypatch.setattr("knowledge.ingest.ingest_text_document", ingest)
     monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid: Mock())

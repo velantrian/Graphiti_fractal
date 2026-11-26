@@ -117,6 +117,7 @@ class TestMemoryOps:
             "test text",
             source_description="memory_ops",
             memory_type="personal",
+            origin_class=None,
         )
 
     @pytest.mark.asyncio

@@ -64,7 +64,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="memory.remember",
-        description="Добавить текст в память владельца FRACTAL_USER_ID.",
+        description="Добавить неавторитетный текст AI-агента в память экземпляра FRACTAL_USER_ID.",
         input_schema={
             "type": "object",
             "properties": {
@@ -81,7 +81,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="memory.upload",
-        description="Загрузить текстовый документ от владельца FRACTAL_USER_ID.",
+        description="Загрузить документ AI-агента в память экземпляра FRACTAL_USER_ID.",
         input_schema={
             "type": "object",
             "properties": {
@@ -243,6 +243,7 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             text,
             memory_type=args.get("memory_type"),
             source_description=str(args.get("source_description") or "mcp_remember"),
+            origin_class="agent_derived",
         )
 
     if name == "memory.upload":
@@ -259,6 +260,7 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             source_description=str(args.get("source_description") or "mcp_upload"),
             user_id=owner,
             group_id=resolve_group_id(memory_type),
+            origin_class="agent_derived",
         )
 
     if name == "memory.delete":

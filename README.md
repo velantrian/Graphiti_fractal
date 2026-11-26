@@ -471,7 +471,7 @@ External test, который был skipped из-за отсутствующе�
 
 - ⚠️ **404 ≠ успех.** 404 значит «id неизвестен или вытеснен» (registry in-memory, bounded LRU на 1000 записей, теряется при рестарте). Это не подтверждение записи.
 - 📥 Ingest длинных документов возвращает `degraded_chunks` — число чанков, сохранённых в деградированном режиме; `> 0` означает неполное качество извлечения, а не чистый успех.
-- UI пока не опрашивает этот endpoint; это делают клиенты/операторы вручную.
+- UI опрашивает этот endpoint ограниченное время; 404, таймаут или неизвестный статус не считаются успешным сохранением.
 - 📄 Длинный документ больше не помечается `persisted`, если часть чанков не сохранилась: статус берётся из `completeness` ingest (`complete` → `persisted`, `partial` → `partial`, `unconfirmed` → `unconfirmed`, `failed` → `failed`, нет сводки → `unknown`), а запись несёт счётчики `chunks` (`added`, `skipped_existing`, `skipped_claim_held`, `failed_chunks`, `degraded_chunks`). `skipped_claim_held` — чанк пишет другой процесс, этим вызовом не подтверждён: если других ошибок нет (или ничего не подтверждено), статус `unconfirmed`, а не `failed`. Legacy-поле `status` ingest по-прежнему `ok` при частичном результате — смотрите `completeness`.
 
 ### 🔄 Что теряется при перезапуске (registry в памяти)
@@ -490,7 +490,7 @@ External test, который был skipped из-за отсутствующе�
 ## ⚠️ Честные ограничения
 
 - 🏠 система намеренно local/single-owner, не multi-user SaaS;
-- 📥 applied imports остаются isolated/untrusted;
+- 📥 applied imports остаются isolated/untrusted; MCP-записи классифицируются как `agent_derived`, а не как подтверждённые владельцем;
 - 🔁 automatic durable promotion writer не активирован;
 - 🧪 consolidation остаётся preview-first;
 - 🤖 first-class provider path пока OpenAI;

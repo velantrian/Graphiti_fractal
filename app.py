@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from api.jobs import cleanup_old_jobs, create_upload_job, get_upload_job, update_upload_job
+from api.jobs import cleanup_old_jobs, create_upload_job, finish_upload_job, get_upload_job, update_upload_job
 from core.conversation_buffer import clear_user_buffer
 from core.graphiti_client import get_graphiti_client
 from core.instance import get_instance_user_id, require_instance_user_id
@@ -102,20 +102,13 @@ async def run_ingest_job(
         if job and "timing" in job:
             job["timing"]["ingest_finished_at"] = datetime.now(timezone.utc)
 
-        warnings = result.get("warnings", [])
-        if result.get("status") == "error":
-            update_upload_job(job_id, stage="error", warnings=warnings)
-        else:
-            update_upload_job(
-                job_id,
-                stage="done_with_warnings" if warnings else "done",
-                warnings=warnings,
-            )
+        finish_upload_job(job_id, result)
     except Exception as exc:  # noqa: BLE001
         update_upload_job(
             job_id,
             stage="error",
-            error=f"{type(exc).__name__}: {exc}",
+            completeness="unknown",
+            error=type(exc).__name__,
         )
         logger.exception("Upload job %s failed", job_id)
 
