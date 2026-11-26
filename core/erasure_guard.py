@@ -108,6 +108,20 @@ async def require_erasure_revision(graphiti, expected: int) -> None:
         raise ErasureFenceChanged("erasure revision changed; start a new authorized operation")
 
 
+async def require_erasure_state(graphiti, expected: tuple[int, bool]) -> None:
+    """Check both revision and legacy quarantine observation, fail closed."""
+    if await read_erasure_state(graphiti) != expected:
+        raise ErasureFenceChanged("erasure state changed; discard stale operation")
+
+
+async def quarantine_unconfirmed_episode(graphiti, episode_uuid: str) -> None:
+    """Monotonic isolation of an exact known upstream write; no auto-repair."""
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic {uuid:$uuid}) SET e.erasure_quarantined=true",
+        uuid=episode_uuid,
+    )
+
+
 def candidate_key(item: dict) -> tuple[str, str, str]:
     return item["type"], item["uuid"], item["group_id"]
 

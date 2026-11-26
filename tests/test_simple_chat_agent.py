@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.helpers.fence import mock_chat_erasure  # noqa: F401
 
 import simple_chat_agent as chat_module
 from core.conversation_buffer import clear_user_buffer, get_user_conversation_buffer

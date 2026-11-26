@@ -78,18 +78,8 @@ def degraded_context(*, query: str, status: str, reason: str, max_tokens: int) -
     return empty
 
 
-async def persist_recall_guard_metadata(
-    graphiti,
-    *,
-    episode_uuid: str,
-    context_receipt: ContextReceipt | None,
-) -> dict:
-    """Mark a persisted chat turn as recall-derived by exact UUID.
-
-    This metadata never changes truth/confidence/validity. It only records that
-    the assistant response was produced while non-empty recalled context was
-    present.
-    """
+def recall_guard_fields(context_receipt: ContextReceipt | None) -> dict:
+    """Shared pure metadata contract for legacy and atomic chat finalization."""
     derived = bool(
         context_receipt
         and context_receipt.status in {"OK", "DEGRADED_PARTIAL"}
@@ -98,6 +88,23 @@ async def persist_recall_guard_metadata(
     )
     digest = context_receipt.context_sha256 if derived and context_receipt else None
     query_hash = context_receipt.query_sha256 if context_receipt else None
+    return {
+        "recall_derived": derived,
+        "recall_context_sha256": digest,
+        "recall_query_sha256": query_hash,
+        "recall_source_ids": list(context_receipt.source_ids) if derived and context_receipt else [],
+        "recall_guard_authoritative": False,
+    }
+
+
+async def persist_recall_guard_metadata(
+    graphiti,
+    *,
+    episode_uuid: str,
+    context_receipt: ContextReceipt | None,
+) -> dict:
+    """Legacy exact-UUID recall metadata update; does not grant authority."""
+    fields = recall_guard_fields(context_receipt)
     result = await graphiti.driver.execute_query(
         """
         MATCH (e:Episodic {uuid:$uuid})
@@ -109,15 +116,15 @@ async def persist_recall_guard_metadata(
         RETURN e.uuid AS uuid
         """,
         uuid=episode_uuid,
-        recall_derived=derived,
-        context_sha256=digest,
-        query_sha256=query_hash,
-        source_ids=list(context_receipt.source_ids) if derived and context_receipt else [],
+        recall_derived=fields["recall_derived"],
+        context_sha256=fields["recall_context_sha256"],
+        query_sha256=fields["recall_query_sha256"],
+        source_ids=fields["recall_source_ids"],
     )
     if not result.records:
         raise LookupError(f"episode not found for recall guard metadata: {episode_uuid}")
     return {
         "episode_uuid": episode_uuid,
-        "recall_derived": derived,
+        "recall_derived": fields["recall_derived"],
         "authoritative": False,
     }

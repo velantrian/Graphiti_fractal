@@ -2,7 +2,7 @@
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from tests.helpers.fence import mock_ingest_revision  # noqa: F401
+from tests.helpers.fence import mock_ingest_revision, mock_chat_erasure  # noqa: F401
 
 import simple_chat_agent
 from core import persist_outcomes
@@ -26,7 +26,7 @@ def _agent():
 async def _run_doc(monkeypatch, summary):
     spawned = []
     monkeypatch.setattr(simple_chat_agent, "spawn", lambda coro, name=None: spawned.append(coro))
-    monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid: Mock())
+    monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid, **kwargs: Mock())
     monkeypatch.setattr("knowledge.ingest.ingest_text_document", AsyncMock(return_value=summary))
     agent = _agent()
     await agent._handle_long_message("x" * 50)

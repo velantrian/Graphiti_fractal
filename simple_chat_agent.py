@@ -15,19 +15,21 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from core import persist_outcomes
-from core.chat_persistence import allocate_turn_index, fetch_persisted_turn_window, mark_turns_summarized
+from core.chat_persistence import allocate_turn_index, fetch_persisted_turn_window, finalize_chat_episode
 from core.config import get_config
-from core.context_guard import build_context_receipt, degraded_context, persist_recall_guard_metadata
-from core.conversation_buffer import get_user_conversation_buffer
+from core.context_guard import build_context_receipt, degraded_context, recall_guard_fields
+from core.conversation_buffer import clear_user_buffer, get_user_conversation_buffer
+from core.erasure_guard import (
+    ErasureFenceChanged, read_erasure_state, require_erasure_state,
+    quarantine_unconfirmed_episode,
+)
 from core.graphiti_client import get_write_semaphore
 from core.graphrag_policy import plan_retrieval
-from core.ingest_atomicity import classify_episode_origin
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
 from core.memory_ops import MemoryOps
 from core.prompt_boundary import MEMORY_DATA_POLICY, SUMMARY_DATA_POLICY, build_memory_user_content, build_summary_user_content
 from core.provenance import build_provenance_record
-from core.provenance_persistence import persist_provenance_metadata
 from core.rate_limit_retry import with_rate_limit_retry
 from core.task_registry import spawn
 from core.text_utils import is_correction_text
@@ -106,11 +108,15 @@ class SimpleChatAgent:
     async def answer_core(self, user_message: str) -> Tuple[str, str, Optional["ContextResult"]]:
         from core.types import ContextResult
         config = get_config()
-        if len(user_message) > config.app.max_chat_turn_chars:
-            return await self._handle_long_message(user_message)
         started = perf_counter()
         try:
-            conversation_buffer = get_user_conversation_buffer(self.memory.user_id)
+            # Read before using RAM, recall, or scheduling any write. If the DB
+            # fence is unavailable, no previous conversation is sent to a model.
+            expected_state = await read_erasure_state(self.memory.graphiti)
+            if len(user_message) > config.app.max_chat_turn_chars:
+                return await self._handle_long_message(user_message, expected_state=expected_state)
+            conversation_buffer = get_user_conversation_buffer(
+                self.memory.user_id, erasure_state=expected_state)
             conversation_id = conversation_buffer.conversation_id
             recall_enabled, recall_reason = should_recall(user_message, config.memory.recall_mode)
             context_result: ContextResult
@@ -182,6 +188,9 @@ class SimpleChatAgent:
                     "context_status": context_result.receipt.status if context_result.receipt else "UNKNOWN",
                 },
             )
+            await require_erasure_state(self.memory.graphiti, expected_state)
+            if get_user_conversation_buffer(self.memory.user_id, erasure_state=expected_state) is not conversation_buffer:
+                raise ErasureFenceChanged("conversation buffer was cleared")
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_buffer.get_recent_messages(6))
             messages.append({"role": "user", "content": user_content})
@@ -190,6 +199,11 @@ class SimpleChatAgent:
             ).strip()
             if not response:
                 raise RuntimeError("LLM returned an empty response")
+            # A provider call already in flight cannot be recalled. Its output
+            # must not reach the client, RAM or a persistence task after a fence change.
+            await require_erasure_state(self.memory.graphiti, expected_state)
+            if get_user_conversation_buffer(self.memory.user_id, erasure_state=expected_state) is not conversation_buffer:
+                raise ErasureFenceChanged("conversation buffer was cleared")
             conversation_text = f"User: {user_message}\nAssistant: {response}"
             conversation_buffer.add_turn(user_message, response)
             persist_id = persist_outcomes.new_persist_id("chat")
@@ -201,6 +215,7 @@ class SimpleChatAgent:
                     conversation_text=conversation_text,
                     context_receipt=context_result.receipt,
                     persist_id=persist_id,
+                    expected_state=expected_state,
                 ),
                 name=f"chat-persist:{self.memory.user_id}:{conversation_id}",
             )
@@ -215,8 +230,13 @@ class SimpleChatAgent:
                 },
             )
             return response, conversation_text, context_result
-        except Exception:
-            logger.exception("Chat agent core error")
+        except ErasureFenceChanged:
+            clear_user_buffer(self.memory.user_id)
+            logger.warning("Chat discarded after erasure fence changed")
+            fallback = "Память изменилась во время обработки. Повторите запрос."
+            return fallback, f"User: {user_message}\nAssistant: {fallback}", None
+        except Exception as exc:
+            logger.error("Chat agent core error: %s", type(exc).__name__)
             fallback = "Извините, произошла ошибка при обработке запроса. Попробуйте ещё раз."
             return fallback, f"User: {user_message}\nAssistant: {fallback}", None
 
@@ -225,6 +245,7 @@ class SimpleChatAgent:
         *,
         conversation_id: str,
         conversation_text: str,
+        expected_state: tuple[int, bool],
         context_receipt: "ContextReceipt | None" = None,
         persist_id: str | None = None,
     ) -> dict:
@@ -233,20 +254,25 @@ class SimpleChatAgent:
         turn_uuid = None
         episode_write_started = False
         try:
+            await require_erasure_state(graphiti, expected_state)
             turn_index = await allocate_turn_index(graphiti, self.memory.user_id, conversation_id)
+            await require_erasure_state(graphiti, expected_state)
             episode_write_started = True
-            turn_uuid = await self._persist_episode(name="chat_turn", body=conversation_text, op_name="add_episode:chat")
-            from core.authorship import attach_author
-            from knowledge.ingest import update_episode_metadata
-            await attach_author(turn_uuid, self.memory.user_id)
-            await update_episode_metadata(graphiti, turn_uuid, {"conversation_id": conversation_id, "turn_index": turn_index, "episode_kind": "chat_turn", "is_correction": is_correction_text(conversation_text), "summarized": False})
-            await persist_recall_guard_metadata(
-                graphiti,
-                episode_uuid=turn_uuid,
-                context_receipt=context_receipt,
+            turn_uuid = await self._persist_episode(name="chat_turn", body=conversation_text,
+                                                    op_name="add_episode:chat", expected_state=expected_state)
+            await finalize_chat_episode(
+                graphiti, episode_uuid=turn_uuid, user_id=self.memory.user_id,
+                group_id=get_config().memory.personal_group_id, expected_state=expected_state,
+                metadata={"conversation_id": conversation_id, "turn_index": turn_index,
+                          "episode_kind": "chat_turn", "is_correction": is_correction_text(conversation_text),
+                          "summarized": False, **recall_guard_fields(context_receipt)},
             )
-            if turn_index % 10 == 0:
-                await self._create_persisted_summary(conversation_id=conversation_id, end_turn_index=turn_index)
+            # Opaque summaries remain quarantined; don't spend a provider call
+            # to create an artifact that cannot be admitted to durable recall.
+            if turn_index % 10 == 0 and not expected_state[1]:
+                await self._create_persisted_summary(conversation_id=conversation_id, end_turn_index=turn_index,
+                                                     expected_state=expected_state)
+            await require_erasure_state(graphiti, expected_state)
             outcome = _outcome(PERSIST_PERSISTED, turn_uuid, None)
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             # Before the episode write started nothing was sent -> failed (not unknown).
@@ -261,8 +287,16 @@ class SimpleChatAgent:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             return outcome
+        except ErasureFenceChanged as exc:
+            if turn_uuid:
+                try:
+                    await quarantine_unconfirmed_episode(graphiti, turn_uuid)
+                except Exception:
+                    logger.error("Could not mark stale chat episode; global quarantine remains")
+            outcome = _outcome(PERSIST_UNCONFIRMED if episode_write_started else PERSIST_FAILED, turn_uuid, exc)
         except Exception as exc:
-            outcome = _outcome(PERSIST_PARTIAL if turn_uuid else PERSIST_FAILED, turn_uuid, exc)
+            outcome = _outcome(PERSIST_PARTIAL if turn_uuid else
+                               PERSIST_UNKNOWN if episode_write_started else PERSIST_FAILED, turn_uuid, exc)
         self._record_persist_outcome(persist_id, outcome, conversation_id)
         return outcome
 
@@ -276,71 +310,96 @@ class SimpleChatAgent:
         else:
             logger.error("Persistence outcome %s: %s", outcome["status"], outcome.get("error"), extra=extra)
 
-    async def _persist_episode(self, *, name: str, body: str, op_name: str) -> str:
+    async def _persist_episode(self, *, name: str, body: str, op_name: str,
+                               expected_state: tuple[int, bool]) -> str:
         graphiti = self.memory.graphiti
         request_id = str(uuid.uuid4())[:8]
         semaphore = get_write_semaphore()
         async def write():
             async with semaphore:
+                await require_erasure_state(graphiti, expected_state)
                 return await graphiti.add_episode(name=name, episode_body=body, source_description="chat", reference_time=datetime.now(timezone.utc), group_id=get_config().memory.personal_group_id)
         result = await with_rate_limit_retry(write, op_name=op_name, request_id=request_id)
         episode_uuid = _episode_uuid(result)
         if not episode_uuid:
             raise RuntimeError(f"{op_name} returned no episode UUID")
-        # Chat turns combine owner text with model output, and summaries are model
-        # synthesis. Classify both conservatively as agent-derived before any later
-        # L2 pass can treat their extracted entities as trusted owner evidence.
-        await classify_episode_origin(
-            graphiti,
-            episode_uuid=episode_uuid,
-            origin_class="agent_derived",
-            authoritative_fact=False,
-        )
+        # Raw upstream result is not yet a finalized chat artifact.
         return episode_uuid
 
-    async def _create_persisted_summary(self, *, conversation_id: str, end_turn_index: int) -> None:
+    async def _create_persisted_summary(self, *, conversation_id: str, end_turn_index: int,
+                                         expected_state: tuple[int, bool]) -> None:
         graphiti = self.memory.graphiti
-        turns = await fetch_persisted_turn_window(graphiti, user_id=self.memory.user_id, conversation_id=conversation_id, end_turn_index=end_turn_index, window_size=10, wait_timeout=25.0)
-        if len(turns) != 10 or [turn.get("turn_index") for turn in turns] != list(range(end_turn_index - 9, end_turn_index + 1)) or len({turn.get("uuid") for turn in turns}) != 10:
-            logger.warning("Skipping chat summary because persisted window is incomplete", extra={"conversation_id": conversation_id, "end_turn_index": end_turn_index, "persisted_turns": len(turns)})
+        await require_erasure_state(graphiti, expected_state)
+        if expected_state[1]:
             return
+        turns = await fetch_persisted_turn_window(
+            graphiti, user_id=self.memory.user_id, conversation_id=conversation_id,
+            end_turn_index=end_turn_index, window_size=10, wait_timeout=25.0,
+            expected_revision=expected_state[0],
+        )
+        if len(turns) != 10 or [turn.get("turn_index") for turn in turns] != list(range(end_turn_index - 9, end_turn_index + 1)) or len({turn.get("uuid") for turn in turns}) != 10:
+            logger.warning("Skipping chat summary because persisted window is incomplete")
+            return
+        await require_erasure_state(graphiti, expected_state)
         summary_text = await _generate_chat_summary(turns)
-        summary_uuid = await self._persist_episode(name="chat_summary", body=summary_text, op_name="add_episode:summary")
-        from core.authorship import attach_author
-        from knowledge.ingest import update_episode_metadata
+        await require_erasure_state(graphiti, expected_state)
+        summary_uuid = await self._persist_episode(name="chat_summary", body=summary_text,
+                                                    op_name="add_episode:summary", expected_state=expected_state)
         source_uuids = [str(turn["uuid"]) for turn in turns]
         start_turn_index = int(turns[0]["turn_index"])
-        provenance = build_provenance_record(kind="chat_summary", source_ids=source_uuids, activity="chat_summary_synthesis", agent="fractal:summary", payload=summary_text)
-        await attach_author(summary_uuid, self.memory.user_id)
-        await update_episode_metadata(graphiti, summary_uuid, {"conversation_id": conversation_id, "episode_kind": "chat_summary", "covers_turns": f"{start_turn_index}-{end_turn_index}", "summarized_turns": source_uuids})
-        await persist_provenance_metadata(graphiti, summary_uuid, {"provenance_id": provenance["provenance_id"], "provenance_activity": provenance["activity"], "provenance_agent": provenance["agent"], "payload_sha256": provenance["payload_sha256"], "derived_source_ids": source_uuids, "authoritative_fact": False})
-        updated = await mark_turns_summarized(graphiti, turn_uuids=source_uuids, summary_uuid=summary_uuid)
-        if updated != len(source_uuids):
-            raise RuntimeError(f"Summary source marking incomplete: expected={len(source_uuids)} updated={updated}")
-        logger.info("Chat summary created", extra={"summary_uuid": summary_uuid, "conversation_id": conversation_id, "covers_turns": f"{start_turn_index}-{end_turn_index}", "provenance_id": provenance["provenance_id"], "user_id": self.memory.user_id})
+        provenance = build_provenance_record(kind="chat_summary", source_ids=source_uuids,
+                                             activity="chat_summary_synthesis", agent="fractal:summary", payload=summary_text)
+        try:
+            await finalize_chat_episode(
+                graphiti, episode_uuid=summary_uuid, user_id=self.memory.user_id,
+                group_id=get_config().memory.personal_group_id, expected_state=expected_state,
+                metadata={"conversation_id": conversation_id, "episode_kind": "chat_summary",
+                          "covers_turns": f"{start_turn_index}-{end_turn_index}",
+                          "summarized_turns": source_uuids, "derived_source_ids": source_uuids,
+                          "provenance_id": provenance["provenance_id"], "provenance_activity": provenance["activity"],
+                          "provenance_agent": provenance["agent"], "payload_sha256": provenance["payload_sha256"]},
+            )
+            await require_erasure_state(graphiti, expected_state)
+        except Exception:
+            try:
+                await quarantine_unconfirmed_episode(graphiti, summary_uuid)
+            except Exception:
+                logger.error("Could not mark unconfirmed summary")
+            raise
+        logger.info("Chat summary created", extra={"summary_uuid": summary_uuid, "conversation_id": conversation_id})
 
-    async def _handle_long_message(self, text: str):
+    async def _handle_long_message(self, text: str, *, expected_state: tuple[int, bool] | None = None):
         from core.types import ContextResult
         from knowledge.ingest import ingest_text_document
+        if expected_state is None:
+            expected_state = await read_erasure_state(self.memory.graphiti)
+        await require_erasure_state(self.memory.graphiti, expected_state)
+        buffer = get_user_conversation_buffer(self.memory.user_id, erasure_state=expected_state)
         response = "Большой текст поставлен в очередь на сохранение. Подтверждение записи ещё не получено."
         doc_persist_id = persist_outcomes.new_persist_id("document")
         persist_outcomes.mark_pending(doc_persist_id, user_id=self.memory.user_id)
         self.last_persist_id = doc_persist_id
         async def store_document():
             try:
-                result = await ingest_text_document(self.memory.graphiti, text, source_description="chat_document", user_id=self.memory.user_id, group_id=get_config().memory.personal_group_id)
+                await require_erasure_state(self.memory.graphiti, expected_state)
+                result = await ingest_text_document(self.memory.graphiti, text, source_description="chat_document",
+                                                    user_id=self.memory.user_id, group_id=get_config().memory.personal_group_id,
+                                                    expected_revision=expected_state[0])
+                await require_erasure_state(self.memory.graphiti, expected_state)
                 outcome = _document_outcome(result)
             except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                 self._record_persist_outcome(doc_persist_id, _outcome(PERSIST_UNKNOWN, None, exc))
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 return
+            except ErasureFenceChanged as exc:
+                outcome = _outcome(PERSIST_UNCONFIRMED, None, exc)
             except Exception as exc:
-                logger.exception("Long chat document persistence failed")
+                logger.error("Long chat document persistence failed: %s", type(exc).__name__)
                 outcome = _outcome(PERSIST_FAILED, None, exc)
             self._record_persist_outcome(doc_persist_id, outcome)
         spawn(store_document(), name=f"chat-document:{self.memory.user_id}")
-        get_user_conversation_buffer(self.memory.user_id).add_turn(f"[LONG TEXT DOCUMENT: {len(text)} chars]", response)
+        buffer.add_turn(f"[LONG TEXT DOCUMENT: {len(text)} chars]", response)
         empty_context = ContextResult(text="", token_estimate=0, sources={})
         return response, f"User: [Long Text]\nAssistant: {response}", empty_context
 

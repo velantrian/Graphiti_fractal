@@ -10,3 +10,11 @@ from unittest.mock import AsyncMock
 def mock_ingest_revision(monkeypatch):
     monkeypatch.setattr("knowledge.ingest.read_erasure_state", AsyncMock(return_value=(0, False)))
     monkeypatch.setattr("knowledge.ingest.require_erasure_revision", AsyncMock())
+
+
+
+@pytest.fixture(autouse=True)
+def mock_chat_erasure(monkeypatch):
+    """Unrelated chat behavior tests explicitly simulate an unchanged revision."""
+    monkeypatch.setattr("simple_chat_agent.read_erasure_state", AsyncMock(return_value=(0, False)))
+    monkeypatch.setattr("simple_chat_agent.require_erasure_state", AsyncMock())
