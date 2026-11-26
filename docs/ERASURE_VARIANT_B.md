@@ -67,10 +67,55 @@ the write (`unconfirmed`, claim kept), isolates the episode, and marks every ent
 exposed to each such erasure (`mark_late_write`): the tombstone is reopened and the group paused until the
 usual re-derivation. Erasures in other groups do not disturb a running write (per-group fence).
 
+## Ambiguous late writes (reply lost after the write)
+The reply of `add_episode()` can be lost after the database already changed (error after commit, timeout, dropped
+connection, a process that dies). If an erasure landed meanwhile, the objects the call created or changed are
+**unknown**, so they cannot be marked, and the group is not declared safe:
+
+* Before every model-assisted write a durable attempt record exists: the ingest claim (`write_attempted_at`,
+  `erasure_revision`) or, for chat, `:FractalChatWriteAttempt` (created before the call, once per episode).
+* An attempt that is neither committed nor settled and is **older than an erasure** (its snapshot revision is lower;
+  ingest: same group, chat: any group because chat fences globally) pauses model-assisted writes in its group
+  (`require_group_writable` reads these records, so the pause holds after a restart) and keeps that erasure's event
+  open (`_close_event` counts it; `reopen_for_unsettled_writes` reopens even a RESOLVED one). A rebuild alone cannot
+  resume the group; nothing resumes it automatically.
+* Known episode UUID (recorded on the claim/attempt): contained with `mark_late_write` and settled, also by the
+  recovery sweep after a restart (`scope_pending_erasures` runs it).
+* Unknown: only `settle_unsettled_write(kind, key, outcome, episode_uuids)` ends it, never automatically:
+  `no_write` (verified that nothing landed) or `contained` (the episodes that landed are named; their derived objects
+  are marked as exposed to every newer erasure and the group stays paused until rebuilt). `list_unsettled_writes`
+  shows them (`scripts/erasure_dry_run.py` counts them as `UNSETTLED_WRITE_ATTEMPT`).
+* Retrying with `add_episode(uuid=...)` is **not** a repair. Observed on graphiti_core 0.29.3 (pinned in
+  `tests/integration/test_ambiguous_late_write.py`): an unknown uuid raises `NodeNotFoundError` (nothing written, no
+  model call); an existing uuid is a reprocess handle: same node returned, new model calls, derived entities/edges
+  created again, stored content and name unchanged.
+
+## Closing an event is atomic
+`RESOLVED` is decided by one statement under the erasure control lock that counts the remaining marks (and unsettled
+writes) and writes the status; registering a late write is one statement under the same lock. A late write that
+arrives before the closing statement keeps the event `SCOPED` (group paused); one that arrives after finds a RESOLVED
+event and reopens it. The old two-step close lost exactly such a write (reproduced as a control experiment in
+`tests/integration/test_atomic_event_close.py`).
+
+## Erasure requests are idempotent
+One event per target UUID. `event_id`, `event_revision`, the lineage seed and the status are fixed when the event is
+created; a repeat (concurrent on another connection, after the rebuild finished, after physical deletion) finds the
+event and rewrites nothing. `event_revision` is the database revision at which that event was created and never
+changes; `database_revision` is the current global revision and grows with every NEW event. The response states
+`requested_mode` and `performed_mode` (`soft` | `hard` | `none`): `hard` after `soft` deletes the node physically
+(`hard_deleted_at` recorded on the event; status and revisions untouched), a repeat of the same mode performs `none`,
+an unknown uuid returns `found=false` and creates nothing. Only the creating request runs the scope phase; scoping
+holds a lease so a retry or the recovery sweep cannot compute the same area twice.
+
 ## Limits
 * Re-derivation costs one extractor call per live source episode of an affected edge.
 * Entity summaries that a model wrote richer than the edge facts lose that richness when rebuilt.
-* The episode of a write that overlapped an erasure stays isolated (`unconfirmed`); there is no reconciliation tool yet.
+* The episode of a write that overlapped an erasure stays isolated (`unconfirmed`); an unknown outcome needs an explicit
+  `settle_unsettled_write` (no HTTP/MCP endpoint for it yet; a function for the owner to run).
+* Unknown-outcome attempts that predate an erasure block their group after that erasure, also old ones that were never
+  settled: the dry run lists them (`UNSETTLED_WRITE_ATTEMPT`) so they can be settled before the first erasure.
+* While an outcome is unknown, objects of the unknown write that are NOT marked stay readable (they cannot be found);
+  only writes (model use) are paused.
 * Agent-originated episodes (MCP) carry no lineage to what the agent saw.
 * Chat fences on the global revision (it reads every group): an erasure anywhere makes an in-flight turn retry.
   Document ingest fences per group.

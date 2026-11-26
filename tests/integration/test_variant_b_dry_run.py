@@ -89,3 +89,18 @@ async def test_diagnostics_list_objects_without_lineage_and_seedless_tombstones_
         assert secret not in blob
     assert set(report["effects_by_moment"]) == {"on_deploy", "on_first_erasure_with_this_code", "on_migration_of_a_flag"}
     assert "knowledge" in report["groups_touched_after_migration"] and "project" in report["groups_untouched_after_migration"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_counts_unsettled_write_attempts_without_writing(isolated_graph):
+    from core.erasure_dry_run import dry_run
+    await isolated_graph.driver.execute_query("""
+        CREATE (:FractalIngestClaim {claim_key:'k1', group_id:'g1', state:'RECONCILIATION_REQUIRED',
+                                     write_attempted_at:datetime(), erasure_revision:0}),
+               (:FractalIngestClaim {claim_key:'k2', group_id:'g1', state:'COMMITTED', write_attempted_at:datetime()}),
+               (:FractalChatWriteAttempt {attempt_id:'a1', group_id:'personal', state:'OPEN', erasure_revision:0})""")
+    report = await dry_run(isolated_graph)
+    reason = report["reasons"]["UNSETTLED_WRITE_ATTEMPT"]
+    assert reason["total"] == 2
+    assert {(r["kind"], r["grp"], r["state"]) for r in reason["by_group_and_state"]} == {
+        ("ingest", "g1", "RECONCILIATION_REQUIRED"), ("chat", "personal", "OPEN")}

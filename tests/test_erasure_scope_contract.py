@@ -77,3 +77,41 @@ def test_no_normalization_or_quantity_heuristic_decides_an_edge():
     assert "_norm" not in source and "_quantities" not in source and "_MONTHS" not in source
     assert "held_reworded_edges" in source and "confirms(r[\"fact\"]" in source
     assert '"fact": r["fact"]' in source                      # the stored text is kept, never rewritten
+
+
+# --- idempotent erasure, atomic closing, unsettled writes (static; live behaviour in tests/integration) ---
+
+def test_erase_node_fixes_event_identity_only_on_create_and_never_resets_status():
+    text = (ROOT / "core/erasure_guard.py").read_text(encoding="utf-8")
+    start = text.index("_NEW_EVENT = ")
+    end = text.index("async def erase_node")
+    block = text[start:end]
+    on_create = block[block.index("ON CREATE SET"):block.index("WITH n,gate,t,(t.event_id")]
+    for field in ("t.event_id=$event_id", "t.revision=", "gate.revision=", "t.seed_entities="):
+        assert field in on_create, field
+    import re
+    writes = re.compile(r"t\.(status|event_id|revision|seed_\w+|token_hashes)\s*=(?!=)")
+    after_create = block[block.index("OPTIONAL MATCH (run:TaskRun)"):]
+    assert not writes.search(after_create), "identity, seed and status are written ON CREATE only"
+    known = text[text.index("_KNOWN_EVENT = "):end]
+    assert not writes.search(known) and "gate.revision=" not in known    # a repeat never rewrites nor bumps
+
+
+def test_event_close_and_late_write_registration_are_single_locked_statements():
+    from core import erasure_scope as scope
+    import inspect
+    close = inspect.getsource(scope._close_event)
+    assert close.count("execute_query") + close.count("_rows(") == 1 and "LOCK_ERASURE_CONTROL" in close
+    assert "UNSETTLED_INGEST" in close and "UNSETTLED_CHAT" in close
+    late = inspect.getsource(scope.mark_late_write)
+    assert late.count("_rows(") == 1 and "LOCK_ERASURE_CONTROL" in late and "execute_query" not in late
+
+
+def test_group_write_gate_reads_durable_attempt_records():
+    source = inspect_source(guard.require_group_writable)
+    assert "FractalIngestClaim" in source and "FractalChatWriteAttempt" in source and "ingest_unsettled" in source
+
+
+def inspect_source(obj):
+    import inspect
+    return inspect.getsource(obj)

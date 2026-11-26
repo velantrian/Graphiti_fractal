@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from core.erasure_guard import (
-    LOCK_ERASURE_CONTROL, OPEN_STATUSES, ErasureFenceChanged, blocked_node, read_erasure_state, token_hashes,
+    LOCK_ERASURE_CONTROL, OPEN_STATUSES, UNSETTLED_CHAT, UNSETTLED_INGEST, ErasureFenceChanged, blocked_node,
+    read_erasure_state, token_hashes,
 )
 
 WINDOW = 10
@@ -245,7 +246,11 @@ def _json(d: dict) -> str:
 async def scope_pending_erasures(graphiti) -> list[dict]:
     """Crash recovery: finish phase 2 for every tombstone still PENDING_SCOPE."""
     rows = await _rows(graphiti, "MATCH (t:FractalErasure {status:'PENDING_SCOPE'}) RETURN t.event_id AS e")
-    return [await scope_erasure(graphiti, r["e"]) for r in rows]
+    out = [await scope_erasure(graphiti, r["e"]) for r in rows]
+    from core.late_writes import contain_known_unsettled_writes, reopen_for_unsettled_writes
+    await contain_known_unsettled_writes(graphiti)      # after a restart: what is known is contained,
+    await reopen_for_unsettled_writes(graphiti)         # what is not known keeps its events open
+    return out
 
 
 # --- rebuild --------------------------------------------------------------------------------
@@ -449,13 +454,15 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
     return summary
 
 
-async def _close_event(graphiti, event_id: str, prefix: str, owner_decisions: int) -> str:
+async def _close_event(graphiti, event_id: str, prefix: str, owner_decisions: int | None = None) -> str:
     """Decide RESOLVED vs SCOPED in ONE statement, under the same lock mark_late_write uses.
 
     Counting the remaining marks and writing the status must not be separate steps: a late write
     registered between them would be marked (and its group paused) only to be declared RESOLVED
     right after, from a count that no longer holds. Here the count and the decision are one
-    serialized unit; a late write that comes after finds a RESOLVED event and reopens it."""
+    serialized unit; a late write that comes after finds a RESOLVED event and reopens it.
+    An event also stays open while a write that crossed it has an unsettled outcome (its objects
+    are unknown, so nothing can be marked): see core/late_writes.py."""
     marked = "any(m IN coalesce({x}.erasure_quarantine,[]) WHERE m STARTS WITH $p)"
     rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + f"""
         MATCH (t:FractalErasure {{event_id:$e}})
@@ -463,13 +470,18 @@ async def _close_event(graphiti, event_id: str, prefix: str, owner_decisions: in
         WITH t, collect(DISTINCT n.group_id) AS g1
         OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE {marked.format(x='r')}
         WITH t, g1, collect(DISTINCT r.group_id) AS g2
-        WITH t, [g IN g1 + g2 WHERE g IS NOT NULL] AS gs
+        OPTIONAL MATCH (c:FractalIngestClaim) WHERE c.group_id = t.group_id AND {UNSETTLED_INGEST}
+          AND coalesce(c.erasure_revision,0) < t.revision
+        WITH t, g1, g2, collect(DISTINCT c.group_id) AS g3
+        OPTIONAL MATCH (a:FractalChatWriteAttempt) WHERE {UNSETTLED_CHAT} AND coalesce(a.erasure_revision,0) < t.revision
+        WITH t, g1, g2, g3, collect(DISTINCT a.group_id) AS g4
+        WITH t, [g IN g1 + g2 + g3 + g4 WHERE g IS NOT NULL] AS gs
         UNWIND CASE WHEN size(gs)=0 THEN [null] ELSE gs END AS g
         WITH t, collect(DISTINCT g) AS groups
         SET t.blocked_groups = groups,
             t.status = CASE WHEN size(groups)=0 THEN 'RESOLVED' ELSE 'SCOPED' END,
             t.resolved_at = CASE WHEN size(groups)=0 THEN datetime() ELSE null END,
-            t.owner_decision_needed = $d
+            t.owner_decision_needed = coalesce($d, t.owner_decision_needed)
         RETURN t.status AS status""", e=event_id, p=prefix, d=owner_decisions)
     return rows[0]["status"]
 

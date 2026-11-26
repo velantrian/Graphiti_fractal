@@ -8,6 +8,7 @@ persisted chat_turn episodes with real UUIDs.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,9 @@ from core.erasure_guard import (
     require_group_writable, quarantine_unconfirmed_episode,
 )
 from core.graphiti_client import get_write_semaphore
+from core.late_writes import (
+    begin_chat_write_attempt, finish_chat_attempts, record_chat_attempt_episode,
+)
 from core.graphrag_policy import plan_retrieval
 from core.llm import llm_chat_response
 from core.memory_lifecycle import should_recall
@@ -38,6 +42,8 @@ if TYPE_CHECKING:
     from core.types import ContextReceipt, ContextResult
 
 logger = logging.getLogger(__name__)
+
+_CHAT_ATTEMPTS: contextvars.ContextVar = contextvars.ContextVar("fractal_chat_write_attempts", default=None)
 
 SYSTEM_PROMPT = f"""Ты — Velan: ИИ-компаньон.
 
@@ -253,6 +259,8 @@ class SimpleChatAgent:
         persist_id = persist_id or persist_outcomes.new_persist_id("chat")
         turn_uuid = None
         episode_write_started = False
+        attempts: list[dict] = []
+        _CHAT_ATTEMPTS.set(attempts)      # task-local: _persist_episode records its write attempts here
         try:
             await require_erasure_state(graphiti, expected_state)
             turn_index = await allocate_turn_index(graphiti, self.memory.user_id, conversation_id)
@@ -274,7 +282,9 @@ class SimpleChatAgent:
                                                      expected_state=expected_state)
             await require_erasure_state(graphiti, expected_state)
             outcome = _outcome(PERSIST_PERSISTED, turn_uuid, None)
+            await finish_chat_attempts(graphiti, attempts, completed=True)
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            await asyncio.shield(finish_chat_attempts(graphiti, attempts, completed=False))
             # Before the episode write started nothing was sent -> failed (not unknown).
             if turn_uuid:
                 status = PERSIST_PARTIAL
@@ -293,8 +303,10 @@ class SimpleChatAgent:
                     await quarantine_unconfirmed_episode(graphiti, turn_uuid)
                 except Exception:
                     logger.error("Could not mark stale chat episode; global quarantine remains")
+            await finish_chat_attempts(graphiti, attempts, completed=False)
             outcome = _outcome(PERSIST_UNCONFIRMED if episode_write_started else PERSIST_FAILED, turn_uuid, exc)
         except Exception as exc:
+            await finish_chat_attempts(graphiti, attempts, completed=False)
             outcome = _outcome(PERSIST_PARTIAL if turn_uuid else
                                PERSIST_UNKNOWN if episode_write_started else PERSIST_FAILED, turn_uuid, exc)
         self._record_persist_outcome(persist_id, outcome, conversation_id)
@@ -315,6 +327,8 @@ class SimpleChatAgent:
         graphiti = self.memory.graphiti
         request_id = str(uuid.uuid4())[:8]
         semaphore = get_write_semaphore()
+        attempts = _CHAT_ATTEMPTS.get()
+        mine: dict = {}
         async def write():
             async with semaphore:
                 await require_erasure_state(graphiti, expected_state)
@@ -322,6 +336,13 @@ class SimpleChatAgent:
                 await require_group_writable(graphiti, group)
                 now = datetime.now(timezone.utc)
                 previous = await live_previous_episode_uuids(graphiti, group, now)
+                if attempts is not None and not mine:
+                    # Durable record BEFORE the call (once per episode, not per rate-limit retry): if the
+                    # reply is lost, this record is what keeps the group paused across an erasure.
+                    mine.update(id=await begin_chat_write_attempt(
+                        graphiti, group_id=group, expected_revision=expected_state[0],
+                        persist_id=request_id), group=group, revision=expected_state[0], uuid=None)
+                    attempts.append(mine)
                 return await graphiti.add_episode(
                     name=name, episode_body=body, source_description="chat", reference_time=now, group_id=group,
                     **({} if previous is None else {"previous_episode_uuids": previous}))
@@ -329,6 +350,9 @@ class SimpleChatAgent:
         episode_uuid = _episode_uuid(result)
         if not episode_uuid:
             raise RuntimeError(f"{op_name} returned no episode UUID")
+        if mine:
+            mine["uuid"] = episode_uuid
+            await record_chat_attempt_episode(graphiti, mine["id"], episode_uuid)
         # Raw upstream result is not yet a finalized chat artifact.
         return episode_uuid
 

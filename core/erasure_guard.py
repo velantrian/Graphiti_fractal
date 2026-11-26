@@ -189,6 +189,15 @@ async def require_erasure_state(graphiti, expected: tuple[int, bool]) -> None:
         raise ErasureFenceChanged("erasure revision changed; discard stale operation")
 
 
+# A write that reached Graphiti (durable write-attempt marker) and whose outcome was never settled,
+# while an erasure newer than the write's snapshot exists: which objects it created is unknown, so
+# nothing can be marked and the group cannot be declared safe. Derived from durable records, so it
+# holds after a process restart without any in-memory state.
+UNSETTLED_INGEST = """c.state IN ['PENDING','RECONCILIATION_REQUIRED'] AND c.write_attempted_at IS NOT NULL
+        AND c.late_settled_at IS NULL"""
+UNSETTLED_CHAT = "a.state = 'OPEN'"
+
+
 async def require_group_writable(graphiti, group_id: str) -> None:
     """Pause model-assisted writes only in groups with unresolved Graphiti-derived objects.
 
@@ -197,12 +206,23 @@ async def require_group_writable(graphiti, group_id: str) -> None:
     """
     result = await graphiti.driver.execute_query(
         "OPTIONAL MATCH (t:FractalErasure) WHERE " + OPEN_TOMBSTONE
-        + " AND $g IN coalesce(t.blocked_groups, [t.group_id]) RETURN count(t) AS n",
+        + " AND $g IN coalesce(t.blocked_groups, [t.group_id]) WITH count(t) AS n RETURN n, "
+        + "EXISTS { MATCH (c:FractalIngestClaim {group_id:$g}) WHERE " + UNSETTLED_INGEST
+        + " AND EXISTS { MATCH (u:FractalErasure {group_id:$g}) WHERE u.revision > coalesce(c.erasure_revision,0) } }"
+        + " AS ingest_unsettled, "
+        + "EXISTS { MATCH (a:FractalChatWriteAttempt {group_id:$g}) WHERE " + UNSETTLED_CHAT
+        + " AND EXISTS { MATCH (u:FractalErasure) WHERE u.revision > coalesce(a.erasure_revision,0) } }"
+        + " AS chat_unsettled",
         g=group_id,
     )
     if len(result.records) != 1:
         raise RuntimeError("write restriction state unavailable")
-    if int(result.records[0]["n"]) > 0:
+    row = result.records[0]
+    if row["ingest_unsettled"] or row["chat_unsettled"]:
+        raise GroupWriteRestricted(
+            f"group {group_id!r}: a write whose outcome is unknown crossed an erasure; it must be settled "
+            "(core.late_writes.settle_unsettled_write) before model-assisted writes resume")
+    if int(row["n"]) > 0:
         raise GroupWriteRestricted(
             f"group {group_id!r} has derived objects of an erasure that are not yet rebuilt or cleared")
 

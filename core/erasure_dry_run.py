@@ -16,6 +16,10 @@ Reason codes:
                                Their CONTENT IS UNKNOWN: this report never reads it, and an erasure cannot
                                find them, so erased text inside them would not be found. Counting them says
                                nothing about whether they are clean or contaminated
+  UNSETTLED_WRITE_ATTEMPT      a write that reached Graphiti (write-attempt marker) and was never committed or
+                               settled; harmless today, but once an erasure newer than the attempt exists in its
+                               group, model-assisted writes there stay paused until it is settled explicitly
+                               (core.late_writes.settle_unsettled_write). Counted per group and state
   TOMBSTONE_WITHOUT_SEED       tombstone not created by this code: no area can be computed; its group's
                                derived objects are held until the owner decides
 
@@ -84,6 +88,13 @@ async def dry_run(graphiti, *, details: bool = False, limit: int = 200) -> dict:
                                       "RETURN c.group_id AS grp, count(c) AS n ORDER BY grp")
     seedless = await _rows(graphiti, "MATCH (t:FractalErasure) WHERE t.status IS NULL "
                                      "RETURN t.target_uuid AS uuid, t.group_id AS grp ORDER BY uuid")
+    unsettled = await _rows(graphiti, """
+        MATCH (c:FractalIngestClaim) WHERE c.state IN ['PENDING','RECONCILIATION_REQUIRED']
+          AND c.write_attempted_at IS NOT NULL AND c.late_settled_at IS NULL
+        RETURN 'ingest' AS kind, c.group_id AS grp, c.state AS state, count(c) AS n
+        UNION ALL
+        MATCH (a:FractalChatWriteAttempt) WHERE a.state = 'OPEN'
+        RETURN 'chat' AS kind, a.group_id AS grp, a.state AS state, count(a) AS n""")
     groups = {r["g"] for r in await _rows(graphiti, "MATCH (e:Episodic) WHERE e.group_id IS NOT NULL "
                                                     "RETURN DISTINCT e.group_id AS g")}
     touched = {ep["grp"] for ep in flagged_eps} | derived_groups | write_pause | {t["grp"] for t in seedless if t["grp"]}
@@ -108,6 +119,10 @@ async def dry_run(graphiti, *, details: bool = False, limit: int = 200) -> dict:
                 "content": "unknown",
                 "effect": "not restricted by variant B; lineage cannot reach them, so whether they contain erased "
                           "text is UNKNOWN (never read here; an erasure cannot find them)"},
+            "UNSETTLED_WRITE_ATTEMPT": {
+                "total": sum(r["n"] for r in unsettled), "by_group_and_state": unsettled,
+                "effect": "no effect until an erasure newer than the attempt exists in the group (any group for "
+                          "chat); then model-assisted writes there pause until settled with evidence"},
             "TOMBSTONE_WITHOUT_SEED": {
                 "total": len(seedless), "tombstones": [{"uuid": t["uuid"], "group": t["grp"]} for t in seedless],
                 "effect": "area unknown: derived objects of that group are held until decided"},

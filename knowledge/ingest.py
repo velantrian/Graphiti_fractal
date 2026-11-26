@@ -19,6 +19,7 @@ from core.graphiti_client import get_write_semaphore
 from core.ingest_atomicity import (
     VALID_ORIGIN_CLASSES,
     acquire_ingest_claim,
+    claim_key,
     finalize_episode_identity,
     mark_ingest_claim_episode_created,
     mark_ingest_claim_failed,
@@ -364,17 +365,30 @@ async def _settle_unfinished_claim(graphiti, *, group_id: str, fingerprint: str,
 
 
 async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: int | None,
-                                       episode_uuids: list[str]) -> None:
+                                       episode_uuids: list[str], *, claim_fingerprint: str | None = None) -> None:
     """An erasure in this group landed while add_episode was running: contain what it wrote.
 
-    Never raises (it runs inside error handling); a failure is logged and the claim's
-    reconciliation state plus the group's write pause remain the safety net.
+    Known episode UUIDs: their derived objects are marked (and the claim settled). A chunk whose
+    write reached Graphiti but whose episode is UNKNOWN (reply lost): nothing can be marked, so the
+    erasures it crossed are reopened and held; the claim stays unsettled, which pauses the group
+    until an explicit settlement (core.late_writes). Never raises (it runs inside error handling);
+    if it fails, the durable claim itself still pauses the group (require_group_writable) and the
+    recovery sweep repeats this after a restart.
     """
-    if since_revision is None or not episode_uuids:
+    if since_revision is None:
         return
     try:
         from core.erasure_scope import mark_late_write
-        await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+        from core.late_writes import reopen_for_unsettled_writes
+        if episode_uuids:
+            result = await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+            if result.get("events") and claim_fingerprint:
+                await graphiti.driver.execute_query(
+                    "MATCH (c:FractalIngestClaim {claim_key:$k}) WHERE c.late_settled_at IS NULL "
+                    "SET c.late_settled_at=datetime(), c.late_settlement='contained'",
+                    k=claim_key(group_id, claim_fingerprint))
+        elif claim_fingerprint:
+            await reopen_for_unsettled_writes(graphiti)
     except Exception:  # noqa: BLE001
         logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
 
@@ -468,6 +482,7 @@ async def ingest_text_document(
         claim_token: str | None = None
         episode_uuid: str | None = None
         write_started = False
+        chunk_uuid_start = len(written_uuids)
 
         try:
             await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
@@ -609,6 +624,10 @@ async def ingest_text_document(
                 await asyncio.shield(_settle_unfinished_claim(
                     graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
                     write_started=write_started, error_type="CancelledError"))
+                if write_started:
+                    await asyncio.shield(_contain_if_erased_meanwhile(
+                        graphiti, group_id, expected_revision, written_uuids[chunk_uuid_start:],
+                        claim_fingerprint=chunk_fp))
             raise
         except Exception as exc:  # noqa: BLE001
             settled = "none"
@@ -618,7 +637,8 @@ async def ingest_text_document(
                     write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
             if write_started:
-                await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision, written_uuids)
+                await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision,
+                                                   written_uuids[chunk_uuid_start:], claim_fingerprint=chunk_fp)
             if write_started or settled == "reconciliation":
                 # An attempt may have reached Graphiti: neither a failure nor a success.
                 unconfirmed_writes += 1
