@@ -16,7 +16,7 @@ durable records, not from memory):
   keeps that erasure's event open (``_close_event``) - automatic resumption is impossible;
 * what is known (the episode UUID was recorded) is contained with ``mark_late_write``;
 * what is unknown is settled only by an explicit decision with evidence
-  (``settle_unsettled_write``): ``no_write`` (verified that nothing landed) or ``contained`` (the
+  (``core.settlement.settle_unsettled_write``): ``no_write`` (verified that nothing landed) or ``contained`` (the
   episodes that landed are named and are marked here). Retrying with ``add_episode(uuid=...)`` is
   not a way to complete it: in graphiti_core 0.29.3 that call reprocesses an existing episode node
   from the body passed now (new model calls, derived objects created again, stored content and
@@ -38,7 +38,8 @@ async def _rows(graphiti, cypher: str, **params) -> list[dict]:
 
 # --- chat attempts ----------------------------------------------------------------------------
 
-async def begin_chat_write_attempt(graphiti, *, group_id: str, expected_revision: int, persist_id: str) -> str:
+async def begin_chat_write_attempt(graphiti, *, group_id: str, expected_revision: int, persist_id: str,
+                                   body_sha256: str | None = None) -> str:
     """Record, before add_episode, that this chat write is about to reach Graphiti.
 
     Admitted only at the revision the caller observed (the chat path is fenced globally); the
@@ -47,9 +48,9 @@ async def begin_chat_write_attempt(graphiti, *, group_id: str, expected_revision
     attempt_id = str(uuid4())
     rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
         WHERE coalesce(gate.revision,0) = $rev
-        CREATE (a:FractalChatWriteAttempt {attempt_id:$id, group_id:$g, state:'OPEN', persist_id:$p,
+        CREATE (a:FractalChatWriteAttempt {attempt_id:$id, group_id:$g, state:'OPEN', persist_id:$p, body_sha256:$sha,
                                            erasure_revision:coalesce(gate.revision,0), started_at:datetime()})
-        RETURN a.attempt_id AS id""", rev=expected_revision, id=attempt_id, g=group_id, p=persist_id)
+        RETURN a.attempt_id AS id""", rev=expected_revision, id=attempt_id, g=group_id, p=persist_id, sha=body_sha256)
     if len(rows) != 1:
         raise ErasureFenceChanged("chat write not admitted: the erasure revision changed")
     return attempt_id
@@ -132,43 +133,6 @@ async def list_unsettled_writes(graphiti) -> list[dict]:
         RETURN 'chat' AS kind, a.attempt_id AS key, a.group_id AS group_id, a.state AS state,
                a.episode_uuid AS episode_uuid, toString(a.started_at) AS attempted_at, events""")
     return ingest + chat
-
-
-async def settle_unsettled_write(graphiti, *, kind: str, key: str, outcome: str,
-                                 episode_uuids: list[str] | None = None) -> dict:
-    """The explicit, evidence-based end of an ambiguous write. Never called automatically.
-
-    ``outcome='no_write'``: the caller has verified that nothing of this attempt landed.
-    ``outcome='contained'``: the named episodes landed; their derived objects are marked as exposed
-    to every newer erasure (group paused until rebuilt) before the attempt is settled.
-    Afterwards every open event is re-evaluated (one locked statement each), so events that were
-    held only by this attempt close; the others stay open."""
-    if kind not in ("ingest", "chat") or outcome not in ("no_write", "contained"):
-        raise ValueError("kind must be ingest|chat and outcome no_write|contained")
-    if outcome == "contained" and not episode_uuids:
-        raise ValueError("'contained' needs the episode UUIDs that landed; use 'no_write' only with evidence")
-    from core.erasure_scope import _close_event, mark_late_write
-    if kind == "ingest":
-        rows = await _rows(graphiti, "MATCH (c:FractalIngestClaim {claim_key:$k}) "
-                                     "RETURN c.group_id AS g, coalesce(c.erasure_revision,0) AS r", k=key)
-    else:
-        rows = await _rows(graphiti, "MATCH (a:FractalChatWriteAttempt {attempt_id:$k}) "
-                                     "RETURN a.group_id AS g, coalesce(a.erasure_revision,0) AS r", k=key)
-    if len(rows) != 1:
-        return {"settled": False, "reason": "unknown_attempt"}
-    if outcome == "contained":
-        await mark_late_write(graphiti, rows[0]["g"], rows[0]["r"], list(episode_uuids), any_group=(kind == "chat"))
-    if kind == "ingest":
-        await graphiti.driver.execute_query(
-            "MATCH (c:FractalIngestClaim {claim_key:$k}) SET c.late_settled_at=datetime(), c.late_settlement=$o",
-            k=key, o=outcome)
-    else:
-        await settle_chat_write_attempt(graphiti, key, outcome)
-    still_open = []
-    for ev in await _rows(graphiti, "MATCH (t:FractalErasure) WHERE t.status = 'SCOPED' RETURN t.event_id AS e"):
-        if await _close_event(graphiti, ev["e"], ev["e"] + ":") != "RESOLVED":
-            still_open.append(ev["e"])
-    return {"settled": True, "outcome": outcome, "events_still_open": still_open}
 
 
 async def finish_chat_attempts(graphiti, attempts: list[dict] | None, *, completed: bool) -> None:

@@ -115,3 +115,18 @@ def test_group_write_gate_reads_durable_attempt_records():
 def inspect_source(obj):
     import inspect
     return inspect.getsource(obj)
+
+
+def test_readers_hold_derived_objects_of_a_group_with_an_unsettled_write():
+    fragment = blocked_node("x")
+    assert "FractalIngestClaim" in fragment and "FractalChatWriteAttempt" in fragment
+    assert "fz_c" in fragment and "(t:FractalErasure" not in fragment
+
+
+def test_settlement_is_never_called_by_runtime_code_paths():
+    # lifting a pause is a person's decision: only tests and the settlement module reference it
+    offenders = [str(p.relative_to(ROOT)) for d in ("core", "knowledge", "api", "mcp_server", "layers")
+                 for p in (ROOT / d).rglob("*.py") if "settle_unsettled_write" in p.read_text(encoding="utf-8")
+                 and p.name not in ("settlement.py", "late_writes.py", "erasure_guard.py", "erasure_dry_run.py")]
+    offenders += [p for p in ("app.py", "simple_chat_agent.py") if "settle_unsettled_write" in (ROOT / p).read_text(encoding="utf-8")]
+    assert offenders == []

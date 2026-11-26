@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -341,7 +342,8 @@ class SimpleChatAgent:
                     # reply is lost, this record is what keeps the group paused across an erasure.
                     mine.update(id=await begin_chat_write_attempt(
                         graphiti, group_id=group, expected_revision=expected_state[0],
-                        persist_id=request_id), group=group, revision=expected_state[0], uuid=None)
+                        persist_id=request_id,
+                        body_sha256=hashlib.sha256(body.encode('utf-8')).hexdigest()), group=group, revision=expected_state[0], uuid=None)
                     attempts.append(mine)
                 return await graphiti.add_episode(
                     name=name, episode_body=body, source_description="chat", reference_time=now, group_id=group,

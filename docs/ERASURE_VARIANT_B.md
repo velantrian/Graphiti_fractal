@@ -81,14 +81,40 @@ connection, a process that dies). If an erasure landed meanwhile, the objects th
   resume the group; nothing resumes it automatically.
 * Known episode UUID (recorded on the claim/attempt): contained with `mark_late_write` and settled, also by the
   recovery sweep after a restart (`scope_pending_erasures` runs it).
-* Unknown: only `settle_unsettled_write(kind, key, outcome, episode_uuids)` ends it, never automatically:
-  `no_write` (verified that nothing landed) or `contained` (the episodes that landed are named; their derived objects
-  are marked as exposed to every newer erasure and the group stays paused until rebuilt). `list_unsettled_writes`
-  shows them (`scripts/erasure_dry_run.py` counts them as `UNSETTLED_WRITE_ATTEMPT`).
+* Unknown: only `core.settlement.settle_unsettled_write` ends it, never automatically (see "Manual settlement"
+  below). `list_unsettled_writes` shows them (`scripts/erasure_dry_run.py` counts them as `UNSETTLED_WRITE_ATTEMPT`).
+* Readers: while such an attempt exists in a group, the group's DERIVED objects (entities, edges, communities,
+  non-original episodes) are hidden from every reader, recall for the chat answer included (`blocked_node`): the unknown
+  write may have restated erased text in any of them and nothing can be marked. Original episodes written before it stay
+  readable. This lasts until settlement.
 * Retrying with `add_episode(uuid=...)` is **not** a repair. Observed on graphiti_core 0.29.3 (pinned in
   `tests/integration/test_ambiguous_late_write.py`): an unknown uuid raises `NodeNotFoundError` (nothing written, no
   model call); an existing uuid is a reprocess handle: same node returned, new model calls, derived entities/edges
   created again, stored content and name unchanged.
+
+## Manual settlement
+`settle_unsettled_write(kind, key, group_id, outcome, decided_by, ...)`; every refusal returns `{"settled": False,
+"refused": code}` after checking, and nothing is isolated, marked or written on a refusal.
+* `contained` needs every UUID provably linked to THIS attempt. Recorded UUID: the list must be exactly it. Otherwise
+  the group is not proof: the episode is linked by what the attempt recorded before the call (ingest: claim
+  fingerprint; chat: SHA-256 of the body) matched with the episode content, created after the attempt began, same group,
+  not claimed by another attempt; exactly one such candidate (`no_provable_link`, `ambiguous_candidates`), and the list
+  must equal it (`list_mismatch`, `uuid_foreign_group`, `uuid_missing`, `uuid_not_unique`, `bad_uuid_list`).
+  An explicit group matching the attempt is required (`group_required`, `group_mismatch`).
+* `no_write` needs `decided_by` and an independent `basis_kind` (`provider_request_log`, `graphiti_transaction_log`,
+  `operator_attestation`) with `evidence_ref`; "the node is absent now" (`node_absent`) is not accepted; refused while a
+  matching episode exists, while a UUID is recorded, and for an attempt that recorded nothing to look for (chat attempts
+  from before the body hash existed: their pause stays).
+* The attempt must be open and older than `SETTLEMENT_MIN_AGE_SECONDS` (a call still in flight is not a lost one).
+  Clock skew between the application and Neo4j can only make a link unprovable (fail-safe).
+* Isolation, decision and audit: step 1 is one statement under the erasure lock that re-verifies group and content
+  of the exact objects, isolates the episodes, writes the audit node (`ISOLATING`) and claims the attempt for this
+  decision hash; step 2 marks exposure (idempotent); step 3 one locked statement settles the attempt and marks the audit
+  `COMMITTED`. A crash between 1 and 3 keeps the pause, leaves audit `ISOLATING`; the same decision resumes, another is
+  refused (`settlement_decision_conflict`) until `cancel_pending_settlement`. Concurrent callers: one winner; identical
+  decisions settle once (`already_settled`).
+* Audit (`FractalSettlementAudit`): who, outcome, basis, evidence, uuids, link proof (content hash, attempt key and
+  time). `explain_settlement` rebuilds and re-checks the basis from persistent data (it flags a tampered object).
 
 ## Closing an event is atomic
 `RESOLVED` is decided by one statement under the erasure control lock that counts the remaining marks (and unsettled

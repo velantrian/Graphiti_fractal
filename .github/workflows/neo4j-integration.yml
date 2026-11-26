@@ -77,4 +77,6 @@ jobs:
             --target tests/integration/test_ingest_claim_lifecycle.py \
             --target tests/integration/test_erasure_idempotency.py \
             --target tests/integration/test_atomic_event_close.py \
-            --target tests/integration/test_ambiguous_late_write.py
+            --target tests/integration/test_ambiguous_late_write.py \
+            --target tests/integration/test_manual_settlement.py \
+            --target tests/integration/test_chat_answer_gate.py

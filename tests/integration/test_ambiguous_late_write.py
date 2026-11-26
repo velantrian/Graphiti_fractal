@@ -24,7 +24,9 @@ from core.erasure_guard import (
 )
 from core.erasure_scope import rebuild_area, scope_pending_erasures
 from core.ingest_atomicity import acquire_ingest_claim, mark_ingest_claim_episode_created, mark_ingest_claim_write_attempt
-from core.late_writes import list_unsettled_writes, settle_unsettled_write
+from core import settlement
+from core.late_writes import list_unsettled_writes
+from core.settlement import settle_unsettled_write
 from core.text_utils import fingerprint
 from knowledge.ingest import ingest_text_document
 from tests.integration.conftest import IsolatedGraph
@@ -43,6 +45,7 @@ def text(label):
 async def world(isolated_graph, neo4j_isolation, monkeypatch):
     """stub = the process that writes; restarted = a second process on its own connection."""
     monkeypatch.setattr("knowledge.ingest.get_embedding", AsyncMock(return_value=None))
+    monkeypatch.setattr(settlement, "SETTLEMENT_MIN_AGE_SECONDS", 0)     # age rule is tested in test_manual_settlement
     driver2 = await open_admitted_async_driver(neo4j_isolation)
     stub = StubGraphiti(StubDriver(isolated_graph._raw, neo4j_isolation.database))
     restarted = StubGraphiti(StubDriver(driver2, neo4j_isolation.database))
@@ -156,12 +159,15 @@ async def test_ingest_lost_reply_across_an_erasure_pauses_the_group_until_settle
 
     pending = await list_unsettled_writes(other)
     assert [(p["kind"], p["group_id"], p["episode_uuid"]) for p in pending] == [("ingest", G, None)]
-    with pytest.raises(ValueError):                             # 'contained' must name what landed
-        await settle_unsettled_write(other, kind="ingest", key=pending[0]["key"], outcome="contained")
-    assert (await settle_unsettled_write(other, kind="ingest", key="nope", outcome="no_write"))["settled"] is False
+    refusal = await settle_unsettled_write(other, kind="ingest", key=pending[0]["key"], group_id=G,
+                                           outcome="contained", decided_by="owner")     # 'contained' must name what landed
+    assert refusal["refused"] == "bad_uuid_list"
+    unknown = await settle_unsettled_write(other, kind="ingest", key="nope", group_id=G, outcome="no_write",
+                                           decided_by="owner")
+    assert unknown["settled"] is False
 
-    done = await settle_unsettled_write(other, kind="ingest", key=pending[0]["key"], outcome="contained",
-                                        episode_uuids=[landed[0]["u"]])
+    done = await settle_unsettled_write(other, kind="ingest", key=pending[0]["key"], group_id=G, outcome="contained",
+                                        decided_by="owner", episode_uuids=[landed[0]["u"]])
     assert done["settled"] and done["events_still_open"] == []
     assert (await tomb(g, "old-1"))["status"] == "RESOLVED" and await refused(other, G) is None
     hidden = await q(g, f"MATCH (e:Episodic {{uuid:$u}}) WHERE {visible_node('e')} RETURN count(e) AS c", u=landed[0]["u"])
@@ -172,11 +178,17 @@ async def test_ingest_lost_reply_across_an_erasure_pauses_the_group_until_settle
 async def test_ingest_settled_as_no_write_after_verification_resumes_the_group(world):
     stub, other, g = world.stub, world.restarted, world.graph
     await seed_old(g)
-    stub.plan = [erasing_write("old-1", then=TimeoutError("socket closed"))]
+    async def erase_then_fail_without_writing(_stub, _kwargs):
+        await erase_node(_stub, uuid="old-1")
+        raise TimeoutError("socket closed before anything was stored")
+
+    stub.plan = [erase_then_fail_without_writing]
     await ingest_text_document(stub, text("a"), group_id=G, user_id="owner")
     assert await refused(other, G)
     key = (await list_unsettled_writes(other))[0]["key"]
-    done = await settle_unsettled_write(other, kind="ingest", key=key, outcome="no_write")
+    done = await settle_unsettled_write(other, kind="ingest", key=key, group_id=G, outcome="no_write",
+                                        decided_by="owner", basis_kind="provider_request_log",
+                                        evidence_ref="provider-log:req-none-0001")
     assert done["events_still_open"] == [] and await refused(other, G) is None
     assert (await q(g, "MATCH (c:FractalIngestClaim) RETURN c.late_settlement AS s"))[0]["s"] == "no_write"
 
@@ -283,8 +295,8 @@ async def test_chat_lost_reply_across_an_erasure_pauses_chat_until_settled(world
 
     pending = await list_unsettled_writes(other)
     assert [(p["kind"], p["group_id"]) for p in pending] == [("chat", personal)]
-    done = await settle_unsettled_write(other, kind="chat", key=pending[0]["key"], outcome="contained",
-                                        episode_uuids=[landed[0]["u"]])
+    done = await settle_unsettled_write(other, kind="chat", key=pending[0]["key"], group_id=personal,
+                                        outcome="contained", decided_by="owner", episode_uuids=[landed[0]["u"]])
     assert done["settled"] and await refused(other, personal) is None
     assert (await tomb(g, "old-1"))["status"] == "RESOLVED"
 

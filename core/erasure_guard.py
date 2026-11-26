@@ -92,6 +92,8 @@ def blocked_node(alias: str) -> str:
         OR EXISTS { MATCH (:FractalErasure {target_uuid:@N.uuid}) }
         OR (NOT @N:Episodic AND """ + _PENDING_GROUP + """)
         OR (@N:Episodic AND NOT """ + _ORIGINAL + """ AND """ + _PENDING_GROUP + """)
+        OR (NOT @N:Episodic AND """ + _UNSETTLED_GROUP + """)
+        OR (@N:Episodic AND NOT """ + _ORIGINAL + """ AND """ + _UNSETTLED_GROUP + """)
         OR (""" + _DERIVED_KIND + """ AND """ + _PENDING_ANY + """)
         OR (""" + _UNKNOWN_LINEAGE + """ AND """ + _ANY_TOMBSTONE + """)
     )""", alias)
@@ -193,9 +195,19 @@ async def require_erasure_state(graphiti, expected: tuple[int, bool]) -> None:
 # while an erasure newer than the write's snapshot exists: which objects it created is unknown, so
 # nothing can be marked and the group cannot be declared safe. Derived from durable records, so it
 # holds after a process restart without any in-memory state.
-UNSETTLED_INGEST = """c.state IN ['PENDING','RECONCILIATION_REQUIRED'] AND c.write_attempted_at IS NOT NULL
-        AND c.late_settled_at IS NULL"""
+_UNSETTLED_INGEST_T = """{c}.state IN ['PENDING','RECONCILIATION_REQUIRED'] AND {c}.write_attempted_at IS NOT NULL
+        AND {c}.late_settled_at IS NULL"""
+UNSETTLED_INGEST = _UNSETTLED_INGEST_T.format(c="c")
 UNSETTLED_CHAT = "a.state = 'OPEN'"
+# Read side of the same fact (variable names unique: callers bind s/t/r/n/m/e/c/a). While such an attempt
+# exists in a node's group, the group's DERIVED objects (entities, edges, communities, non-original episodes)
+# are held from every reader: the unknown write may have stored text of an erased object in any of them,
+# and nothing can be marked because it is unknown which.
+_UNSETTLED_GROUP = ("EXISTS { MATCH (fz_c:FractalIngestClaim|FractalChatWriteAttempt {group_id:@N.group_id}) "
+                    "WHERE fz_c.state IN ['OPEN','PENDING','RECONCILIATION_REQUIRED'] AND fz_c.late_settled_at IS NULL "
+                    "AND (fz_c:FractalChatWriteAttempt OR fz_c.write_attempted_at IS NOT NULL) "
+                    "AND EXISTS { MATCH (fz_u:FractalErasure) WHERE fz_u.revision > coalesce(fz_c.erasure_revision,0) "
+                    "AND (fz_c:FractalChatWriteAttempt OR fz_u.group_id = fz_c.group_id) } }")
 
 
 async def require_group_writable(graphiti, group_id: str) -> None:
@@ -221,7 +233,7 @@ async def require_group_writable(graphiti, group_id: str) -> None:
     if row["ingest_unsettled"] or row["chat_unsettled"]:
         raise GroupWriteRestricted(
             f"group {group_id!r}: a write whose outcome is unknown crossed an erasure; it must be settled "
-            "(core.late_writes.settle_unsettled_write) before model-assisted writes resume")
+            "(core.settlement.settle_unsettled_write) before model-assisted writes resume")
     if int(row["n"]) > 0:
         raise GroupWriteRestricted(
             f"group {group_id!r} has derived objects of an erasure that are not yet rebuilt or cleared")

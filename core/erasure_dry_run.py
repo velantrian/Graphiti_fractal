@@ -19,7 +19,7 @@ Reason codes:
   UNSETTLED_WRITE_ATTEMPT      a write that reached Graphiti (write-attempt marker) and was never committed or
                                settled; harmless today, but once an erasure newer than the attempt exists in its
                                group, model-assisted writes there stay paused until it is settled explicitly
-                               (core.late_writes.settle_unsettled_write). Counted per group and state
+                               (core.settlement.settle_unsettled_write). Counted per group and state
   TOMBSTONE_WITHOUT_SEED       tombstone not created by this code: no area can be computed; its group's
                                derived objects are held until the owner decides
 

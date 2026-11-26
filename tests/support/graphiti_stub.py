@@ -47,7 +47,7 @@ class StubGraphiti:
         episode_uuid = str(uuid.uuid4())
         await self.driver.execute_query(
             "CREATE (:Episodic {uuid:$uuid, name:$name, content:$content, "
-            "source_description:$source_description, group_id:$group_id})",
+            "source_description:$source_description, group_id:$group_id, created_at:datetime()})",
             uuid=episode_uuid, name=kwargs["name"], content=kwargs["episode_body"],
             source_description=kwargs["source_description"], group_id=kwargs["group_id"])
         # A nameless entity is dropped by core.safe_graphiti -> degraded extraction.
