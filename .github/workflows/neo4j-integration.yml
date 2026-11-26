@@ -55,4 +55,5 @@ jobs:
       - name: Live Neo4j contracts on an admitted disposable database, then decoy rejection
         run: |
           python scripts/test_neo4j.py acceptance \
-            --target tests/integration/test_neo4j_operational_contracts.py
+            --target tests/integration/test_neo4j_operational_contracts.py \
+            --target tests/integration/test_pr54_scenario_b.py
