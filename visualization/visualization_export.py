@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from core import get_graphiti_client
+from core.erasure_guard import visible_edge, visible_node
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,7 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
     MATCH (n)
     WHERE (n:Entity OR n:Community)
       AND n.uuid IS NOT NULL
-      AND coalesce(n.deleted, false) = false
-      AND NOT EXISTS { MATCH (:FractalErasure) }
-      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+      AND """ + visible_node("n") + """
     RETURN n.uuid as uuid, n.name as name, labels(n) as labels, n.group_id as group_id, n.summary as summary
     LIMIT $limit
     """
@@ -101,10 +100,7 @@ async def export_graph_for_vis(graphiti, limit: int = 500):
       AND m.uuid IS NOT NULL
       AND n.uuid IN $node_uuids
       AND m.uuid IN $node_uuids
-      AND coalesce(n.deleted, false) = false
-      AND coalesce(m.deleted, false) = false
-      AND NOT EXISTS { MATCH (:FractalErasure) }
-      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+      AND """ + visible_edge("r", "n", "m") + """
     RETURN n.uuid as source, m.uuid as target, type(r) as type, r.fact as fact
     LIMIT $edge_limit
     """

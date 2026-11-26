@@ -3,6 +3,7 @@ import logging
 from collections.abc import Sequence
 
 from core import get_graphiti_client
+from core.erasure_guard import visible_node
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,10 @@ async def get_l2_semantic_context_with_sources(
     query = """
     MATCH (matched:Entity)
     WHERE toLower(matched.name) CONTAINS toLower($name)
-      AND coalesce(matched.deleted, false) = false
-      AND NOT EXISTS { MATCH (:FractalErasure) }
-      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+      AND """ + visible_node("matched") + """
       AND matched.group_id IN $allowed_groups
     MATCH (c:Community)-[:HAS_MEMBER]->(matched)
-    WHERE coalesce(c.deleted, false) = false
+    WHERE """ + visible_node("c") + """
       AND c.group_id IN $allowed_groups
       AND c.group_id = matched.group_id
     WITH DISTINCT c
@@ -85,10 +84,10 @@ async def get_l2_semantic_context_with_sources(
     LIMIT 5
 
     MATCH (c)-[:HAS_MEMBER]->(member:Entity)
-    WHERE coalesce(member.deleted, false) = false
+    WHERE """ + visible_node("member") + """
       AND member.group_id = c.group_id
     OPTIONAL MATCH (source:Episodic)-[:MENTIONS]->(member)
-    WHERE coalesce(source.deleted, false) = false
+    WHERE """ + visible_node("source") + """
     WITH c, member,
          [p IN collect(DISTINCT {
              uuid: source.uuid,

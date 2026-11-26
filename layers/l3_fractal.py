@@ -11,6 +11,7 @@ from core.provenance import build_provenance_record
 from core.provenance_persistence import persist_provenance_metadata
 from knowledge.ingest import ingest_text_document, resolve_group_id
 from layers.l2_semantic import get_l2_semantic_context_with_sources
+from core.erasure_guard import ErasureFenceChanged, read_erasure_state, visible_node
 
 logger = logging.getLogger(__name__)
 
@@ -147,11 +148,7 @@ async def get_l3_fractal_context(graphiti, entity_name: str) -> str:
         """
         MATCH (e:Episodic)
         WHERE e.source_description=$source
-          AND coalesce(e.deleted, false)=false
-          AND e.origin_class='agent_derived'
-          AND size(coalesce(e.derived_source_ids,[])) > 0
-          AND NOT EXISTS { MATCH (:FractalErasure) }
-          AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+          AND """ + visible_node("e") + """
         RETURN coalesce(e.content, e.episode_body, '') AS content,
                coalesce(e.created_at, e.valid_at) AS created_at
         ORDER BY coalesce(e.created_at, e.valid_at) DESC

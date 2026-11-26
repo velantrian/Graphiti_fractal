@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from api.jobs import cleanup_old_jobs, create_upload_job, finish_upload_job, get_upload_job, update_upload_job
 from core.conversation_buffer import clear_user_buffer
 from core.graphiti_client import get_graphiti_client
-from core.erasure_guard import erase_node, read_erasure_state
+from core.erasure_guard import erase_node, last_erasure_at, read_erasure_state, visible_node
 from core.instance import get_instance_user_id, require_instance_user_id
 from core.memory_ops import clear_recent_memories
 from core.task_registry import drain, spawn
@@ -194,9 +194,9 @@ async def visualization_data():
             detail="graph_data.json not generated; run python main.py viz-export",
         )
     graphiti = await get_graphiti_dep()
-    _, quarantined = await read_erasure_state(graphiti)
-    if quarantined:
-        raise HTTPException(status_code=409, detail="graph export quarantined after erasure; verified rebuild required")
+    latest = await last_erasure_at(graphiti)
+    if latest is not None and path.stat().st_mtime < latest.timestamp():
+        raise HTTPException(status_code=409, detail="graph export predates an erasure; export it again")
     return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
@@ -480,11 +480,9 @@ async def diagnose_memory_conflicts(entity_name: str, limit: int = 20):
         """
         MATCH (e:Entity)
         WHERE toLower(e.name) CONTAINS toLower($entity_name)
-          AND coalesce(e.deleted, false) = false
-          AND NOT EXISTS { MATCH (:FractalErasure) }
-          AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+          AND """ + visible_node("e") + """
         OPTIONAL MATCH (e)<-[:MENTIONS]-(ep:Episodic)
-        WHERE coalesce(ep.deleted, false) = false
+        WHERE """ + visible_node("ep") + """
         RETURN e.name AS entity_name,
                e.summary AS entity_summary,
                collect({

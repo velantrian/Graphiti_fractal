@@ -13,8 +13,7 @@ from time import monotonic
 from typing import Any
 
 from core.erasure_guard import (
-    ERASURE_PRESENT, LOCK_ERASURE_CONTROL, ErasureFenceChanged,
-    ensure_erasure_constraints,
+    LOCK_ERASURE_CONTROL, ErasureFenceChanged, ensure_erasure_constraints, visible_node,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,9 +58,7 @@ async def get_conversation_turn_count(graphiti, user_id: str, conversation_id: s
         })
         WHERE (EXISTS { MATCH (e)-[:STORED_FOR]->(:User {user_id:$user_id}) }
             OR EXISTS { MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e) })
-          AND coalesce(e.deleted, false) = false
-          AND coalesce(e.erasure_quarantined,false)=false
-          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
+          AND """ + visible_node("e") + """
         RETURN count(e) AS turn_count
         """,
         user_id=user_id,
@@ -99,13 +96,9 @@ async def fetch_persisted_turn_window(
         OR EXISTS { MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e) })
       AND e.turn_index >= $start_turn_index
       AND e.turn_index <= $end_turn_index
-      AND coalesce(e.deleted, false) = false
-      AND coalesce(e.erasure_quarantined,false)=false
-      AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
+      AND """ + visible_node("e") + """
       AND ($expected_revision IS NULL OR
-          (e.chat_finalized=true AND e.chat_erasure_revision=$expected_revision))
-      AND NOT EXISTS { MATCH (:FractalErasure) }
-      AND NOT EXISTS { MATCH (d) WHERE d.deleted=true }
+          (e.chat_finalized=true AND e.chat_erasure_revision <= $expected_revision))
     RETURN e.uuid AS uuid,
            coalesce(e.content, e.episode_body, '') AS content,
            e.turn_index AS turn_index
@@ -202,8 +195,6 @@ async def finalize_chat_episode(
         raise ValueError("invalid erasure state")
     sources = []
     if kind == "chat_summary":
-        if quarantined:
-            raise ErasureFenceChanged("summary disabled during derived quarantine")
         sources = metadata["summarized_turns"]
         if (not isinstance(sources, list) or len(sources) != 10
                 or any(not isinstance(x, str) or not x for x in sources)
@@ -216,8 +207,7 @@ async def finalize_chat_episode(
 
     await ensure_erasure_constraints(graphiti)
     result = await graphiti.driver.execute_query(
-        LOCK_ERASURE_CONTROL + " WHERE coalesce(gate.revision,0)=$revision AND "
-        + ERASURE_PRESENT + """ = $quarantined
+        LOCK_ERASURE_CONTROL + """ WHERE coalesce(gate.revision,0)=$revision
         MATCH (e:Episodic {uuid:$uuid})
         WHERE e.group_id=$group_id AND e.source_description='chat'
           AND coalesce(e.deleted,false)=false
@@ -235,10 +225,8 @@ async def finalize_chat_episode(
           AND source.group_id=$group_id
           AND source.episode_kind='chat_turn'
           AND source.conversation_id=$conversation_id
-          AND source.chat_finalized=true AND source.chat_erasure_revision=$revision
-          AND coalesce(source.deleted,false)=false
-          AND coalesce(source.erasure_quarantined,false)=false
-          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:source.uuid}) }
+          AND source.chat_finalized=true AND source.chat_erasure_revision <= $revision
+          AND """ + visible_node("source") + """
           AND EXISTS { MATCH (source)-[:STORED_FOR]->(:User {user_id:$user_id}) }
         WITH e,collect(source) AS source_nodes
         WHERE size(source_nodes)=size($sources)
@@ -259,7 +247,7 @@ async def finalize_chat_episode(
         RETURN DISTINCT e.uuid AS uuid
         """,
         uuid=episode_uuid, user_id=user_id, group_id=group_id,
-        revision=revision, quarantined=quarantined, metadata=metadata,
+        revision=revision, metadata=metadata,
         conversation_id=metadata["conversation_id"], sources=sources,
     )
     if len(result.records) != 1 or result.records[0].get("uuid") != episode_uuid:
