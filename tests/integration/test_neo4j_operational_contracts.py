@@ -429,13 +429,15 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
         after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
         assert [e["uuid"] for e in after.episodes] == ["keep-me"]
         assert not after.entities and not after.edges and not after.communities
-        assert (await erase_node(graphiti, uuid="erase-me", hard=True))["deleted"] is True
-        assert await read_erasure_state(other) == (2, True)
+        upgrade = await erase_node(graphiti, uuid="erase-me", hard=True)
+        assert upgrade["deleted"] is True and upgrade["performed_mode"] == "hard"
+        # hard after soft is the SAME event: physical deletion only, no new revision (idempotency contract)
+        assert await read_erasure_state(other) == (1, True)
         after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
         assert [e["uuid"] for e in after.episodes] == ["keep-me"]
         marker = await graphiti.driver.execute_query(
-            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode")
-        assert marker.records[0]["mode"] == "hard"
+            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode, t.hard_deleted_at AS h")
+        assert marker.records[0]["mode"] == "soft" and marker.records[0]["h"]
     finally:
         await graphiti.reset()
 

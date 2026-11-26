@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from core.erasure_guard import (
     LOCK_ERASURE_CONTROL, OPEN_STATUSES, ErasureFenceChanged, blocked_node, read_erasure_state, token_hashes,
@@ -198,6 +199,17 @@ async def scope_erasure(graphiti, event_id: str) -> dict:
     tomb = await _load(graphiti, event_id)
     if tomb.get("status") != "PENDING_SCOPE":
         return {"status": tomb.get("status"), "event_id": event_id, "counts": tomb.get("area_counts_json")}
+    # One scoper at a time: a lease (CAS on the tombstone) so a request, a retry and the background
+    # sweep cannot compute and publish the same area twice. An abandoned lease expires.
+    token = str(uuid4())
+    # (the control lock comes first: a MATCH ... WHERE evaluated before the write lock would let
+    # every concurrent caller pass the check)
+    claimed = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
+        MATCH (t:FractalErasure {event_id:$e}) WHERE t.status='PENDING_SCOPE'
+          AND (t.scope_lease IS NULL OR t.scope_lease_at < datetime() - duration('PT2M'))
+        SET t.scope_lease=$tok, t.scope_lease_at=datetime() RETURN count(t) AS c""", e=event_id, tok=token)
+    if not claimed or claimed[0]["c"] != 1:
+        return {"status": "PENDING_SCOPE", "event_id": event_id, "counts": None, "scoping": "in_progress_elsewhere"}
     seed = _seed(tomb)
     area = await compute_area(graphiti, seed) if tomb.get("target_label") == "Episodic" else Area()
 
@@ -217,9 +229,10 @@ async def scope_erasure(graphiti, event_id: str) -> dict:
     counts = area.counts()
     counts["purged_entities"], counts["purged_edges"] = len(pure_entities), len(pure_edges)
     await graphiti.driver.execute_query(
-        "MATCH (t:FractalErasure {event_id:$e}) SET t.status='SCOPED', t.scoped_at=datetime(), "
+        "MATCH (t:FractalErasure {event_id:$e}) WHERE t.scope_lease=$tok "
+        "SET t.status='SCOPED', t.scoped_at=datetime(), t.scope_lease=null, "
         "t.blocked_groups=$blocked, t.area_counts_json=$counts",
-        e=event_id, blocked=blocked, counts=_json(counts))
+        e=event_id, blocked=blocked, counts=_json(counts), tok=token)
     return {"status": "SCOPED", "event_id": event_id, "counts": counts, "blocked_groups": blocked,
             "derived_groups": sorted(set(area.derived.values()))}
 

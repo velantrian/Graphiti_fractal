@@ -115,18 +115,27 @@ def visible_edge(rel: str, start: str, end: str) -> str:
 
 
 # --- state ----------------------------------------------------------------------------
+async def _create_schema(graphiti, statement: str) -> None:
+    """``IF NOT EXISTS`` is not race-free: two connections creating the same schema rule at the
+    same moment make the loser fail with ...SchemaRuleAlreadyExists. That outcome is the one we
+    wanted, so it is not an error; anything else is raised."""
+    try:
+        await graphiti.driver.execute_query(statement)
+    except Exception as exc:  # noqa: BLE001 - narrowed by the server code below
+        code = str(getattr(exc, "code", "") or "") + " " + str(exc)
+        if "AlreadyExists" not in code:
+            raise
+
+
 async def ensure_erasure_constraints(graphiti) -> None:
-    await graphiti.driver.execute_query(
+    await _create_schema(graphiti,
         "CREATE CONSTRAINT fractal_erasure_target_unique IF NOT EXISTS "
-        "FOR (t:FractalErasure) REQUIRE t.target_uuid IS UNIQUE"
-    )
-    await graphiti.driver.execute_query(
+        "FOR (t:FractalErasure) REQUIRE t.target_uuid IS UNIQUE")
+    await _create_schema(graphiti,
         "CREATE CONSTRAINT fractal_erasure_control_unique IF NOT EXISTS "
-        "FOR (c:FractalErasureControl) REQUIRE c.key IS UNIQUE"
-    )
-    await graphiti.driver.execute_query(
-        "CREATE INDEX fractal_erasure_status IF NOT EXISTS FOR (t:FractalErasure) ON (t.status)"
-    )
+        "FOR (c:FractalErasureControl) REQUIRE c.key IS UNIQUE")
+    await _create_schema(graphiti,
+        "CREATE INDEX fractal_erasure_status IF NOT EXISTS FOR (t:FractalErasure) ON (t.status)")
 
 
 async def read_erasure_state(graphiti) -> tuple[int, bool]:
@@ -225,25 +234,13 @@ async def _content_hashes(graphiti, uuid: str) -> list[str]:
     return token_hashes(result.records[0]["c"]) if result.records else []
 
 
-async def erase_node(graphiti, *, uuid: str, hard: bool = False) -> dict:
-    """Caller enforces permission. Phase 1 is one atomic statement: tombstone with the lineage
-    seed (mentioned entities, edges, group, hashed tokens), revision bump, soft/hard delete.
-    Phase 2 (core.erasure_scope.scope_erasure) computes and marks the affected area and runs
-    immediately; if the process dies in between, the group stays held (PENDING_SCOPE) and
-    scope_pending_erasures() finishes the job."""
-    if not isinstance(uuid, str) or not uuid.strip():
-        raise ValueError("uuid is required")
-    await ensure_erasure_constraints(graphiti)
-    hashes = await _content_hashes(graphiti, uuid)
-    action = "DETACH DELETE n" if hard else "SET n.deleted=true, n.deleted_at=$ts"
-    event_id = str(uuid4())
-    ts = datetime.now(timezone.utc).isoformat()
-    result = await graphiti.driver.execute_query(
-        LOCK_ERASURE_CONTROL + """
+_NEW_EVENT = LOCK_ERASURE_CONTROL + """
         MATCH (n {uuid:$uuid})
         WITH gate,collect(n) AS targets
         WHERE size(targets)=1
         WITH gate,targets[0] AS n
+        WHERE NOT (coalesce(n.deleted,false)=true
+                   AND EXISTS { MATCH (:FractalErasure {target_uuid:$uuid}) })
         OPTIONAL MATCH (n)-[:MENTIONS]->(m:Entity)
         WITH gate,n,collect(DISTINCT m.uuid) AS mentioned
         OPTIONAL MATCH ()-[r:RELATES_TO]->()
@@ -251,28 +248,89 @@ async def erase_node(graphiti, *, uuid: str, hard: bool = False) -> dict:
             AND (n.uuid IN coalesce(r.episodes,[]) OR r.uuid IN coalesce(n.entity_edges,[]))
         WITH gate,n,mentioned,collect(DISTINCT r.uuid) AS edges
         MERGE (t:FractalErasure {target_uuid:$uuid})
-        ON CREATE SET t.created_at=$ts
-        SET t.event_id=$event_id, t.group_id=n.group_id, t.mode=$mode, t.status='PENDING_SCOPE',
-            t.target_label=head(labels(n)), t.valid_at=toString(n.valid_at),
+        ON CREATE SET t.event_id=$event_id, t.created_at=$ts, t.group_id=n.group_id, t.mode=$mode,
+            t.status='PENDING_SCOPE', t.target_label=head(labels(n)), t.valid_at=toString(n.valid_at),
             t.seed_entities=mentioned, t.seed_edges=edges, t.token_hashes=$hashes,
-            t.blocked_groups=[n.group_id], t.erased_at=$ts, t.revision=coalesce(gate.revision,0)+1
-        SET gate.revision=coalesce(gate.revision,0)+1
-        WITH n,gate
+            t.blocked_groups=[n.group_id], t.erased_at=$ts, t.revision=coalesce(gate.revision,0)+1,
+            gate.revision=coalesce(gate.revision,0)+1
+        WITH n,gate,t,(t.event_id=$event_id) AS fresh
         OPTIONAL MATCH (run:TaskRun)-[]->(n)
-        WITH n,gate,collect(DISTINCT run) AS runs
+        WITH n,gate,t,fresh,collect(DISTINCT run) AS runs
         FOREACH (run IN runs | SET run.erasure_quarantined=true)
-        """ + action + """
-        RETURN 1 AS done, gate.revision AS revision
-        """,
-        uuid=uuid, ts=ts, mode="hard" if hard else "soft", event_id=event_id, hashes=hashes,
-    )
-    deleted = len(result.records) == 1 and result.records[0].get("done") == 1
-    out = {"deleted": deleted, "mode": "hard" if hard else "soft",
-           "erasure_revision": result.records[0]["revision"] if deleted else None,
-           "event_id": event_id if deleted else None, "area": None}
-    if deleted:
-        from core.erasure_scope import scope_erasure
-        out["area"] = await scope_erasure(graphiti, event_id)
+        FOREACH (_ IN CASE WHEN $hard THEN [1] ELSE [] END | SET t.hard_deleted_at=coalesce(t.hard_deleted_at,$ts))
+        FOREACH (_ IN CASE WHEN $hard THEN [] ELSE [1] END | SET n.deleted=true, n.deleted_at=coalesce(n.deleted_at,$ts))
+        WITH n,gate,t,fresh,$hard AS hard
+        WITH n,gate,t,fresh,hard,t.event_id AS event_id,t.revision AS event_revision,
+             gate.revision AS database_revision,t.mode AS event_mode,t.status AS event_status
+        FOREACH (_ IN CASE WHEN hard THEN [1] ELSE [] END | DETACH DELETE n)
+        RETURN fresh,event_id,event_revision,database_revision,event_mode,event_status
+        """
+
+# Already erased (soft flag or physically gone): read the event, upgrade soft->hard when asked.
+_KNOWN_EVENT = LOCK_ERASURE_CONTROL + """
+        OPTIONAL MATCH (n {uuid:$uuid})
+        WITH gate,collect(n) AS targets
+        OPTIONAL MATCH (t:FractalErasure {target_uuid:$uuid})
+        WITH gate,targets,t,($hard AND t IS NOT NULL AND size(targets)=1) AS upgrade
+        FOREACH (_ IN CASE WHEN upgrade THEN [1] ELSE [] END |
+                 SET t.hard_deleted_at=coalesce(t.hard_deleted_at,$ts))
+        FOREACH (x IN CASE WHEN upgrade THEN targets ELSE [] END | DETACH DELETE x)
+        RETURN t IS NOT NULL AS known, upgrade, size(targets) AS present, t.event_id AS event_id,
+               t.revision AS event_revision, gate.revision AS database_revision,
+               t.mode AS event_mode, t.status AS event_status
+        """
+
+
+async def erase_node(graphiti, *, uuid: str, hard: bool = False) -> dict:
+    """Caller enforces permission. Idempotent per target UUID.
+
+    Phase 1 is one lock-serialized statement: the first request creates the event (tombstone with
+    the lineage seed, event_id and event revision fixed ON CREATE, one database-revision bump) and
+    performs the requested mode. Every later request - concurrent, after the area was rebuilt, after
+    the node was physically deleted - finds that event and never rewrites its identity, seed or
+    status. A hard request after a soft one deletes the node physically and records
+    ``hard_deleted_at``; it does not reopen the event or bump any revision.
+    Phase 2 (core.erasure_scope.scope_erasure) is run only by the creating request; if the process
+    dies in between, the group stays held (PENDING_SCOPE) and scope_pending_erasures() finishes it.
+
+    The result separates ``event_revision`` (database revision at which this event was created,
+    fixed) from ``database_revision`` (current, global) and states ``performed_mode`` - what this
+    call actually did: "soft", "hard" or "none" (``requested_mode`` is what was asked)."""
+    if not isinstance(uuid, str) or not uuid.strip():
+        raise ValueError("uuid is required")
+    await ensure_erasure_constraints(graphiti)
+    hashes = await _content_hashes(graphiti, uuid)
+    mode = "hard" if hard else "soft"
+    ts = datetime.now(timezone.utc).isoformat()
+    out = {"found": False, "deleted": False, "requested_mode": mode, "performed_mode": "none",
+           "mode": "none", "idempotent_repeat": False, "event_id": None, "event_revision": None,
+           "erasure_revision": None, "database_revision": None, "event_mode": None,
+           "event_status": None, "node_state": "absent", "area": None}
+    event_id = str(uuid4())
+    result = await graphiti.driver.execute_query(
+        _NEW_EVENT, uuid=uuid, ts=ts, mode=mode, event_id=event_id, hashes=hashes, hard=hard)
+    if len(result.records) == 1:
+        row = result.records[0]
+        out.update(found=True, deleted=True, performed_mode=mode, mode=mode,
+                   idempotent_repeat=not row["fresh"], event_id=row["event_id"],
+                   event_revision=row["event_revision"], erasure_revision=row["event_revision"],
+                   database_revision=row["database_revision"], event_mode=row["event_mode"],
+                   event_status=row["event_status"], node_state="absent" if hard else "soft")
+        if row["fresh"]:
+            from core.erasure_scope import scope_erasure
+            out["area"] = await scope_erasure(graphiti, row["event_id"])
+            out["event_status"] = out["area"].get("status")
+        return out
+    result = await graphiti.driver.execute_query(_KNOWN_EVENT, uuid=uuid, ts=ts, hard=hard)
+    if len(result.records) != 1 or not result.records[0]["known"]:
+        return out
+    row = result.records[0]
+    performed = "hard" if row["upgrade"] else "none"
+    out.update(found=True, deleted=True, performed_mode=performed, mode=performed, idempotent_repeat=True,
+               event_id=row["event_id"], event_revision=row["event_revision"],
+               erasure_revision=row["event_revision"], database_revision=row["database_revision"],
+               event_mode=row["event_mode"], event_status=row["event_status"],
+               node_state="absent" if (row["upgrade"] or not row["present"]) else "soft")
     return out
 
 
