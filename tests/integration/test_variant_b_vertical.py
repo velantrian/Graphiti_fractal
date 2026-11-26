@@ -27,7 +27,7 @@ from core import erasure_scope
 from core.erasure_guard import ErasureFenceChanged, blocked_node, erase_node, read_erasure_state
 from core.memory_ops import MemoryOps
 from knowledge.ingest import ingest_text_document
-from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker
+from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker, recording_extractor
 
 K, P, PERSONAL = "knowledge", "project", "personal"
 MARK_A = "ZORBLAX-ALPHA"
@@ -207,7 +207,7 @@ async def test_vertical_delete_new_write_rebuild_search(env, mode):
     assert {r["u"] for r in l3} == {"l3-B3"}
 
     # 4. rebuild: evidence per object, tombstone kept, group resolved
-    summary = await erasure_scope.rebuild_area(env.graphiti)
+    summary = await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))
     tomb = await tombstone(env, ids["A"])
     print("OBSERVED_V " + json.dumps({"mode": mode, "rebuild": summary, "status": tomb["status"]}, sort_keys=True))
     assert tomb["status"] == "RESOLVED" and tomb["blocked_groups"] == [] and tomb["owner_decision_needed"] == 1 + CHAIN + 1
@@ -216,7 +216,8 @@ async def test_vertical_delete_new_write_rebuild_search(env, mode):
     assert MARK_A not in mira["s"] and "QUIBBLE12" in mira["s"] and mira["marks"] == 0
     assert any(":rebuilt_from_clean_edges:" in e for e in mira["ev"])
     edge = (await env.q("MATCH ()-[r:RELATES_TO]->() WHERE r.fact CONTAINS 'QUIBBLE11' RETURN r.erasure_evidence AS ev"))[0]
-    assert any(":content_screen:" in e for e in edge["ev"])                # reopened by screen, evidence recorded
+    assert any(":re_extracted:" in e for e in edge["ev"])                  # reopened by re-derivation, evidence recorded
+    assert not any(":content_screen:" in e for e in edge["ev"])            # a token screen is never the basis
 
     # 5. new write after the rebuild: the recorder sees the valid context and not the erased text
     mark = env.llm.mark()
@@ -234,7 +235,7 @@ async def test_vertical_delete_new_write_rebuild_search(env, mode):
         await env.q("MATCH ()-[r:RELATES_TO]->() RETURN r.fact AS f"))
     after = await env.delivered(K)
     assert MARK_A not in after["all"] and "NEWQ3" in after["all"]
-    assert await env.visible_edges("QUIBBLE") == CHAIN                           # all 12 cleared by evidence, shown again
+    assert await env.visible_edges("QUIBBLE") == CHAIN                           # all 12 re-derived, shown again
     assert await env.visible_count("Entity", "n.summary CONTAINS 'QUIBBLE12'") >= 1 # incl. the rebuilt Mira Venn
     assert after["derived"] & {f"QUIBBLE{i}" for i in range(1, CHAIN + 1)}
     holders = await env.q("MATCH (n) WHERE any(k IN keys(n) WHERE n[k] IS :: STRING AND n[k] CONTAINS $m) "
@@ -259,7 +260,7 @@ async def test_re_erasure_during_rebuild_commits_nothing_then_converges(env):
 
     env.monkeypatch.setattr(erasure_scope, "_checkpoint", second_deletion)
     with pytest.raises(ErasureFenceChanged):
-        await erasure_scope.rebuild_area(env.graphiti)
+        await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))
     env.monkeypatch.undo()
     env.monkeypatch.setattr("knowledge.ingest.get_embedding", AsyncMock(return_value=None))
     assert fired
@@ -268,7 +269,7 @@ async def test_re_erasure_during_rebuild_commits_nothing_then_converges(env):
     assert mira["marks"] >= 1 and MARK_A in mira["s"]                     # nothing was reopened by the aborted run
     assert (await env.add("[[Mira Venn]] asks [[Harbor Office]] NEWQ4.", K))["completeness"] == "failed"
 
-    await erasure_scope.rebuild_area(env.graphiti)                          # converges for both erasures
+    await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))                          # converges for both erasures
     states = {t["u"]: t["s"] for t in await env.q("MATCH (t:FractalErasure) RETURN t.target_uuid AS u, t.status AS s")}
     assert set(states.values()) == {"RESOLVED"} and set(states) == {ids["A"], ids["B1"]}
     summary = (await env.q("MATCH (n:Entity {name:'Mira Venn', group_id:$g}) RETURN n.summary AS s", g=K))[0]["s"]
@@ -288,7 +289,7 @@ async def test_soft_deleted_episode_inside_the_previous_window_is_not_given_to_t
     await env.add(b_text(2))
     a_uuid = await env.uuid_of(MARK_A)
     await delete(env, a_uuid, "soft")
-    await erasure_scope.rebuild_area(env.graphiti)
+    await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))
 
     default_window = await env.graphiti.retrieve_episodes(datetime.now(timezone.utc), last_n=10, group_ids=[K])
     assert a_uuid in {e.uuid for e in default_window}          # control: Graphiti's own window still contains A

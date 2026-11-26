@@ -25,7 +25,7 @@ from core import erasure_scope
 from core.erasure_guard import read_erasure_state
 from core.memory_ops import MemoryOps
 from knowledge.ingest import ingest_text_document
-from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker
+from tests.support.recording_model import HashEmbedder, RecordingLLM, ZeroRanker, recording_extractor
 
 GROUP = "knowledge"
 A = "[[Mira Venn]] keeps the vault passphrase ZORBLAX-ALPHA in the [[Amber Cabinet]]."
@@ -120,7 +120,7 @@ async def run_variant(env, monkeypatch, mode, *, filter_previous=False):
     if mode in ("soft", "hard"):
         # Variant B pauses model-assisted writes in the affected group until its derived
         # objects are rebuilt or cleared (refusal itself is covered in test_variant_b_vertical).
-        rebuilt = await erasure_scope.rebuild_area(env.graphiti)
+        rebuilt = await erasure_scope.rebuild_area(env.graphiti, extractor=recording_extractor(env.graphiti, env.llm))
     state_before = await read_erasure_state(env.graphiti)
     before = await _snapshot(env)
     residue_before = sorted(f"{k[0]}" for k, v in before.items() if MARK_A in v and k[0] != "episode")

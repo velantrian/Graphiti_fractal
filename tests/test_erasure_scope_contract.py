@@ -40,3 +40,11 @@ def test_erase_never_deletes_a_tombstone_and_state_is_not_a_scan():
     assert "DELETE t" not in source and "DELETE fz" not in source
     assert "MATCH (n) WHERE" not in source          # no label-less scans in the guard
     assert guard.OPEN_TOMBSTONE.startswith("(t.status IS NULL")
+
+
+def test_a_token_screen_is_never_recorded_as_evidence_and_rebuild_needs_an_extractor_to_reopen_edges():
+    source = (ROOT / "core/erasure_scope.py").read_text(encoding="utf-8")
+    assert ":content_screen:" not in source                       # no reopening evidence of that kind exists
+    assert ":re_extracted:" in source and ":rebuilt_from_clean_edges:" in source
+    assert "if extractor is None:" in source                       # without it edges stay held
+    assert "async def mark_late_write" in source

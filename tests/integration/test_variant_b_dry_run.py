@@ -55,3 +55,36 @@ async def test_dry_run_reports_reason_and_scale_without_writing_and_matches_the_
     real = {k: v for k, v in result["area"]["counts"].items() if not k.startswith("purged_")}
     assert real == episode["area_counts"]
     assert result["area"]["counts"]["purged_entities"] == episode["area_counts"]["entity_pure"]
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_list_objects_without_lineage_and_seedless_tombstones_without_content(isolated_graph, neo4j_isolation):
+    await isolated_graph.reset()
+    await data.load(isolated_graph.driver.execute_query, "both")           # flag AND a tombstone created without a seed
+    await isolated_graph.driver.execute_query(
+        "CREATE (:Entity {uuid:'orphan-entity', group_id:'knowledge', name:'OrphanK', summary:'lineage cannot reach me'})")
+    read_only = ReadOnlyGraph(isolated_graph._raw, neo4j_isolation.database)
+    before = await fingerprint(isolated_graph)
+    report = await dry_run(read_only, details=True)
+    assert await fingerprint(isolated_graph) == before                      # still read-only
+    reasons, detail = report["reasons"], report["details"]
+    print("DIAG " + json.dumps({"reasons": reasons, "effects": report["effects_by_moment"]}, sort_keys=True, default=str))
+
+    # tombstone created outside this code: no area can be computed, its group is held
+    assert reasons["TOMBSTONE_WITHOUT_SEED"]["total"] == 1
+    assert detail["TOMBSTONE_WITHOUT_SEED"]["objects"] == [{"uuid": "x-K", "group": "knowledge"}]
+    # objects lineage cannot reach: reported, and honestly labelled as not restricted
+    gap = reasons["LINEAGE_GAP"]
+    assert {r["grp"]: r["n"] for r in gap["entities_without_mentions"]}["knowledge"] >= 1
+    assert "not restricted" in gap["effect"]
+    assert {"uuid": "orphan-entity", "group": "knowledge", "label": "Entity"} in detail["LINEAGE_GAP"]["objects"]
+    # derived-kind episodes without lineage, per object
+    unknown = {(o["uuid"], o["kind"]) for o in detail["UNKNOWN_LINEAGE_DERIVED_KIND"]["objects"]}
+    assert unknown == {("chat-K", "chat_turn"), ("chat-P", "chat_turn"), ("l3-P", "l3_profile")}
+    assert detail["UNKNOWN_LINEAGE_DERIVED_KIND"]["truncated"] is False
+    # the report carries identifiers and counts, never stored text
+    blob = json.dumps(report, default=str)
+    for secret in ("MKxK", "MKdocK", "MKlegK", "lineage cannot reach me", "secret episode"):
+        assert secret not in blob
+    assert set(report["effects_by_moment"]) == {"on_deploy", "on_first_erasure_with_this_code", "on_migration_of_a_flag"}
+    assert "knowledge" in report["groups_touched_after_migration"] and "project" in report["groups_untouched_after_migration"]

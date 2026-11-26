@@ -13,6 +13,12 @@ episodes in the chain; kept hidden until the owner decides).
 
 Phase 2 (scope_erasure) is idempotent; rebuild_area commits only at an unchanged erasure
 revision and records per-object evidence. Nothing here deletes a tombstone.
+
+Evidence that reopens an object is *re-derivation from clean live sources*: an edge fact is
+extracted again from its live source episode with no previous episodes, an entity summary is
+rebuilt from such edges, and an object no live source supports is deleted. A token screen of the
+stored text is only a post-check on the re-derived text, never the basis: a paraphrase of erased
+content carries none of its tokens.
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 from core.erasure_guard import (
-    LOCK_ERASURE_CONTROL, OPEN_STATUSES, ErasureFenceChanged, read_erasure_state, token_hashes,
+    LOCK_ERASURE_CONTROL, OPEN_STATUSES, ErasureFenceChanged, blocked_node, read_erasure_state, token_hashes,
 )
 
 WINDOW = 10
@@ -243,18 +249,42 @@ def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()[:16]
 
 
-async def rebuild_area(graphiti, event_id: str | None = None) -> dict:
-    """Clear or rebuild what the open erasures marked, with per-object evidence.
+def graphiti_edge_extractor(graphiti):
+    """Production extractor: Graphiti's own extract_edges on ONE live episode.
 
-    * exposed objects: reopened only if a content screen finds none of the erased text's
-      distinctive tokens (tokens also present in other live episodes of the group are ignored);
-      a failing exposed object becomes mixed;
-    * mixed entities: summary rebuilt deterministically from the facts of clean edges;
-    * mixed edges and communities carry erased text that cannot be separated without a model:
-      they stay hidden (re-extraction is not implemented), and so does their group's write pause;
+    The input is exactly the episode text plus the names of the entities it mentions, with no
+    previous episodes, so it cannot contain text of an erased episode. Returns
+    ``[{"source": uuid, "target": uuid, "fact": str, "input_sha256": str}]``.
+    """
+    from graphiti_core.nodes import EntityNode, EpisodicNode
+    from graphiti_core.utils.maintenance.edge_operations import extract_edges
+
+    async def extract(episode_uuid: str) -> list[dict]:
+        episode = await EpisodicNode.get_by_uuid(graphiti.driver, episode_uuid)
+        mentioned = [r["u"] for r in await _rows(graphiti, "MATCH (:Episodic {uuid:$e})-[:MENTIONS]->(n:Entity) "
+                                                           "RETURN n.uuid AS u", e=episode_uuid)]
+        nodes = await EntityNode.get_by_uuids(graphiti.driver, mentioned)
+        edges = await extract_edges(graphiti.clients, episode, nodes, [], {("Entity", "Entity"): []}, episode.group_id)
+        digest = _sha(episode.content + "|" + "|".join(sorted(n.name for n in nodes)))
+        return [{"source": e.source_node_uuid, "target": e.target_node_uuid, "fact": e.fact, "input_sha256": digest}
+                for e in edges]
+
+    return extract
+
+
+async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None) -> dict:
+    """Re-derive or delete what open erasures marked; reopen objects only with such evidence.
+
+    * edges (exposed/mixed): live source episodes are found; none -> the edge is unsupported and
+      deleted; otherwise ``extractor(episode_uuid)`` re-extracts the fact from the clean source
+      and the edge is reopened with ``re_extracted`` evidence. A re-derived fact that still fails
+      the token screen stays hidden. Without an extractor edges stay hidden.
+    * entities (exposed/mixed): no live source mentions them -> deleted; otherwise the summary is
+      rebuilt from the facts of its incident edges once every incident edge is clean or re-derived.
+    * communities carry erased text that cannot be separated without a model: they stay hidden.
     * derived episodes (chat, summaries, L3, any group): never reopened here (owner decision).
-    All commits require an unchanged erasure revision; otherwise ErasureFenceChanged is raised
-    and nothing already hidden is reopened.
+    The group's write pause lasts while any Graphiti-derived object remains marked. All commits
+    require an unchanged erasure revision (ErasureFenceChanged otherwise; nothing is reopened).
     """
     await scope_pending_erasures(graphiti)
     rev0, _ = await read_erasure_state(graphiti)
@@ -265,63 +295,97 @@ async def rebuild_area(graphiti, event_id: str | None = None) -> dict:
     erased_hashes: set[str] = {h for o in opens for h in (o["h"] or [])}
     live_cache: dict[str, set[str]] = {}
 
-    async def dirty(text: str, group: str) -> bool:
+    async def dirty(text: str, group: str) -> bool:     # post-check only, never the basis
         if group not in live_cache:
             live_cache[group] = await _live_hashes(graphiti, group)
         return bool((set(token_hashes(text, cap=100000)) & erased_hashes) - live_cache[group])
 
-    summary = {"reopened_by_screen": 0, "rebuilt_entities": 0, "still_hidden_edges": 0,
-               "still_hidden_communities": 0, "owner_decision_needed": 0}
+    async def live_sources(episode_ids: list[str]) -> list[str]:
+        if not episode_ids:
+            return []
+        return [r["u"] for r in await _rows(graphiti, "MATCH (e:Episodic) WHERE e.uuid IN $u AND NOT "
+                                            + blocked_node("e") + " RETURN e.uuid AS u", u=episode_ids)]
+
+    summary = {"re_extracted_edges": 0, "purged_unsupported_edges": 0, "purged_unsupported_entities": 0,
+               "rebuilt_entities": 0, "held_edges": 0, "held_entities": 0, "held_communities": 0,
+               "held_for_missing_extractor": 0, "owner_decision_needed": 0}
     for ev in [o["e"] for o in opens]:
         prefix = ev + ":"
         marked = lambda x: f"any(m IN coalesce({x}.erasure_quarantine,[]) WHERE m STARTS WITH $p)"  # noqa: E731
         edges = await _rows(graphiti, f"""
             MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity) WHERE {marked('r')}
-            RETURN r.uuid AS uuid, r.group_id AS g, r.fact AS fact, toString(r.created_at) AS ts,
-                   [m IN r.erasure_quarantine WHERE m STARTS WITH $p | substring(m, size($p))][0] AS cls,
-                   s.uuid AS s, t.uuid AS t, size(r.erasure_quarantine) AS nmarks""", p=prefix)
+            RETURN r.uuid AS uuid, r.group_id AS g, r.fact AS fact, coalesce(r.episodes,[]) AS episodes,
+                   s.uuid AS s, t.uuid AS t""", p=prefix)
         ents = await _rows(graphiti, f"""
             MATCH (n:Entity) WHERE {marked('n')}
-            RETURN n.uuid AS uuid, n.group_id AS g, n.name AS name, n.summary AS summary,
-                   [m IN n.erasure_quarantine WHERE m STARTS WITH $p | substring(m, size($p))][0] AS cls,
-                   size(n.erasure_quarantine) AS nmarks""", p=prefix)
-        comms = await _rows(graphiti, f"""
-            MATCH (n:Community) WHERE {marked('n')}
-            RETURN n.uuid AS uuid, n.group_id AS g, n.summary AS summary, size(n.erasure_quarantine) AS nmarks""", p=prefix)
+            RETURN n.uuid AS uuid, n.group_id AS g, n.name AS name""", p=prefix)
+        comms = await _rows(graphiti, f"MATCH (n:Community) WHERE {marked('n')} RETURN count(n) AS n", p=prefix)
         derived = await _rows(graphiti, f"MATCH (n:Episodic) WHERE {marked('n')} RETURN count(n) AS n", p=prefix)
         summary["owner_decision_needed"] += derived[0]["n"]
+        summary["held_communities"] += comms[0]["n"]
 
-        clear_edges, clear_ents, hold_edges = [], [], []
+        extracted_cache: dict[str, list[dict]] = {}
+        used: dict[str, set[int]] = {}
+        purge_edges, cleared_edges, held_edge_ids = [], [], set()
         for r in edges:
-            if r["cls"] == "mixed" or await dirty(r["fact"] or "", r["g"]):
-                hold_edges.append(r)          # known to carry erased text: needs an extractor
-            else:
-                clear_edges.append({"uuid": r["uuid"], "evidence": f"{ev}:content_screen:rev{rev0}:{_sha(r['fact'])}"})
-        clear_ids = {c["uuid"] for c in clear_edges}
-        for r in ents:
-            if r["cls"] == "exposed" and not await dirty(r["summary"] or "", r["g"]):
-                clear_ents.append({"uuid": r["uuid"], "summary": r["summary"], "evidence":
-                                   f"{ev}:content_screen:rev{rev0}:{_sha(r['summary'])}"})
+            live = await live_sources(r["episodes"])
+            if not live:
+                purge_edges.append(r["uuid"])            # no live source supports this edge
                 continue
-            clean = [e for e in await _rows(graphiti, f"""
-                MATCH (a:Entity {{uuid:$u}})-[r:RELATES_TO]-(:Entity)
-                RETURN r.uuid AS uuid, r.fact AS fact, toString(r.created_at) AS ts,
-                       size(coalesce(r.erasure_quarantine,[])) AS marks ORDER BY ts""", u=r["uuid"])
-                     if e["marks"] == 0 or e["uuid"] in clear_ids]
-            facts = list(dict.fromkeys(e["fact"] for e in clean if e["fact"]))
-            new_summary = "\n".join(facts) if facts else (r["name"] or "")
-            if await dirty(new_summary, r["g"]):
-                continue                      # cannot happen from clean facts; stay hidden if it does
-            clear_ents.append({"uuid": r["uuid"], "summary": new_summary, "evidence":
-                               f"{ev}:rebuilt_from_clean_edges:rev{rev0}:{_sha(new_summary)}:{len(clean)}"})
-            summary["rebuilt_entities"] += 1
-        summary["still_hidden_edges"] += len(hold_edges)
-        summary["still_hidden_communities"] += len(comms)
-        summary["reopened_by_screen"] += len(clear_edges) + sum(
-            1 for c in clear_ents if ":content_screen:" in c["evidence"])
+            if extractor is None:
+                held_edge_ids.add(r["uuid"]); summary["held_for_missing_extractor"] += 1
+                continue
+            ep = live[0]
+            if ep not in extracted_cache:
+                extracted_cache[ep] = await extractor(ep)
+            pair = {r["s"], r["t"]}
+            pick = next((i for i, c in enumerate(extracted_cache[ep])
+                         if {c["source"], c["target"]} == pair and i not in used.setdefault(ep, set())), None)
+            if pick is None:
+                purge_edges.append(r["uuid"])            # the clean source does not state this fact
+                continue
+            used[ep].add(pick)
+            item = extracted_cache[ep][pick]
+            if await dirty(item["fact"], r["g"]):
+                held_edge_ids.add(r["uuid"])             # even the clean derivation carries erased tokens
+                continue
+            cleared_edges.append({"uuid": r["uuid"], "fact": item["fact"], "evidence":
+                                  f"{ev}:re_extracted:rev{rev0}:in{item['input_sha256']}:out{_sha(item['fact'])}"})
+        summary["held_edges"] += len(held_edge_ids)
+        fact_of = {c["uuid"]: c["fact"] for c in cleared_edges}
+        gone_edges = set(purge_edges)
 
-        await _checkpoint("after_screen")      # a re-erasure here must stop the commit below
-        await _commit(graphiti, rev0, prefix, "edge", clear_edges)
+        purge_entities, clear_ents = [], []
+        for r in ents:
+            if not (await _rows(graphiti, "MATCH (n:Entity {uuid:$u}) OPTIONAL MATCH (e:Episodic)-[:MENTIONS]->(n) "
+                                          "WHERE NOT " + blocked_node("e") + " RETURN count(e) AS c", u=r["uuid"]))[0]["c"]:
+                purge_entities.append(r["uuid"])
+                continue
+            incident = await _rows(graphiti, """
+                MATCH (a:Entity {uuid:$u})-[r:RELATES_TO]-(:Entity)
+                RETURN r.uuid AS uuid, r.fact AS fact, size(coalesce(r.erasure_quarantine,[])) AS marks,
+                       toString(r.created_at) AS ts ORDER BY ts""", u=r["uuid"])
+            incident = [e for e in incident if e["uuid"] not in gone_edges]
+            if any(e["marks"] > 0 and e["uuid"] not in fact_of for e in incident):
+                summary["held_entities"] += 1            # an incident edge is not clean yet
+                continue
+            facts = list(dict.fromkeys(fact_of.get(e["uuid"], e["fact"]) for e in incident
+                                       if fact_of.get(e["uuid"], e["fact"])))
+            text = "\n".join(facts) if facts else (r["name"] or "")
+            if await dirty(text, r["g"]):
+                summary["held_entities"] += 1
+                continue
+            clear_ents.append({"uuid": r["uuid"], "summary": text, "evidence":
+                               f"{ev}:rebuilt_from_clean_edges:rev{rev0}:{_sha(text)}:{len(incident)}"})
+        summary["re_extracted_edges"] += len(cleared_edges)
+        summary["purged_unsupported_edges"] += len(purge_edges)
+        summary["purged_unsupported_entities"] += len(purge_entities)
+        summary["rebuilt_entities"] += len(clear_ents)
+
+        await _checkpoint("after_screen")      # a re-erasure here must stop every commit below
+        await _purge(graphiti, rev0, "edge", purge_edges)
+        await _purge(graphiti, rev0, "Entity", purge_entities)
+        await _commit(graphiti, rev0, prefix, "edge", cleared_edges)
         await _commit(graphiti, rev0, prefix, "Entity", clear_ents)
 
         left = await _rows(graphiti, f"""
@@ -339,13 +403,27 @@ async def rebuild_area(graphiti, event_id: str | None = None) -> dict:
     return summary
 
 
+async def _purge(graphiti, rev: int, label: str, ids: list[str]) -> None:
+    """Delete derived objects no live source supports; fenced like every rebuild commit."""
+    if not ids:
+        return
+    match = ("OPTIONAL MATCH ()-[x:RELATES_TO {uuid:id}]->()" if label == "edge"
+             else "OPTIONAL MATCH (x:Entity {uuid:id})")
+    delete = "DELETE x" if label == "edge" else "DETACH DELETE x"
+    result = await graphiti.driver.execute_query(
+        LOCK_ERASURE_CONTROL + " WHERE coalesce(gate.revision,0) = $rev UNWIND $ids AS id "
+        + match + " WITH id, x " + delete + " RETURN count(id) AS n", rev=rev, ids=ids)
+    if int(result.records[0]["n"]) != len(ids):
+        raise ErasureFenceChanged("erasure revision changed during rebuild; nothing was reopened")
+
+
 async def _commit(graphiti, rev: int, prefix: str, label: str, items: list[dict]) -> None:
     if not items:
         return
     ev_expr = "x.erasure_quarantine = [m IN coalesce(x.erasure_quarantine,[]) WHERE NOT m STARTS WITH $prefix], " \
               "x.erasure_evidence = coalesce(x.erasure_evidence,[]) + [it.evidence]"
     if label == "edge":
-        match, extra = "MATCH ()-[x:RELATES_TO {uuid:it.uuid}]->()", ""
+        match, extra = "MATCH ()-[x:RELATES_TO {uuid:it.uuid}]->()", ", x.fact = it.fact"
     else:
         match, extra = "MATCH (x:Entity {uuid:it.uuid})", ", x.summary = it.summary"
     result = await graphiti.driver.execute_query(
@@ -354,3 +432,34 @@ async def _commit(graphiti, rev: int, prefix: str, label: str, items: list[dict]
         rev=rev, items=items, prefix=prefix)
     if int(result.records[0]["n"]) != len(items):
         raise ErasureFenceChanged("erasure revision changed during rebuild; nothing was reopened")
+
+
+async def mark_late_write(graphiti, group_id: str, since_revision: int, episode_uuids: list[str]) -> dict:
+    """Contain objects of a write that was already in flight when an erasure happened in its group.
+
+    add_episode reads its context, calls the model and writes its derived objects in one long
+    call; an erasure that lands meanwhile cannot have scoped objects that did not exist yet.
+    Every entity/edge derived from the given episodes is marked as exposed to each erasure of the
+    group newer than ``since_revision`` (its tombstone is reopened, so the group is paused), and
+    the episodes themselves are isolated until reconciliation.
+    """
+    if not episode_uuids:
+        return {"marked": 0}
+    tombs = await _rows(graphiti, "MATCH (t:FractalErasure {group_id:$g}) WHERE t.revision > $r "
+                                  "RETURN t.event_id AS e, t.status AS s", g=group_id, r=since_revision)
+    if not tombs:
+        return {"marked": 0}
+    ents = [r["u"] for r in await _rows(graphiti, "MATCH (e:Episodic)-[:MENTIONS]->(n:Entity) WHERE e.uuid IN $u "
+                                                  "RETURN DISTINCT n.uuid AS u", u=episode_uuids)]
+    edges = [r["u"] for r in await _rows(graphiti, "MATCH ()-[r:RELATES_TO {group_id:$g}]->() "
+                                                   "WHERE any(x IN coalesce(r.episodes,[]) WHERE x IN $u) "
+                                                   "RETURN DISTINCT r.uuid AS u", g=group_id, u=episode_uuids)]
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic) WHERE e.uuid IN $u SET e.erasure_quarantined = true", u=episode_uuids)
+    for t in tombs:
+        await _mark(graphiti, t["e"], "Entity", {u: "exposed" for u in ents})
+        await _mark(graphiti, t["e"], "edge", {u: "exposed" for u in edges})
+        await graphiti.driver.execute_query(
+            "MATCH (t:FractalErasure {event_id:$e}) SET t.blocked_groups=[$g], "
+            "t.status=CASE WHEN t.status = 'PENDING_SCOPE' THEN 'PENDING_SCOPE' ELSE 'SCOPED' END", e=t["e"], g=group_id)
+    return {"marked": len(ents) + len(edges), "events": [t["e"] for t in tombs]}

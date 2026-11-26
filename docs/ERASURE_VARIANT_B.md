@@ -34,24 +34,40 @@ until the flag is migrated to a tombstone (`erase_node`); `scripts/erasure_dry_r
 **A. Send context to the model again (new model-assisted writes).**
 Per group, automatically: ingest and chat persistence refuse while an open erasure lists the group in
 `blocked_groups` (Graphiti-derived objects of that group would be fed back to the model as candidates;
-hiding them at read time does not help). The group reopens when no such object is still marked:
-pure objects purged, mixed entities rebuilt, exposed objects cleared. The previous-episode window given
-to `add_episode` excludes erased/quarantined episodes (Graphiti's default window ignores Fractal's flags).
-Other groups are never paused. Mixed edges and communities cannot be separated from erased text without a
-model; re-extraction is **not implemented**, so such objects keep their group paused.
+hiding them at read time does not help). The group reopens only when no such object is still marked.
+Unresolved objects keep the group paused; this is accepted policy. The previous-episode window given to
+`add_episode` excludes erased/quarantined episodes (Graphiti's default window ignores Fractal's flags).
+Other groups are never paused.
 
-**B. Show a specific rebuilt object again.** Per object, tombstone kept. The object's mark is removed
-only with a recorded `erasure_evidence` entry `<event>:<kind>:rev<N>:<sha256[:16]>`:
-* `content_screen`: none of the erased text's distinctive tokens (tokens also present in other live episodes
-  of the group are ignored). Weak evidence: a paraphrase evades it.
-* `rebuilt_from_clean_edges`: entity summary recomputed from the facts of clean edges (count recorded).
-* never automatic: `derived` episodes (counted in `owner_decision_needed`) and unknown-lineage derived-kind episodes.
+**B. Show a specific rebuilt object again.** Per object, tombstone kept. A mark is removed only with a
+recorded `erasure_evidence` entry `<event>:<kind>:rev<N>:...` of one of two kinds:
+* `re_extracted`: the edge's fact was extracted again from its **live source episode** by the extractor
+  (`graphiti_edge_extractor`: Graphiti's own `extract_edges`, one episode, no previous episodes; the
+  entry carries the input hash). An edge no live source states is deleted instead.
+* `rebuilt_from_clean_edges`: an entity summary recomputed from the facts of its incident edges, allowed
+  only once every incident edge is clean or re-derived. An entity no live source mentions is deleted.
+
+A token screen of the *stored* text is **not** evidence: a paraphrase of erased content carries none of
+its tokens. It runs only as a post-check on re-derived text. Without an extractor nothing is reopened
+and the group stays paused. Never reopened here: communities (no model-free way to separate the text),
+`derived` episodes (chat, summaries, L3: `owner_decision_needed`) and episodes without recorded lineage.
+
+## A write that overlaps an erasure
+`add_episode()` reads its context, calls the model and writes derived objects in one long call; an erasure
+in the same group that lands meanwhile cannot have scoped objects that did not exist yet. When ingest sees
+(at finalization or at completion) an erasure newer than the revision it started at, it refuses to confirm
+the write (`unconfirmed`, claim kept), isolates the episode, and marks every entity/edge derived from it as
+exposed to each such erasure (`mark_late_write`): the tombstone is reopened and the group paused until the
+usual re-derivation. Erasures in other groups do not disturb a running write (per-group fence).
 
 ## Limits
-* The screen proves absence of tokens, not of meaning. Entity summaries that a model wrote richer than
-  the edge facts lose that richness when rebuilt.
+* Re-derivation costs one extractor call per live source episode of an affected edge.
+* Entity summaries that a model wrote richer than the edge facts lose that richness when rebuilt.
+* The episode of a write that overlapped an erasure stays isolated (`unconfirmed`); there is no reconciliation tool yet.
 * Agent-originated episodes (MCP) carry no lineage to what the agent saw.
 * Chat fences on the global revision (it reads every group): an erasure anywhere makes an in-flight turn retry.
   Document ingest fences per group.
 * Experience keeps its own conditions and is outside this model.
 * Migration of legacy flags and `lineage_reviewed` marking are owner actions; nothing here runs them.
+  `scripts/erasure_dry_run.py [--details]` lists, read-only and without content: flagged objects, derived-kind
+  episodes without lineage, objects lineage cannot reach (not restricted by this model), tombstones without a seed.

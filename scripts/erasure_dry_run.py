@@ -52,6 +52,8 @@ def render(report: dict) -> str:
         f"GROUP_WRITE_PAUSE: {r['GROUP_WRITE_PAUSE']}",
         f"UNKNOWN_LINEAGE_DERIVED_KIND: {r['UNKNOWN_LINEAGE_DERIVED_KIND']['total']} "
         f"({json.dumps(r['UNKNOWN_LINEAGE_DERIVED_KIND']['by_group_and_kind'])})",
+        f"LINEAGE_GAP: {r['LINEAGE_GAP']['total']} (not restricted; an erasure cannot reach them)",
+        f"TOMBSTONE_WITHOUT_SEED: {r['TOMBSTONE_WITHOUT_SEED']['total']}",
         f"groups touched after migration: {report['groups_touched_after_migration']}; "
         f"untouched: {report['groups_untouched_after_migration']}",
         report["migration"],
@@ -59,14 +61,14 @@ def render(report: dict) -> str:
     return "\n".join(lines)
 
 
-async def main(as_json: bool) -> int:
+async def main(as_json: bool, details: bool) -> int:
     uri, user, password = os.environ.get("NEO4J_URI"), os.environ.get("NEO4J_USER"), os.environ.get("NEO4J_PASSWORD")
     if not (uri and user and password):
         print("NEO4J_URI, NEO4J_USER and NEO4J_PASSWORD are required (read-only access is enough)", file=sys.stderr)
         return 2
     driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
     try:
-        report = await dry_run(ReadOnlyGraph(driver, os.environ.get("NEO4J_DATABASE") or "neo4j"))
+        report = await dry_run(ReadOnlyGraph(driver, os.environ.get("NEO4J_DATABASE") or "neo4j"), details=details)
     finally:
         await driver.close()
     print(json.dumps(report, indent=2, sort_keys=True, default=str) if as_json else render(report))
@@ -76,4 +78,6 @@ async def main(as_json: bool) -> int:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true")
-    raise SystemExit(asyncio.run(main(ap.parse_args().json)))
+    ap.add_argument("--details", action="store_true", help="also list the objects (uuid, group, label; no content)")
+    args = ap.parse_args()
+    raise SystemExit(asyncio.run(main(args.json or args.details, args.details)))

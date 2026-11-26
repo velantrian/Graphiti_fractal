@@ -363,6 +363,22 @@ async def _settle_unfinished_claim(graphiti, *, group_id: str, fingerprint: str,
         return "reconciliation" if write_started else "pending"
 
 
+async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: int | None,
+                                       episode_uuids: list[str]) -> None:
+    """An erasure in this group landed while add_episode was running: contain what it wrote.
+
+    Never raises (it runs inside error handling); a failure is logged and the claim's
+    reconciliation state plus the group's write pause remain the safety net.
+    """
+    if since_revision is None or not episode_uuids:
+        return
+    try:
+        from core.erasure_scope import mark_late_write
+        await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+    except Exception:  # noqa: BLE001
+        logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
+
+
 async def ingest_text_document(
     graphiti,
     text: str,
@@ -422,6 +438,7 @@ async def ingest_text_document(
     unconfirmed_writes = 0
     reference_time = datetime.now(timezone.utc)
     semaphore = get_write_semaphore()
+    written_uuids: list[str] = []      # episodes this call made Graphiti create
 
     if job_id:
         update_upload_job(
@@ -522,6 +539,7 @@ async def ingest_text_document(
             if not episode_uuid:
                 raise RuntimeError("Graphiti add_episode returned no episode UUID")
             episode_uuid = str(episode_uuid)
+            written_uuids.append(episode_uuid)
             await mark_ingest_claim_episode_created(
                 graphiti, group_id=group_id, fingerprint=chunk_fp,
                 token=claim_token, episode_uuid=episode_uuid,
@@ -599,6 +617,8 @@ async def ingest_text_document(
                     graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
                     write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
+            if write_started:
+                await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision, written_uuids)
             if write_started or settled == "reconciliation":
                 # An attempt may have reached Graphiti: neither a failure nor a success.
                 unconfirmed_writes += 1
@@ -655,6 +675,7 @@ async def ingest_text_document(
     try:
         await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
     except Exception:
+        await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision, written_uuids)
         result["status"] = "ok"
         result["completeness"] = "unconfirmed"
         result["warnings"].append("Erasure revision could not be confirmed at completion")

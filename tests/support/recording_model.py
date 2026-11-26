@@ -16,8 +16,10 @@ end against a real Neo4j:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +44,13 @@ class RecordingLLM(LLMClient):
         super().__init__(LLMConfig(api_key="recording-stub", model="recording-stub"), cache=False)
         self.calls: list[ModelCall] = []
         self.episode_body = ""
+        self._hold = None
+
+    def hold_next(self, prompt_name: str):
+        """Park the next call of this prompt until the test releases it (a write in flight)."""
+        gate = SimpleNamespace(reached=asyncio.Event(), release=asyncio.Event())
+        self._hold = (prompt_name, gate)
+        return gate
 
     def expect(self, episode_body: str) -> None:
         """The text of the episode about to be added (used only to build answers)."""
@@ -63,6 +72,10 @@ class RecordingLLM(LLMClient):
         text = "\n".join(str(message.content) for message in messages)
         name = response_model.__name__ if response_model is not None else None
         self.calls.append(ModelCall(prompt_name, name, text))
+        if self._hold and self._hold[0] == prompt_name:
+            gate, self._hold = self._hold[1], None
+            gate.reached.set()
+            await gate.release.wait()
         return self._answer(name, text)
 
     # -- rule set --------------------------------------------------------------
@@ -122,3 +135,36 @@ class HashEmbedder(EmbedderClient):
 class ZeroRanker(CrossEncoderClient):
     async def rank(self, query, passages):
         return [(p, 1.0 / (i + 1)) for i, p in enumerate(passages)]
+
+
+PARAPHRASE = "Mira's strongbox opening phrase is kept inside the ochre cupboard."
+
+
+class ParaphrasingLLM(RecordingLLM):
+    """A model that, when erased text is in its input, restates it in other words.
+
+    The restatement shares none of the erased text's distinctive tokens (see PARAPHRASE), so a
+    token screen of the stored fact cannot tell it from clean text.
+    """
+
+    def _answer(self, name, text):
+        out = super()._answer(name, text)
+        # restates erased text only in the episode under test (marked NEWQ), when it sees that text
+        if name == "ExtractedEdges" and "ZORBLAX" in text and "NEWQ" in self.episode_body and out["edges"]:
+            first = out["edges"][0]
+            out["edges"] = out["edges"] + [{**first, "fact": PARAPHRASE}]
+        return out
+
+
+def recording_extractor(graphiti, llm):
+    """Fractal's production extractor (real extract_edges) with the recorder told what is being extracted."""
+    from core.erasure_scope import graphiti_edge_extractor
+    real = graphiti_edge_extractor(graphiti)
+
+    async def extract(episode_uuid):
+        rows = (await graphiti.driver.execute_query(
+            "MATCH (e:Episodic {uuid:$u}) RETURN e.content AS c", u=episode_uuid)).records
+        llm.expect(rows[0]["c"])
+        return await real(episode_uuid)
+
+    return extract
