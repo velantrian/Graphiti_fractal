@@ -321,7 +321,9 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph)
     """Provider-free GF-01/GF-03/GF-04; actual Cypher, no owner database."""
     import hashlib
     from datetime import datetime, timedelta, timezone
-    from core.ingest_atomicity import mark_ingest_claim_failed, read_ingest_claim
+    from core.ingest_atomicity import (
+        mark_ingest_claim_failed, mark_ingest_claim_write_attempt, read_ingest_claim,
+    )
     from knowledge.ingest import episode_exists, UnconfirmedEpisodeIdentity
 
     graphiti = isolated_graph
@@ -363,10 +365,14 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph)
                 with pytest.raises(UnconfirmedEpisodeIdentity):
                     await episode_exists(graphiti, fp, body, "knowledge", **kwargs)
         token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain")
+        # The writer recorded its attempt before calling Graphiti (see
+        # test_ingest_claim_lifecycle.py for expired claims without an attempt).
+        await mark_ingest_claim_write_attempt(
+            graphiti, group_id="knowledge", fingerprint="uncertain", token=token)
         await graphiti.driver.execute_query(
             "MATCH (c:FractalIngestClaim {token:$token}) SET c.expires_at=datetime($past)",
             token=token, past=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat())
-        # Old timestamps do not permit takeover; a slow writer may still commit.
+        # Old timestamps do not permit takeover once an attempt exists; a slow writer may still commit.
         assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
         await mark_ingest_claim_failed(
             graphiti, group_id="knowledge", fingerprint="uncertain", token=token, error_type="TimeoutError")

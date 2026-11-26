@@ -14,7 +14,7 @@ def _fake_execute_query(query, **kwargs):
     # claim CREATE, claim finalization) only needs a truthy record.
     if "e.fingerprint = $fp OR e.content = $content" in query:
         return MagicMock(records=[])
-    return MagicMock(records=[{"token": "test-token", "uuid": "test-uuid"}])
+    return MagicMock(records=[{"token": "test-token", "uuid": "test-uuid", "attempts": 1}])
 
 
 class MockGraphiti:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import hashlib
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from core.ingest_atomicity import (
     finalize_episode_identity,
     mark_ingest_claim_episode_created,
     mark_ingest_claim_failed,
+    mark_ingest_claim_write_attempt,
+    release_ingest_claim,
 )
 from core.text_utils import fingerprint, split_into_semantic_chunks
 
@@ -319,6 +322,34 @@ async def remember_text(
     )
 
 
+async def _settle_unfinished_claim(graphiti, *, group_id: str, fingerprint: str, token: str,
+                                   write_started: bool, error_type: str) -> str:
+    """Decide what a claim becomes when its chunk did not finish. Never raises.
+
+    "released": no attempt reached Graphiti (this process never called it and the
+        database holds no write-attempt marker), so only this writer's claim is
+        deleted, by token, and a retry of the same chunk can proceed.
+    "reconciliation": Graphiti may have written (an attempt was made, even one that
+        raised a rate limit or timeout); the claim is kept as RECONCILIATION_REQUIRED.
+    "pending": settlement itself failed (database unreachable). This writer never
+        called Graphiti; the claim stays PENDING and, having no marker, can be
+        replaced once its TTL has passed.
+    """
+    try:
+        if not write_started:
+            if await release_ingest_claim(graphiti, group_id=group_id, fingerprint=fingerprint,
+                                          token=token, confirmed_no_write=True):
+                return "released"
+            # Not deleted: a write-attempt marker exists (its commit may have been
+            # acknowledged ambiguously) or the claim is no longer ours.
+        await mark_ingest_claim_failed(graphiti, group_id=group_id, fingerprint=fingerprint,
+                                       token=token, error_type=error_type)
+        return "reconciliation"
+    except Exception:  # noqa: BLE001 - settlement must not mask the original failure
+        logger.error("Failed to settle unfinished ingest claim")
+        return "reconciliation" if write_started else "pending"
+
+
 async def ingest_text_document(
     graphiti,
     text: str,
@@ -427,6 +458,11 @@ async def ingest_text_document(
             async def write_episode():
                 nonlocal write_started
                 async with semaphore:
+                    # Durable compare-and-set *before* the call: afterwards "no marker"
+                    # proves Graphiti was never called for this claim. Raises
+                    # IngestClaimLost (no write) if the claim was replaced meanwhile.
+                    await mark_ingest_claim_write_attempt(
+                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token)
                     write_started = True
                     return await graphiti.add_episode(
                         name=chunk_source[:100],
@@ -509,19 +545,23 @@ async def ingest_text_document(
             skipped_count += 1
             unconfirmed_existing += 1
             warnings.append(f"Chunk {index}: matching episode identity unconfirmed; reconciliation required")
-        except Exception as exc:  # noqa: BLE001
+        except asyncio.CancelledError:
+            # Cancelled before the call: release (retry possible). After it: keep for
+            # reconciliation. Shielded so settlement completes while cancelled.
             if claim_token:
-                try:
-                    # A transport/provider error is not proof of non-persistence.
-                    # Keep the claim even if no upstream UUID was returned.
-                    await mark_ingest_claim_failed(
-                        graphiti, group_id=group_id, fingerprint=chunk_fp,
-                        token=claim_token, error_type=type(exc).__name__,
-                    )
-                except Exception:
-                    logger.error("Failed to record reconciliation requirement")
+                await asyncio.shield(_settle_unfinished_claim(
+                    graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                    write_started=write_started, error_type="CancelledError"))
+            raise
+        except Exception as exc:  # noqa: BLE001
+            settled = "none"
+            if claim_token:
+                settled = await _settle_unfinished_claim(
+                    graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                    write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
-            if write_started:
+            if write_started or settled == "reconciliation":
+                # An attempt may have reached Graphiti: neither a failure nor a success.
                 unconfirmed_writes += 1
                 warnings.append(f"Chunk {index}: {type(exc).__name__}: write outcome unconfirmed")
             else:

@@ -65,6 +65,7 @@ async def test_ingest_validation_failure_is_fail_closed():
             new=AsyncMock(return_value="test-claim-token"),
         ),
         patch("knowledge.ingest.mark_ingest_claim_failed", new=AsyncMock()) as hold_claim,
+        patch("knowledge.ingest.mark_ingest_claim_write_attempt", new=AsyncMock(return_value=1)),
         patch(
             "knowledge.ingest.mark_ingest_claim_episode_created",
             new=AsyncMock(),
