@@ -372,3 +372,34 @@ async def test_rate_limit_after_a_committed_write_is_not_retried_into_a_second_e
     again = await _ingest(stub, text)                   # repeat of the whole operation
     assert again["completeness"] == "unconfirmed"
     assert len(stub.calls) == 1 and await _episodes(stub, text) == 1
+
+
+def _doc_queries():
+    text = (ROOT / "docs/INGEST_CLAIM_DIAGNOSTICS.md").read_text(encoding="utf-8")
+    return [block.split("```cypher\n", 1)[1] for block in text.split("```\n") if "```cypher\n" in block]
+
+
+@pytest.mark.asyncio
+async def test_documented_diagnostic_queries_find_a_chunk_that_landed_but_is_unconfirmed(stub):
+    queries = _doc_queries()
+    assert len(queries) == 2
+    text = _text("diagnostics")
+    stub.plan = [write_then_raise(RateLimitError("Please try again in 0.01s."))]
+    result = await _ingest(stub, text)
+    assert result["completeness"] == "unconfirmed" and result["unconfirmed_writes"] == 1
+
+    claims = (await stub.driver.execute_query(queries[0])).records
+    mine = [r for r in claims if r["fingerprint"] == fingerprint(text.strip())]
+    assert len(mine) == 1
+    row = mine[0]
+    assert (row["state"], row["write_attempts"], row["attempt_recorded"], row["group_id"]) == (
+        "RECONCILIATION_REQUIRED", 1, True, GROUP)
+    assert row["error_type"] == "AmbiguousGraphitiWrite" and row["episode_exists"] is False
+
+    landed = (await stub.driver.execute_query(queries[1], group_id=GROUP, chunk_text=text.strip())).records
+    assert len(landed) == 1 and landed[0]["finalized"] is False   # stored upstream, never finalized
+
+    other = _text("diagnostics-clean")
+    assert (await _ingest(stub, other))["completeness"] == "complete"
+    claims = (await stub.driver.execute_query(queries[0])).records
+    assert all(r["fingerprint"] != fingerprint(other.strip()) for r in claims)   # completed chunks are not listed
