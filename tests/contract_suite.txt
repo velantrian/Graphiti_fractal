@@ -48,3 +48,4 @@ tests/test_integrity_phase1.py
 tests/test_erasure_guard.py
 tests/test_neo4j_isolation_guard.py
 tests/test_ingest_claim_settlement.py
+tests/test_erasure_scope_contract.py

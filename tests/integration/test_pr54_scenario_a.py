@@ -82,3 +82,25 @@ async def test_scenario_a_same_data_main_vs_pr54(indexes, variant):
         assert "MKderxK" in main["groups"]["K"]["knowledge_search"]
         if variant != "tombstone":
             assert "MKxK" in main["groups"]["K"]["recall"]["episodes"]   # soft-deleted episode still recalled on main
+
+
+    # --- variant B on the same data -------------------------------------------------------------
+    if variant == "none":
+        assert vb["groups"] == main["groups"] and vb["visualization"] == main["visualization"]   # no regression
+    elif variant == "old_flag":
+        # A legacy deleted=true flag hides only the flagged episode; nothing else changes.
+        # (Derived objects of that episode stay visible until the flag is migrated to a tombstone:
+        # this is main's behavior today and is what the dry run reports.)
+        assert vb["groups"]["P"] == main["groups"]["P"]
+        k_main, k_vb = main["groups"]["K"], vb["groups"]["K"]
+        assert "MKxK" in k_main["recall"]["episodes"] and "MKxK" not in k_vb["recall"]["episodes"]
+        assert k_vb["knowledge_search"] == k_main["knowledge_search"] and k_vb["l2"] == k_main["l2"] and k_vb["l3"] == k_main["l3"]
+        assert vb["visualization"] == main["visualization"]
+    else:
+        # A tombstone without a lineage seed (not created by this code): its own group's derived
+        # objects are held; the independent group keeps documents, legacy notes, entities, edges, L2.
+        assert vb["groups"]["K"]["recall"] == {"episodes": ["MKdocK"]} and vb["groups"]["K"]["l2"] == []
+        p_seen = vb["groups"]["P"]
+        assert {"MKdocP", "MKlegP"} <= set(p_seen["recall"]["episodes"]) and "entities" in p_seen["recall"]
+        assert p_seen["l2"] == ["MKdocP"] and "MKentP" in p_seen["knowledge_search"]
+        assert "MKdocK" in vb["groups"]["K"]["knowledge_search"] and "MKentK" not in vb["groups"]["K"]["knowledge_search"]

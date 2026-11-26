@@ -350,7 +350,7 @@ async def test_c5_finalize_normal_turn_and_valid_summary(world):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("how", ["source_erased_revision_bumped", "source_quarantined_same_revision",
-                                 "global_quarantine_expected"])
+                                 "source_in_open_erasure_area"])
 async def test_c5_summary_with_a_dropped_source_is_denied_and_changes_nothing(world, how):
     from core.chat_persistence import finalize_chat_episode
     state = await read_erasure_state(world.graphiti)
@@ -361,8 +361,9 @@ async def test_c5_summary_with_a_dropped_source_is_denied_and_changes_nothing(wo
         assert (await erase_node(world.graphiti, uuid="turn-3"))["deleted"]
     elif how == "source_quarantined_same_revision":
         await world.flaky._inner.execute_query("MATCH (e:Episodic {uuid:'turn-3'}) SET e.erasure_quarantined=true")
-    else:
-        expected = (state[0], True)
+    else:   # variant B: a source marked by an open erasure (e.g. recalled the erased text) is not admitted
+        await world.flaky._inner.execute_query(
+            "MATCH (e:Episodic {uuid:'turn-3'}) SET e.erasure_quarantine=['evt:derived']")
     with pytest.raises(ErasureFenceChanged):
         await finalize_chat_episode(world.graphiti, episode_uuid="summary-bad", user_id="owner", group_id="personal",
                                     expected_state=expected, metadata=_summary_meta(sources))

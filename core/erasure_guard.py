@@ -97,6 +97,11 @@ def blocked_node(alias: str) -> str:
     )""", alias)
 
 
+def unknown_lineage(alias: str) -> str:
+    """Derived-kind episode (chat/summary/L3) whose lineage was never recorded."""
+    return _sub(_UNKNOWN_LINEAGE, alias)
+
+
 def visible_node(alias: str) -> str:
     return "NOT " + blocked_node(alias)
 

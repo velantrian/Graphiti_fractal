@@ -278,3 +278,23 @@ async def test_re_erasure_during_rebuild_commits_nothing_then_converges(env):
     model_input = env.llm.input_since(mark)
     assert done["completeness"] == "complete"
     assert MARK_A not in model_input and not re.search(r"QUIBBLE1(?!\d)", model_input) and "QUIBBLE12" in model_input
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_episode_inside_the_previous_window_is_not_given_to_the_model(env):
+    """Few later episodes: the erased A is still inside Graphiti's default 10-episode window."""
+    await env.add(A_TEXT)
+    await env.add(b_text(1))
+    await env.add(b_text(2))
+    a_uuid = await env.uuid_of(MARK_A)
+    await delete(env, a_uuid, "soft")
+    await erasure_scope.rebuild_area(env.graphiti)
+
+    default_window = await env.graphiti.retrieve_episodes(datetime.now(timezone.utc), last_n=10, group_ids=[K])
+    assert a_uuid in {e.uuid for e in default_window}          # control: Graphiti's own window still contains A
+
+    mark = env.llm.mark()
+    done = await env.add("[[Mira Venn]] asks about the [[Harbor Office]] NEWQ6 today.", K)
+    model_input = env.llm.input_since(mark)
+    assert done["completeness"] == "complete"
+    assert MARK_A not in model_input and "QUIBBLE2" in model_input        # erased text out, valid context in
