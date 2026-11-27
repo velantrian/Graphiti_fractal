@@ -136,7 +136,8 @@ an unknown uuid returns `found=false` and creates nothing. Only the creating req
 holds a lease so a retry or the recovery sweep cannot compute the same area twice.
 
 ## Text changed between search and admission (D2)
-`admit_search_candidates` (one batched statement) compares the text Graphiti returned - taken BEFORE the 8000-character
+`admit_search_candidates` first requires exactly one visible match for the candidate's type, UUID and group.
+The same batched statement then compares the text Graphiti returned - taken BEFORE the 8000-character
 cut applied for display - with the same fields in Neo4j: episode content; entity name and summary; edge fact and name;
 community name and summary. A candidate whose text changed after the search is excluded: its relevance score belongs to
 the old text and must not pass to the new one (it is simply absent from this answer; the next search sees the current
@@ -155,9 +156,10 @@ the delivered text. Refusals (`ReadReceiptRejected.code`): `bad_request`, `unkno
 `receipt_expired`, `source_not_in_receipt`, `source_missing`, `source_not_visible`, `source_changed`, `receipt_required`.
 The receipt proves that the system SHOWED those sources; it does not prove that the client's text semantically uses them
 (the client may name more, which hides more, or fewer, which hides less).
-On success the episode carries `recall_source_ids` (+ `recall_derived`, `recall_receipt_id`), the same lineage fields the
-built-in chat uses. A source deleted or changed between the check and finalization denies the finalization: the already
-created episode is isolated and everything derived from it is marked exposed to the erasures since the read, in any group.
+On success the episode carries `recall_source_ids`, `recall_derived` and `recall_receipt_id`. If a source is deleted or
+changed before finalization, the server denies finalization and isolates any episode already written. The unsettled claim
+holds the destination group's derived objects even when no erasure event exists. Only events classified as `RELATED`
+receive late-write exposure marks, including events in other groups. See the scoped relation rule below.
 A repeat or a deduplicated derived write keeps and extends the links (union); an owner-authored episode with the same text
 is independent and is not touched.
 
