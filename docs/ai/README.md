@@ -150,6 +150,14 @@ Do not replace scoped searches with one unscoped global Graphiti search unless e
 
 Cross-namespace `SAME_AS` bridges are not part of the active retrieval authority path.
 
+The [D2 admission check](../ERASURE_VARIANT_B.md#text-changed-between-search-and-admission-d2) excludes ambiguous candidates and candidates whose full text changed after search.
+
+## MCP retellings and erasure
+
+Use the [MCP receipt contract](../ERASURE_VARIANT_B.md#mcp-retellings-read-receipts-and-the-deletion-of-their-derivatives) for `memory.search_knowledge`, `memory.remember`, and `memory.upload`. When saving a retelling, pass `derived_from` with the server-issued receipt ID and the selected source IDs. The receipt records what was shown. The client declares which sources it used.
+
+Erasure follows verified lineage through the derived graph. For an unsettled write, related and unknown erasure events remain open. Only related events receive late-write marks. Legacy writes without lineage can survive erasure in the default compatibility mode. See the [scoped relation rule](../ERASURE_VARIANT_B.md#scoped-receipt-attempt--erasure-relation-pr-64-follow-up).
+
 ## Trust boundary
 
 `imports` is isolated and untrusted. High recall count or promotion score must not convert an ineligible origin into trusted authority.

@@ -136,13 +136,52 @@ an unknown uuid returns `found=false` and creates nothing. Only the creating req
 holds a lease so a retry or the recovery sweep cannot compute the same area twice.
 
 ## Text changed between search and admission (D2)
-`admit_search_candidates` (one batched statement) compares the text Graphiti returned - taken BEFORE the 8000-character
+`admit_search_candidates` first requires exactly one visible match for the candidate's type, UUID and group.
+The same batched statement then compares the text Graphiti returned - taken BEFORE the 8000-character
 cut applied for display - with the same fields in Neo4j: episode content; entity name and summary; edge fact and name;
 community name and summary. A candidate whose text changed after the search is excluded: its relevance score belongs to
 the old text and must not pass to the new one (it is simply absent from this answer; the next search sees the current
 text). A candidate without `_raw_text` (other callers) is checked for identity and erasure state only; `_raw_text` is
 internal and never part of a result. Cost: `tests/support/measure_d2_admission_cost.py` (admission only, synthetic 1 KB texts,
 median over 25 interleaved runs): +1-5 ms at 10-200 candidates, +16-25 ms at 1000 (a 1 MB statement).
+
+## MCP retellings: read receipts and the deletion of their derivatives
+**Contract.** `memory.search_knowledge` returns, next to the items, a `read_receipt`: the server's record
+(`:FractalReadReceipt`: owner, expiry 1 h, global revision, and per delivered source its type, UUID, group and SHA-256 of
+the text delivered, before display truncation). A client that retells what it read calls `memory.remember` /
+`memory.upload` with `derived_from: {receipt_id, source_ids}` (optionally `derivation: "retelling"`). The server checks,
+before Graphiti is called and again inside the atomic finalization of every stored chunk, that the receipt exists, belongs
+to this owner, has not expired, lists every named source, and that each source still exists once, is visible and still has
+the delivered text. Refusals (`ReadReceiptRejected.code`): `bad_request`, `unknown_receipt`, `receipt_not_applicable`,
+`receipt_expired`, `source_not_in_receipt`, `source_missing`, `source_not_visible`, `source_changed`, `receipt_required`.
+The receipt proves that the system SHOWED those sources; it does not prove that the client's text semantically uses them
+(the client may name more, which hides more, or fewer, which hides less).
+On success the episode carries `recall_source_ids`, `recall_derived` and `recall_receipt_id`. If a source is deleted or
+changed before finalization, the server denies finalization and isolates any episode already written. The unsettled claim
+holds the destination group's derived objects even when no erasure event exists. Only events classified as `RELATED`
+receive late-write exposure marks, including events in other groups. See the scoped relation rule below.
+A repeat or a deduplicated derived write keeps and extends the links (union); an owner-authored episode with the same text
+is independent and is not touched.
+
+**Area closure.** From every dependent episode found by lineage (any group) the area now follows what Graphiti extracted
+from it: entities (`summary`), edges (`fact`) and communities, in the dependent's own group. An object with no independent
+live source (neither the erased episode nor itself dependent) is purged with the area; one that an independent episode
+also supports is held (hidden, group paused) until a clean rebuild re-derives it from that source - it is never destroyed
+together with the dependent one. Identical text or a new UUID is not independence: a second retelling that carries
+lineage is dependent too.
+
+**Boundaries (decision for the owner).**
+* A client that sends neither `derived_from` nor `derivation` keeps the previous behaviour: origin `agent_derived`, no link
+  to what it read; the retelling and its graph survive the deletion of its source (pinned by `test_mcp_lineage_base.py`).
+  So do all records written before this change: they have no lineage and cannot be found by it.
+* A text declared as a retelling without a verifiable receipt is always refused before Graphiti.
+* `FRACTAL_MCP_REQUIRE_READ_RECEIPT=1` refuses EVERY agent write without a verifiable receipt. Consequence: old clients
+  fail on `memory.remember` / `memory.upload` until they send `derived_from`, and an agent cannot store a note that is not
+  derived from a prior `search_knowledge`. Default: off (compatible path).
+* Receipts exist only for `memory.search_knowledge`; other read paths (recall in chat, `search_memory`) issue none. Receipt
+  nodes are not purged after expiry yet.
+* A legacy retelling of the same fact (no lineage) is indistinguishable from an independent source, so a shared fact can
+  be restored from it.
 
 ## Limits
 * Re-derivation costs one extractor call per live source episode of an affected edge.
@@ -163,3 +202,47 @@ median over 25 interleaved runs): +1-5 ms at 10-200 candidates, +16-25 ms at 100
   `scripts/erasure_dry_run.py [--details]` lists, read-only and without content: flagged objects, derived-kind
   episodes without lineage, objects lineage cannot reach (`LINEAGE_GAP`: not restricted by this model, and their
   **content is unknown**: the report never reads it and an erasure cannot find them), tombstones without a seed.
+
+
+### Receipt-derived write: admission while the upstream outcome is unknown
+
+A receipt-bearing ingest claim records its receipt identity and revision at the durable
+write-attempt boundary, before Graphiti is called. While that attempt is pending or requires
+reconciliation, ordinary readers hold the destination group's derived graph and non-original
+episodes, but not independent original episodes or unrelated groups. New Graphiti ingest/chat
+attempts in that group are refused; receipt attempts also refuse other outstanding write
+attempts in the group. Only the atomic source check for the claim itself ignores that claim's
+temporary hold, and only for validating the declared sources.
+
+A successful atomic finalization checks the receipt row, owner, expiry, exact source type,
+identity and text, then commits the claim and the episode's lineage together. An unconfirmed
+outcome (including an edit with no erasure event) leaves the hold durable across restart.
+No synthetic erasure event is created. Automatic recovery does not settle receipt-bearing
+claims. The existing explicit settlement accepts independent no-write evidence; for contained
+writes it requires a real erasure newer than the receipt and durable exposure marks. With no
+such event, it refuses containment rather than releasing the hold. An owner may explicitly
+soft-erase a provably linked rejected output before using event-based settlement/rebuild.
+This is intentionally conservative: a dedicated no-erasure clean-rebuild protocol is not
+implemented by this change. Event-based rebuild skips affected events while receipt claims
+remain unsettled, since temporary invisibility is not proof of absent independent sources.
+
+
+### Scoped receipt-attempt / erasure relation (PR #64 follow-up)
+
+Before Graphiti is called, the attempt marker stores only the UUIDs, kinds and groups
+of the **selected, verified** receipt sources (not every item returned by the search).
+Phase 2 of an erasure records its affected identity footprint before purging graph
+objects. It includes the seed, affected entities/edges/communities, and the transitive
+dependent episodes and their extracted objects across groups. The completed episodic
+scope publishes a version; the footprint is retained when the event resolves.
+
+`ingest_erasure_relation` is the shared rule: RELATED (same-destination-group fence
+or intersecting source/affected identity or destination exposure), UNRELATED (newer
+but complete, disjoint scope), UNKNOWN (pending/legacy/incomplete evidence).
+An unsettled receipt always holds its destination graph. RELATED and UNKNOWN hold
+the relevant event open; only RELATED is allowed to receive late-write exposure
+marks. The existing mutable blocked_groups field is not evidence of a relationship.
+Manual containment refuses unknown relationships or missing related events and
+rechecks the marked event set under the final settlement lock. Old claims/events
+without scope evidence remain conservative; no migration is assumed. The completed
+scope version is limited to episodic erasures under the existing variant B policy.

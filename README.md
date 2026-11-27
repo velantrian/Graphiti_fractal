@@ -25,6 +25,7 @@
 
 - [Документация для агентов](docs/ai/README.md) описывает устройство проекта и порядок проверки.
 - [Журнал проекта](docs/PROJECT_JOURNAL.md) показывает текущий статус, открытые решения и точку возобновления работы.
+- [Контракт MCP для пересказов](docs/ERASURE_VARIANT_B.md#mcp-retellings-read-receipts-and-the-deletion-of-their-derivatives) описывает квитанции чтения, удаление зависимых данных и режим совместимости.
 
 ## 👋 Fractal за 60 секунд
 
@@ -207,7 +208,7 @@ The model uses memory — it does not become memory authority by default.
 | 🧩 Namespace isolation | ✅ **ACTIVE** | scoped memory boundaries |
 | 🔎 Adaptive recall | ✅ **ACTIVE** | `off / auto / always` |
 | 💬 Chat persistence | ✅ **ACTIVE** | persisted turns + bounded summaries |
-| 🧾 Provenance | ✅ **ACTIVE** | exact lineage для новых derived artifacts |
+| 🧾 Provenance | ✅ **ACTIVE** | происхождение производных записей, включая [MCP-пересказы с проверенной квитанцией](docs/ERASURE_VARIANT_B.md#mcp-retellings-read-receipts-and-the-deletion-of-their-derivatives) |
 | 🔐 Unique ingest claim | ✅ **TESTED** | concurrent duplicate admission fail-closed at app boundary |
 | 🔁 Promotion | 🟡 **EXPLAIN / GATED** | eligibility есть; automatic durable writer отсутствует |
 | 🧪 Consolidation | 🟡 **DRY_RUN** | preview only |
@@ -495,7 +496,7 @@ External test, который был skipped из-за отсутствующе�
 ## ⚠️ Честные ограничения
 
 - 🏠 система намеренно local/single-owner, не multi-user SaaS;
-- 📥 applied imports остаются isolated/untrusted; MCP-записи классифицируются как `agent_derived`, а не как подтверждённые владельцем;
+- 📥 applied imports остаются isolated/untrusted. MCP-записи классифицируются как `agent_derived`. В режиме совместимости пересказ без квитанции может пережить удаление источника.
 - 🔁 automatic durable promotion writer не активирован;
 - 🧪 consolidation остаётся preview-first;
 - 🤖 first-class provider path пока OpenAI;

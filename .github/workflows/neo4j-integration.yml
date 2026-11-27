@@ -80,7 +80,9 @@ jobs:
             --target tests/integration/test_ambiguous_late_write.py \
             --target tests/integration/test_manual_settlement.py \
             --target tests/integration/test_chat_answer_gate.py \
-            --target tests/integration/test_d2_fresh_text.py
+            --target tests/integration/test_d2_fresh_text.py \
+            --target tests/integration/test_mcp_lineage_base.py \
+            --target tests/integration/test_mcp_lineage.py
 
       - name: Provider E2E admission on the connection Graphiti uses (no provider key), then decoy rejection
         # The provider round trip itself is skipped here (no OPENAI_API_KEY); it runs only in the
