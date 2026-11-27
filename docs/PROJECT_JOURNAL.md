@@ -13,6 +13,7 @@
 | ✅ В `main` | Интеграционные тесты используют одноразовую Neo4j. Допуск проверяется до первой записи. | [#55](https://github.com/velantrian/Graphiti_fractal/pull/55) |
 | ✅ В `main` | Статусы различают подтверждённую и неопределённую запись. Если Graphiti мог сохранить данные, повтор требует сверки. | [Диагностика ingest](INGEST_CLAIM_DIAGNOSTICS.md) · [#57](https://github.com/velantrian/Graphiti_fractal/pull/57) |
 | ✅ В `main` | Удаление ограничивает затронутые объекты и при необходимости ставит запись в группу на паузу. Пересборка использует допустимые источники. | [Правила удаления и пересборки](ERASURE_VARIANT_B.md) · [#56](https://github.com/velantrian/Graphiti_fractal/pull/56) |
+| 🔎 На проверке · 27.11.2026 | Provider E2E допускается к одноразовой Neo4j через guard: маркер проверяется на том подключении, которое затем использует Graphiti, до схемы и записи. В правилах удаления исправлено противоречие: незавершённая попытка записи, пересёкшая удаление, ограничивает выдачу производных объектов группы и ставит её запись на паузу. | [Изоляция тестовой базы](TEST_DATABASE_ISOLATION.md) · [#60](https://github.com/velantrian/Graphiti_fractal/pull/60) |
 
 На HEAD #56 прошли контракты Python, сборка Docker и интеграция Neo4j. `provider-e2e` и `provenance-preview` были пропущены. [Neo4j CI](https://github.com/velantrian/Graphiti_fractal/actions/runs/45913768265) · [Внешние проверки](https://github.com/velantrian/Graphiti_fractal/actions/runs/45913768243)
 

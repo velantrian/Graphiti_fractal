@@ -25,6 +25,7 @@ carry erased text are restricted; groups whose independence lineage shows stay f
 | objects marked by an open erasure | until evidence is recorded (below) |
 | derived objects of a group whose tombstone has no computed area (`PENDING_SCOPE`, or created without a seed) | until scoped; other groups unaffected |
 | derived-kind episodes (chat/summary/L3) **without recorded lineage** | once any tombstone exists, until the owner sets `lineage_reviewed=true` |
+| derived objects (entities, edges, communities, non-original episodes) of a group with an **unsettled write attempt that crossed an erasure** | until `settle_unsettled_write`; the group's model-assisted writes are paused for as long. Original episodes stay readable; other groups unaffected ("Ambiguous late writes") |
 | everything else, including legacy episodes without `origin_class` and every independent group | never |
 
 A legacy `deleted=true` flag restricts only the flagged object. Its derived objects stay visible
@@ -35,7 +36,8 @@ until the flag is migrated to a tombstone (`erase_node`); `scripts/erasure_dry_r
 Per group, automatically: ingest and chat persistence refuse while an open erasure lists the group in
 `blocked_groups` (Graphiti-derived objects of that group would be fed back to the model as candidates;
 hiding them at read time does not help). The group reopens only when no such object is still marked.
-Unresolved objects keep the group paused; this is accepted policy. The previous-episode window given to
+Unresolved objects keep the group paused; this is accepted policy. A write attempt with an unknown outcome that
+crossed an erasure also pauses its group, until it is settled ("Ambiguous late writes"). The previous-episode window given to
 `add_episode` excludes erased/quarantined episodes (Graphiti's default window ignores Fractal's flags).
 Other groups are never paused.
 
@@ -140,8 +142,10 @@ holds a lease so a retry or the recovery sweep cannot compute the same area twic
   `settle_unsettled_write` (no HTTP/MCP endpoint for it yet; a function for the owner to run).
 * Unknown-outcome attempts that predate an erasure block their group after that erasure, also old ones that were never
   settled: the dry run lists them (`UNSETTLED_WRITE_ATTEMPT`) so they can be settled before the first erasure.
-* While an outcome is unknown, objects of the unknown write that are NOT marked stay readable (they cannot be found);
-  only writes (model use) are paused.
+* While an outcome is unknown, the objects of the unknown write cannot be found and marked one by one, so the
+  restriction covers the whole affected group: its derived objects (entities, edges, communities, non-original episodes)
+  are withheld from every reader, the chat answer included, and its model-assisted writes are paused, both until
+  `settle_unsettled_write`. Original (source) episodes stay readable; other groups are unaffected.
 * Agent-originated episodes (MCP) carry no lineage to what the agent saw.
 * Chat fences on the global revision (it reads every group): an erasure anywhere makes an in-flight turn retry.
   Document ingest fences per group.
