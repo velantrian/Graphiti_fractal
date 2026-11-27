@@ -378,26 +378,46 @@ def candidate_key(item: dict) -> tuple[str, str, str]:
     return item["type"], item["uuid"], item["group_id"]
 
 
+RAW_TEXT = "_raw_text"   # key under which search code carries the text exactly as Graphiti returned it
+
+
 async def admit_search_candidates(graphiti, candidates: list[dict]) -> set[tuple[str, str, str]]:
-    """Check durable identity and erasure state after Graphiti search, before ranking/exposure."""
+    """Check durable identity, erasure state and freshness of text, after Graphiti search, before ranking.
+
+    One batched statement. A candidate that carries ``_raw_text`` = [t1, t2] (the text Graphiti returned,
+    BEFORE any truncation for display) is admitted only if the same fields in Neo4j are still exactly equal:
+    episode content; entity name+summary; edge fact+name; community name+summary. If the text changed after the
+    search, the candidate is excluded: its relevance score was computed for the old text and must not pass to a
+    new one. Candidates without ``_raw_text`` are checked for identity and erasure state only.
+    """
     if not candidates:
         return set()
-    keys = {candidate_key(item) for item in candidates}
-    rows = [{"kind": kind, "uuid": uuid, "group_id": group} for kind, uuid, group in sorted(keys)]
+    by_key: dict[tuple[str, str, str], list | None] = {}
+    for item in candidates:
+        raw = item.get(RAW_TEXT)
+        by_key[candidate_key(item)] = list(raw) if raw is not None else None
+    keys = set(by_key)
+    rows = [{"kind": kind, "uuid": uuid, "group_id": group,
+             "check": by_key[(kind, uuid, group)] is not None,
+             "t1": (by_key[(kind, uuid, group)] or ["", ""])[0],
+             "t2": (by_key[(kind, uuid, group)] or ["", ""])[1]} for kind, uuid, group in sorted(keys)]
     result = await graphiti.driver.execute_query(
         """
         UNWIND $candidates AS candidate
         CALL (candidate) {
             MATCH (n:Episodic {uuid:candidate.uuid})
             WHERE candidate.kind='episode' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
+              AND (NOT candidate.check OR coalesce(n.content, n.summary, '') = candidate.t1)
             RETURN n.uuid AS uuid
             UNION ALL
             MATCH (n:Entity {uuid:candidate.uuid})
             WHERE candidate.kind='entity' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
+              AND (NOT candidate.check OR (coalesce(n.name,'') = candidate.t1 AND coalesce(n.summary,'') = candidate.t2))
             RETURN n.uuid AS uuid
             UNION ALL
             MATCH (n:Community {uuid:candidate.uuid})
             WHERE candidate.kind='community' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
+              AND (NOT candidate.check OR (coalesce(n.name,'') = candidate.t1 AND coalesce(n.summary,'') = candidate.t2))
             RETURN n.uuid AS uuid
             UNION ALL
             MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)
@@ -405,6 +425,7 @@ async def admit_search_candidates(graphiti, candidates: list[dict]) -> set[tuple
               AND r.group_id=candidate.group_id
               AND s.group_id=candidate.group_id AND t.group_id=candidate.group_id
               AND """ + visible_edge("r", "s", "t") + """
+              AND (NOT candidate.check OR (coalesce(r.fact,'') = candidate.t1 AND coalesce(r.name,'') = candidate.t2))
             RETURN r.uuid AS uuid
         }
         WITH candidate, count(uuid) AS matches

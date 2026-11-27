@@ -14,7 +14,7 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
 
 from core.datetime_utils import dt_to_iso, normalize_dt
-from core.erasure_guard import admit_search_candidates, candidate_key
+from core.erasure_guard import RAW_TEXT, admit_search_candidates, candidate_key
 from core.graphrag_policy import apply_mode_weights, plan_retrieval
 from core.recall_telemetry import record_recall
 from core.text_utils import is_correction_text
@@ -263,6 +263,7 @@ class MemoryOps:
                         "episode_kind": episode_kind,
                         "source_description": source_description,
                         "created_at": dt_to_iso(created),
+                        RAW_TEXT: [str(content), ""],        # before the [:8000] cut above
                     }
                     _merge_best(episodes, item, scope)
 
@@ -281,6 +282,7 @@ class MemoryOps:
                         "type": "entity",
                         "group_id": getattr(node, "group_id", None) or scope,
                     }
+                    item[RAW_TEXT] = [item["name"], item["summary"]]
                     _merge_best(entities, item, scope)
 
             raw_edges = getattr(result, "edges", []) or []
@@ -304,6 +306,7 @@ class MemoryOps:
                     "type": "edge",
                     "group_id": getattr(edge, "group_id", None) or scope,
                 }
+                item[RAW_TEXT] = [item["fact"], item["name"] or ""]
                 _merge_best(edges, item, scope)
 
             raw_communities = getattr(result, "communities", []) or []
@@ -320,6 +323,7 @@ class MemoryOps:
                     "type": "community",
                     "group_id": getattr(community, "group_id", None) or scope,
                 }
+                item[RAW_TEXT] = [item["name"], item["summary"]]
                 _merge_best(communities, item, scope)
 
         candidates = [item for bucket in (episodes, entities, edges, communities)
@@ -328,7 +332,8 @@ class MemoryOps:
 
         def ranked(values: dict[str, dict]) -> list[dict]:
             return sorted(
-                (item for item in values.values() if candidate_key(item) in admitted),
+                ({k: v for k, v in item.items() if k != RAW_TEXT}      # internal; never part of a result
+                 for item in values.values() if candidate_key(item) in admitted),
                 key=lambda item: item.get("score", 0.0),
                 reverse=True,
             )[:limit]
