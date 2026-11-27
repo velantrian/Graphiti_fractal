@@ -144,6 +144,43 @@ text). A candidate without `_raw_text` (other callers) is checked for identity a
 internal and never part of a result. Cost: `tests/support/measure_d2_admission_cost.py` (admission only, synthetic 1 KB texts,
 median over 25 interleaved runs): +1-5 ms at 10-200 candidates, +16-25 ms at 1000 (a 1 MB statement).
 
+## MCP retellings: read receipts and the deletion of their derivatives
+**Contract.** `memory.search_knowledge` returns, next to the items, a `read_receipt`: the server's record
+(`:FractalReadReceipt`: owner, expiry 1 h, global revision, and per delivered source its type, UUID, group and SHA-256 of
+the text delivered, before display truncation). A client that retells what it read calls `memory.remember` /
+`memory.upload` with `derived_from: {receipt_id, source_ids}` (optionally `derivation: "retelling"`). The server checks,
+before Graphiti is called and again inside the atomic finalization of every stored chunk, that the receipt exists, belongs
+to this owner, has not expired, lists every named source, and that each source still exists once, is visible and still has
+the delivered text. Refusals (`ReadReceiptRejected.code`): `bad_request`, `unknown_receipt`, `receipt_not_applicable`,
+`receipt_expired`, `source_not_in_receipt`, `source_missing`, `source_not_visible`, `source_changed`, `receipt_required`.
+The receipt proves that the system SHOWED those sources; it does not prove that the client's text semantically uses them
+(the client may name more, which hides more, or fewer, which hides less).
+On success the episode carries `recall_source_ids` (+ `recall_derived`, `recall_receipt_id`), the same lineage fields the
+built-in chat uses. A source deleted or changed between the check and finalization denies the finalization: the already
+created episode is isolated and everything derived from it is marked exposed to the erasures since the read, in any group.
+A repeat or a deduplicated derived write keeps and extends the links (union); an owner-authored episode with the same text
+is independent and is not touched.
+
+**Area closure.** From every dependent episode found by lineage (any group) the area now follows what Graphiti extracted
+from it: entities (`summary`), edges (`fact`) and communities, in the dependent's own group. An object with no independent
+live source (neither the erased episode nor itself dependent) is purged with the area; one that an independent episode
+also supports is held (hidden, group paused) until a clean rebuild re-derives it from that source - it is never destroyed
+together with the dependent one. Identical text or a new UUID is not independence: a second retelling that carries
+lineage is dependent too.
+
+**Boundaries (decision for the owner).**
+* A client that sends neither `derived_from` nor `derivation` keeps the previous behaviour: origin `agent_derived`, no link
+  to what it read; the retelling and its graph survive the deletion of its source (pinned by `test_mcp_lineage_base.py`).
+  So do all records written before this change: they have no lineage and cannot be found by it.
+* A text declared as a retelling without a verifiable receipt is always refused before Graphiti.
+* `FRACTAL_MCP_REQUIRE_READ_RECEIPT=1` refuses EVERY agent write without a verifiable receipt. Consequence: old clients
+  fail on `memory.remember` / `memory.upload` until they send `derived_from`, and an agent cannot store a note that is not
+  derived from a prior `search_knowledge`. Default: off (compatible path).
+* Receipts exist only for `memory.search_knowledge`; other read paths (recall in chat, `search_memory`) issue none. Receipt
+  nodes are not purged after expiry yet.
+* A legacy retelling of the same fact (no lineage) is indistinguishable from an independent source, so a shared fact can
+  be restored from it.
+
 ## Limits
 * Re-derivation costs one extractor call per live source episode of an affected edge.
 * Entity summaries that a model wrote richer than the edge facts lose that richness when rebuilt.

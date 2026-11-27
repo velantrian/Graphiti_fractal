@@ -79,6 +79,7 @@ class MemoryOps:
         memory_type: str = "knowledge",
         group_id: Optional[str] = None,
         origin_class: Optional[str] = None,
+        read_receipt: Any = None,
     ) -> Dict[str, Any]:
         """Delegate to the canonical Graphiti-native ingestion path."""
         target_group = group_id or resolve_group_id(memory_type)
@@ -89,6 +90,7 @@ class MemoryOps:
             user_id=self.user_id,
             group_id=target_group,
             origin_class=origin_class,
+            **({} if read_receipt is None else {"read_receipt": read_receipt}),
         )
 
     async def remember_text(
@@ -98,6 +100,7 @@ class MemoryOps:
         memory_type: Optional[str] = None,
         source_description: Optional[str] = None,
         origin_class: Optional[str] = None,
+        read_receipt: Any = None,
     ) -> Dict[str, Any]:
         cleaned = text.strip()
         if not cleaned:
@@ -112,6 +115,7 @@ class MemoryOps:
             source_description=source_description or "memory_ops",
             memory_type=routed_type,
             origin_class=origin_class,
+            **({} if read_receipt is None else {"read_receipt": read_receipt}),
         )
         if result.get("completeness") == "complete":
             max_size = get_config().app.recent_memories_max_size

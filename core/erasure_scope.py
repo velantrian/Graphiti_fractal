@@ -63,6 +63,7 @@ class Area:
     communities: dict[str, str] = field(default_factory=dict)
     derived: dict[str, str] = field(default_factory=dict)      # episode uuid -> group_id
     exposed_episodes: list[str] = field(default_factory=list)
+    groups: dict[str, str] = field(default_factory=dict)       # uuid -> group of objects found through derived episodes
 
     def counts(self) -> dict:
         out: dict[str, int] = {}
@@ -148,7 +149,50 @@ async def compute_area(graphiti, seed: Seed) -> Area:
     await extend_lineage(graphiti, area, seed,
                          {t} | {u for u, c in {**area.entities, **area.edges, **area.communities}.items()
                                 if c in ("pure", "mixed")})
+    await close_derived_graph(graphiti, area, seed)
     return area
+
+
+async def close_derived_graph(graphiti, area: Area, seed: Seed) -> None:
+    """From every dependent episode found by lineage (any group) to what Graphiti extracted from it.
+
+    A retelling in another group has its own entities, edges and summaries; hiding the episode alone would leave
+    ``Entity.summary`` and ``edge.fact`` readable. Each such object is classified against INDEPENDENT sources only: a
+    live episode that is neither the erased one nor itself dependent. None -> pure (purged with the area); at least
+    one -> mixed (held until a clean rebuild from that source - never destroyed together with the dependent one).
+    Identical text or a fresh UUID is not independence: a second retelling that carries lineage is dependent too, and
+    one without lineage cannot be told from an independent source (documented limit for legacy writes)."""
+    if not area.derived:
+        return
+    dep = sorted(set(area.derived) | {seed.target_uuid})
+    ents = await _rows(graphiti, f"""
+        MATCH (d:Episodic)-[:MENTIONS]->(e:Entity) WHERE d.uuid IN $d AND d.uuid <> $t
+        WITH DISTINCT e
+        OPTIONAL MATCH (o:Episodic)-[:MENTIONS]->(e) WHERE NOT o.uuid IN $dep AND {_live('o')}
+        RETURN e.uuid AS uuid, e.group_id AS g, count(o) AS others""", d=sorted(area.derived), t=seed.target_uuid, dep=dep)
+    for r in ents:
+        cls = "mixed" if r["others"] else "pure"
+        if area.entities.get(r["uuid"]) in (None, "exposed"):
+            area.entities[r["uuid"]] = cls
+        area.groups[r["uuid"]] = r["g"]
+    edges = await _rows(graphiti, f"""
+        MATCH ()-[r:RELATES_TO]->() WHERE any(x IN coalesce(r.episodes,[]) WHERE x IN $d)
+        OPTIONAL MATCH (o:Episodic) WHERE o.uuid IN coalesce(r.episodes,[]) AND NOT o.uuid IN $dep AND {_live('o')}
+        RETURN r.uuid AS uuid, r.group_id AS g, count(o) AS others""", d=sorted(area.derived), dep=dep)
+    for r in edges:
+        cls = "mixed" if r["others"] else "pure"
+        if area.edges.get(r["uuid"]) in (None, "exposed"):
+            area.edges[r["uuid"]] = cls
+        area.groups[r["uuid"]] = r["g"]
+    touched = sorted({r["uuid"] for r in ents})
+    if touched:
+        for r in await _rows(graphiti, """
+            MATCH (c:Community)-[:HAS_MEMBER]->(e:Entity) WHERE e.uuid IN $ids
+            RETURN c.uuid AS uuid, c.group_id AS g, collect(e.uuid) AS members""", ids=touched):
+            hard = any(area.entities.get(m) in ("pure", "mixed") for m in r["members"])
+            if area.communities.get(r["uuid"]) in (None, "exposed"):
+                area.communities[r["uuid"]] = "mixed" if hard else "exposed"
+            area.groups[r["uuid"]] = r["g"]
 
 
 async def extend_lineage(graphiti, area: Area, seed: Seed, frontier: set[str]) -> None:
@@ -226,7 +270,9 @@ async def scope_erasure(graphiti, event_id: str) -> dict:
     await _mark(graphiti, event_id, "Community", area.communities)
     await _mark(graphiti, event_id, "Episodic", {u: "derived" for u in area.derived})
 
-    blocked = sorted({seed.group_id} if (area.entities or area.edges or area.communities) else set())
+    blocked = sorted(({seed.group_id} if (area.entities or area.edges or area.communities) else set())
+                     | {area.groups[u] for u, c in {**area.entities, **area.edges, **area.communities}.items()
+                        if c != "pure" and u in area.groups and area.groups[u]})
     counts = area.counts()
     counts["purged_entities"], counts["purged_edges"] = len(pure_entities), len(pure_edges)
     await graphiti.driver.execute_query(

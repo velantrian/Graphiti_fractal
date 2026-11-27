@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from neo4j.exceptions import ConstraintError
 
 from core.erasure_guard import ErasureFenceChanged, LOCK_ERASURE_CONTROL, ensure_erasure_constraints
+from core.read_receipts import SOURCES_STILL_HOLD
 
 
 VALID_ORIGIN_CLASSES = {"owner", "agent_derived", "untrusted", "system"}
@@ -121,6 +122,14 @@ async def _discard_unattempted_expired_claim(graphiti, key: str, now: datetime) 
         now=now.isoformat(),
     )
     return bool(result.records)
+
+
+class ReadReceiptStale(RuntimeError):
+    """A source of a derived write was deleted or changed before its episode could be finalized."""
+
+    def __init__(self, code: str):
+        super().__init__(f"read receipt no longer holds at finalization: {code}")
+        self.code = code
 
 
 class IngestClaimLost(RuntimeError):
@@ -313,8 +322,14 @@ async def finalize_episode_identity(
     origin_class: str,
     ingest_quality: str = "unknown",
     content_sha256: str | None = None,
+    read_receipt=None,
 ) -> None:
     """Atomically finalize identity, quality, origin, taint and account association.
+
+    With ``read_receipt`` (a verified core.read_receipts.VerifiedReceipt) the same statement re-verifies that every
+    source the write is derived from still exists once, is visible and has the verified text, and records the
+    lineage (``recall_source_ids``, ``recall_derived``, ``recall_receipt_id``) on the episode. If a source was
+    deleted or changed since the check, nothing is finalized (ReadReceiptStale) and the caller contains the episode.
 
     ``has_non_owner_source`` is a monotonic taint on Entity nodes. A derived or
     untrusted episode can therefore never silently become trusted merely because
@@ -340,6 +355,7 @@ async def finalize_episode_identity(
           AND coalesce(e.erasure_quarantined,false)=false
           AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
           AND coalesce(e.deleted,false)=false
+          AND (""" + SOURCES_STILL_HOLD + """)
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
             e.origin_class=$origin_class,
@@ -352,6 +368,9 @@ async def finalize_episode_identity(
             c.content_sha256=$content_sha256,
             c.state='COMMITTED',
             c.committed_at=datetime()
+        FOREACH (_ IN CASE WHEN size($recall_source_ids) > 0 THEN [1] ELSE [] END |
+            SET e.recall_source_ids = $recall_source_ids, e.recall_derived = true, e.recall_receipt_id = $recall_receipt_id
+        )
         FOREACH (_ IN CASE WHEN $user_id IS NULL THEN [] ELSE [1] END |
             MERGE (u:User {user_id:$user_id})
             MERGE (e)-[:STORED_FOR]->(u)
@@ -377,6 +396,17 @@ async def finalize_episode_identity(
         origin_class=origin_class,
         ingest_quality=ingest_quality,
         content_sha256=content_sha256,
+        source_checks=read_receipt.checks() if read_receipt else [],
+        recall_source_ids=list(read_receipt.source_ids) if read_receipt else [],
+        recall_receipt_id=read_receipt.receipt_id if read_receipt else None,
     )
     if not result.records:
+        if read_receipt is not None:
+            from core.read_receipts import ReadReceiptRejected
+            from core.read_receipts import verify_read_receipt
+            try:
+                await verify_read_receipt(graphiti, user_id=user_id, receipt_id=read_receipt.receipt_id,
+                                          source_ids=list(read_receipt.source_ids))
+            except ReadReceiptRejected as exc:
+                raise ReadReceiptStale(exc.code) from exc
         raise RuntimeError("episode finalization not admitted: missing target, claim, or an erasure in this group happened meanwhile")
