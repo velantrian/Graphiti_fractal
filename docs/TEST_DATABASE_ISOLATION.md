@@ -88,3 +88,13 @@ access mode. The acceptance test requires:
 * The provenance dry-run workflow still uses its own `NEO4J_*` settings and is
   not covered by this guard. `tests/e2e`, the Provider E2E workflow and the
   provider job of the External Validation Gate are (see above).
+
+## Statements are pinned to the admitted database
+`graphiti_core`'s `Neo4jDriver` does not choose a database with the driver's `database_` argument: it puts
+`database_` into the query *parameters*, so such a statement runs on the user's home database;
+`delete_all_indexes()` names no database at all; `with_database()`, `session(database)` and a
+`params={'database_': ...}` override can name any other. `graphiti_bound_to_admitted_driver` therefore hands Graphiti a
+`DatabasePinnedDriver`: every statement and session is sent with `database_` / `database` set to the database whose
+marker was verified, and naming another database (or impersonating a user) raises `IsolationRejected` before the
+driver is called. Provider-free evidence: `tests/test_neo4j_isolation_guard.py` (the real `Neo4jDriver` over a
+recording driver, asserting the selection argument of every call) and, live, `tests/e2e` (admission test).

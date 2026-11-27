@@ -56,9 +56,32 @@ async def test_admission_hands_graphiti_the_admitted_connection(admitted_neo4j):
         # Built in a worker thread (no running loop), graphiti_core schedules no schema task,
         # so this check itself writes nothing.
         graph_driver = await asyncio.to_thread(Neo4jDriver, settings.uri, settings.user, settings.password)
-    assert graph_driver.client is admitted_neo4j.driver
+    assert graph_driver.client.wrapped is admitted_neo4j.driver
     assert handed_out == [admitted_neo4j.driver]
 
+    assert await _inventory(admitted_neo4j) == before
+
+
+@pytest.mark.asyncio
+async def test_graphiti_statements_run_on_the_admitted_database_and_cannot_leave_it(admitted_neo4j):
+    """Provider-free, live: statements of graphiti_core's own Neo4jDriver reach the database whose marker
+    was verified; naming any other database is rejected and changes nothing."""
+    from graphiti_core.driver.neo4j_driver import Neo4jDriver
+    from tests.support.neo4j_isolation import IsolationRejected
+
+    settings = admitted_neo4j.settings
+    before = await _inventory(admitted_neo4j)
+    with graphiti_bound_to_admitted_driver(admitted_neo4j.driver, settings):
+        graph_driver = await asyncio.to_thread(Neo4jDriver, settings.uri, settings.user, settings.password)
+    seen = await graph_driver.execute_query(f"MATCH (m:{MARKER_LABEL}) RETURN count(m) AS markers")
+    assert seen.records[0]["markers"] == 1
+    for attempt in (lambda: graph_driver.with_database("system").execute_query("RETURN 1 AS one"),
+                    lambda: graph_driver.execute_query("RETURN 1 AS one", params={"database_": "system"}),
+                    lambda: graph_driver.client.execute_query("RETURN 1 AS one", database_="system")):
+        with pytest.raises(IsolationRejected, match="not the admitted database"):
+            await attempt()
+    with pytest.raises(IsolationRejected, match="not the admitted database"):
+        graph_driver.session("system")
     assert await _inventory(admitted_neo4j) == before
 
 
@@ -78,7 +101,7 @@ async def test_provider_backed_ingest_and_recall_roundtrip(admitted_neo4j, monke
 
     with graphiti_bound_to_admitted_driver(admitted_neo4j.driver, settings):
         client = get_graphiti_client(force_new=True)
-    assert client.raw.driver.client is admitted_neo4j.driver  # schema and writes use the admitted connection
+    assert client.raw.driver.client.wrapped is admitted_neo4j.driver  # schema and writes use the admitted connection
 
     marker = f"fractal-e2e-{uuid.uuid4()}"
     text = f"The bounded provider-backed Fractal E2E marker is {marker}."

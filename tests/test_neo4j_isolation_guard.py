@@ -195,7 +195,7 @@ def test_graphiti_receives_the_admitted_driver_and_opens_no_pool(monkeypatch):
     admitted = object()
     with guard.graphiti_bound_to_admitted_driver(admitted, settings()) as handed_out:
         graph_driver = _construct_graphiti_driver()
-    assert graph_driver.client is admitted
+    assert graph_driver.client.wrapped is admitted
     assert handed_out == [admitted]
     assert pools.calls == []
     assert module.AsyncGraphDatabase is pools  # restored after the context
@@ -294,3 +294,83 @@ def test_disposable_image_matches_reviewed_compose_pin():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     pinned = re.search(r'DEFAULT_IMAGE = "([^"]+)"', script).group(1)
     assert f"image: {pinned}" in compose
+
+
+# --- every statement of the Graphiti client is pinned to the database whose marker was verified ----------
+
+class _RecordingAsyncDriver:
+    """Stand-in for the admitted neo4j.AsyncDriver: records the database-selection argument of every call."""
+
+    def __init__(self):
+        self.queries, self.sessions = [], []
+
+    async def execute_query(self, query_, parameters_=None, routing_=None, database_=None, **kwargs):
+        self.queries.append({"query": query_, "database_": database_, "parameters_": dict(parameters_ or {}),
+                             "kwargs": kwargs})
+        return "result"
+
+    def session(self, database=None, **kwargs):
+        self.sessions.append({"database": database, **kwargs})
+        return object()
+
+    async def verify_connectivity(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+def _bound_graphiti_driver(recorder, db="neo4j"):
+    s = guard.IsolatedNeo4jSettings("bolt://127.0.0.1:1", "neo4j", "pw", db, RUN_ID)
+    with guard.graphiti_bound_to_admitted_driver(recorder, s):
+        return _construct_graphiti_driver()
+
+
+def test_real_neo4j_driver_passes_the_admitted_database_as_the_selection_argument(monkeypatch):
+    """The real graphiti_core Neo4jDriver, a recording driver underneath: ``database_`` must be the
+    selection argument of execute_query (graphiti_core itself only puts it into the *parameters*)."""
+    recorder = _RecordingAsyncDriver()
+    graph_driver = _bound_graphiti_driver(recorder)
+    asyncio.run(graph_driver.execute_query("RETURN 1 AS one"))
+    asyncio.run(graph_driver.execute_query("MATCH (n) RETURN count(n) AS c", n=1))
+    asyncio.run(graph_driver.delete_all_indexes())            # graphiti_core sends this without any database
+    assert len(recorder.queries) == 3
+    assert [q["database_"] for q in recorder.queries] == ["neo4j"] * 3
+    assert all("database_" not in q["parameters_"] for q in recorder.queries), \
+        "the database name must not travel as a query parameter"
+
+
+def test_sessions_and_transactions_of_the_real_driver_are_pinned_too():
+    recorder = _RecordingAsyncDriver()
+    graph_driver = _bound_graphiti_driver(recorder)
+    graph_driver.session()
+    graph_driver.session("neo4j")
+    assert [s["database"] for s in recorder.sessions] == ["neo4j", "neo4j"]
+
+
+@pytest.mark.parametrize("other", ["system", "scratch", "production"])
+def test_selecting_another_database_is_rejected_before_it_reaches_the_driver(other):
+    recorder = _RecordingAsyncDriver()
+    graph_driver = _bound_graphiti_driver(recorder)
+    with pytest.raises(guard.IsolationRejected, match="not the admitted database"):
+        graph_driver.session(other)
+    with pytest.raises(guard.IsolationRejected, match="not the admitted database"):
+        asyncio.run(graph_driver.with_database(other).execute_query("RETURN 1"))            # shared pool, other default
+    with pytest.raises(guard.IsolationRejected, match="not the admitted database"):
+        asyncio.run(graph_driver.execute_query("RETURN 1", params={"database_": other}))    # per-call override
+    with pytest.raises(guard.IsolationRejected, match="not the admitted database"):
+        asyncio.run(graph_driver.client.execute_query("RETURN 1", database_=other))         # the raw client
+    assert recorder.queries == [] and recorder.sessions == []
+
+
+def test_the_pinned_view_has_no_way_to_use_another_database_through_other_apis():
+    recorder = _RecordingAsyncDriver()
+    graph_driver = _bound_graphiti_driver(recorder)
+    for call in (lambda: graph_driver.client.session(database="system"),
+                 lambda: graph_driver.client.session(database="system", default_access_mode="r"),
+                 lambda: graph_driver.client.execute_query("RETURN 1", impersonated_user_="admin")):
+        with pytest.raises(guard.IsolationRejected):
+            result = call()
+            if asyncio.iscoroutine(result):
+                asyncio.run(result)
+    assert recorder.queries == [] and recorder.sessions == []

@@ -228,6 +228,62 @@ async def open_admitted_async_driver(settings: IsolatedNeo4jSettings, *, timeout
 
 # --- application client on the admitted connection ---------------------------
 
+_UNSET = object()
+
+
+class DatabasePinnedDriver:
+    """The admitted AsyncDriver seen through one database: the one whose marker was verified.
+
+    graphiti_core's ``Neo4jDriver`` does not select a database with the driver's own
+    ``database_`` argument: it puts ``database_`` into the query *parameters*, so such a
+    statement runs on the user's home database; ``delete_all_indexes()`` names no database at
+    all; ``with_database()`` / ``session(database)`` / a ``params={'database_': ...}`` override
+    can name any other. Every one of those ends here: each statement and session is sent with
+    ``database_`` / ``database`` set to the admitted database as the selection argument, and any
+    attempt to name another database (or to impersonate a user) is rejected before it reaches
+    the driver. Only the calls graphiti_core makes exist on this view.
+    """
+
+    def __init__(self, driver: Any, database: str):
+        self._driver = driver
+        self._database = database
+
+    @property
+    def wrapped(self) -> Any:
+        return self._driver
+
+    def _only_admitted(self, name: Any) -> None:
+        if name is not None and name != self._database:
+            raise IsolationRejected(
+                f"database {name!r} is not the admitted database {self._database!r}; refusing"
+            )
+
+    async def execute_query(self, query_: Any, parameters_: Mapping[str, Any] | None = None,
+                            routing_: Any = _UNSET, database_: Any = None,
+                            impersonated_user_: Any = None, **kwargs: Any) -> Any:
+        self._only_admitted(database_)
+        if impersonated_user_ is not None:
+            raise IsolationRejected("impersonation is not allowed on the admitted connection")
+        parameters = dict(parameters_ or {})
+        # graphiti_core's way of "choosing" a database: only a parameter. Check it, never forward it.
+        self._only_admitted(parameters.pop("database_", None))
+        extra = {} if routing_ is _UNSET else {"routing_": routing_}
+        return await self._driver.execute_query(
+            query_, parameters_=parameters, database_=self._database, **extra, **kwargs
+        )
+
+    def session(self, database: str | None = None, **kwargs: Any) -> Any:
+        self._only_admitted(database)
+        if kwargs.get("impersonated_user") is not None:
+            raise IsolationRejected("impersonation is not allowed on the admitted connection")
+        return self._driver.session(database=self._database, **kwargs)
+
+    async def verify_connectivity(self) -> Any:
+        return await self._driver.verify_connectivity()
+
+    async def close(self) -> None:
+        await self._driver.close()
+
 def graphiti_default_database() -> str:
     """Database that ``Graphiti(uri=...)`` uses: the default of ``Neo4jDriver``."""
     from graphiti_core.driver.neo4j_driver import Neo4jDriver
@@ -271,7 +327,7 @@ def graphiti_bound_to_admitted_driver(driver: Any, settings: IsolatedNeo4jSettin
                     "Graphiti asked for a different Neo4j connection than the admitted one; refusing"
                 )
             handed_out.append(driver)
-            return driver
+            return DatabasePinnedDriver(driver, settings.database)
 
     graphiti_neo4j.AsyncGraphDatabase = _AdmittedDriverFactory
     try:
