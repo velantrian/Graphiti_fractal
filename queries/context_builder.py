@@ -5,6 +5,7 @@ import logging
 # Import filters for robust temporal retrieval
 from graphiti_core.search.search_filters import SearchFilters, DateFilter, ComparisonOperator
 from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
+from core.erasure_guard import visible_node
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ async def build_agent_context(graphiti, entity_name: str, context_size: str = "f
     fetch_query = """
     MATCH (n)
     WHERE n.uuid IN $uuids
+      AND """ + visible_node("n") + """
     RETURN n.uuid as uuid,
            labels(n) as labels,
            n.name as name,

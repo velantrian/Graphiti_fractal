@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from tests.helpers.fence import mock_ingest_revision  # noqa: F401
 
 from knowledge.ingest import ingest_text_document
 

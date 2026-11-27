@@ -11,6 +11,7 @@ from core.provenance import build_provenance_record
 from core.provenance_persistence import persist_provenance_metadata
 from knowledge.ingest import ingest_text_document, resolve_group_id
 from layers.l2_semantic import get_l2_semantic_context_with_sources
+from core.erasure_guard import ErasureFenceChanged, read_erasure_state, visible_node
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,9 @@ async def _mark_l3_derived_origin(graphiti, episode_uuid: str) -> None:
 
 async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = None) -> str | None:
     """Synthesize one bounded non-authoritative profile with exact L2 lineage."""
+    # The revision observed BEFORE the L2 read follows the profile to its save: if anything is
+    # erased in the knowledge group meanwhile, ingest refuses the stale synthesis.
+    expected_revision, _ = await read_erasure_state(graphiti)
     l2_context, source_ids = await get_l2_semantic_context_with_sources(graphiti, entity_name)
     if not l2_context:
         logger.warning("No trusted L2 context for %r", entity_name)
@@ -90,9 +94,10 @@ async def build_l3_profile(graphiti, entity_name: str, user_id: str | None = Non
         user_id=owner,
         group_id=resolve_group_id("knowledge"),
         origin_class="agent_derived",
+        expected_revision=expected_revision,
     )
-    if result.get("status") != "ok":
-        raise RuntimeError(f"L3 profile ingest failed: {result}")
+    if result.get("status") != "ok" or result.get("completeness") != "complete":
+        raise RuntimeError("L3 profile ingest not confirmed complete")
 
     # Resolve and repair metadata on every build, including a deduplicated replay.
     # This closes the old gap where a failed provenance update could never be repaired
@@ -147,7 +152,7 @@ async def get_l3_fractal_context(graphiti, entity_name: str) -> str:
         """
         MATCH (e:Episodic)
         WHERE e.source_description=$source
-          AND coalesce(e.deleted, false)=false
+          AND """ + visible_node("e") + """
         RETURN coalesce(e.content, e.episode_body, '') AS content,
                coalesce(e.created_at, e.valid_at) AS created_at
         ORDER BY coalesce(e.created_at, e.valid_at) DESC

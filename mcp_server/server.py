@@ -5,12 +5,13 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from core import get_graphiti_client
 from core.instance import get_instance_user_id
-from core.memory_ops import MemoryOps
+from core.memory_ops import MemoryOps, clear_recent_memories
+from core.conversation_buffer import clear_user_buffer
+from core.erasure_guard import erase_node
 from experience.retrieval import get_antipatterns, get_success_patterns
 from knowledge.ingest import ingest_text_document, resolve_group_id
 from knowledge.retrieval import search_knowledge
@@ -271,22 +272,11 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         if hard and os.getenv("FRACTAL_ALLOW_HARD_DELETE") != "1":
             raise PermissionError("hard delete is disabled; set FRACTAL_ALLOW_HARD_DELETE=1 explicitly")
         graphiti = await _get_graphiti()
-        if hard:
-            result = await graphiti.driver.execute_query(
-                "MATCH (n {uuid:$uuid}) DETACH DELETE n RETURN 1 AS done",
-                uuid=uuid,
-            )
-            return {"deleted": bool(result.records), "mode": "hard"}
-        result = await graphiti.driver.execute_query(
-            """
-            MATCH (n {uuid:$uuid})
-            SET n.deleted=true, n.deleted_at=$ts
-            RETURN 1 AS done
-            """,
-            uuid=uuid,
-            ts=datetime.now(timezone.utc).isoformat(),
-        )
-        return {"deleted": bool(result.records), "mode": "soft"}
+        result = await erase_node(graphiti, uuid=uuid, hard=hard)
+        if result["deleted"]:
+            clear_user_buffer(owner)
+            clear_recent_memories(owner)
+        return result
 
     raise ValueError(f"Unknown tool: {name}")
 

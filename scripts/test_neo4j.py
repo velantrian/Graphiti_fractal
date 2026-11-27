@@ -102,7 +102,8 @@ def start_container(kind: str) -> Container:
 
 
 def stop_container(name: str) -> None:
-    subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # --volumes: Neo4j declares /data as an anonymous volume; without this a force-removed container leaks it
+    subprocess.run(["docker", "rm", "--force", "--volumes", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def provision(container: Container, run_id: str) -> None:

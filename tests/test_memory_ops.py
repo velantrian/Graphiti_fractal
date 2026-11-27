@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from core.memory_ops import ContextResult, MemoryOps, SearchResult, _recent_memories
+from tests.helpers.erasure import mock_admission  # noqa: F401
 
 
 @pytest.fixture

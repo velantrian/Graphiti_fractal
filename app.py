@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from api.jobs import cleanup_old_jobs, create_upload_job, finish_upload_job, get_upload_job, update_upload_job
 from core.conversation_buffer import clear_user_buffer
 from core.graphiti_client import get_graphiti_client
+from core.erasure_guard import erase_node, last_erasure_at, read_erasure_state, visible_node
 from core.instance import get_instance_user_id, require_instance_user_id
 from core.memory_ops import clear_recent_memories
 from core.task_registry import drain, spawn
@@ -82,6 +83,7 @@ async def run_ingest_job(
     source_description: str | None,
     memory_type: str,
     user_id: str,
+    expected_revision: int,
 ) -> None:
     try:
         graphiti = await get_graphiti_client().ensure_ready()
@@ -96,6 +98,7 @@ async def run_ingest_job(
             user_id=user_id,
             group_id=resolve_group_id(memory_type),
             job_id=job_id,
+            expected_revision=expected_revision,
         )
 
         job = get_upload_job(job_id)
@@ -190,7 +193,11 @@ async def visualization_data():
             status_code=404,
             detail="graph_data.json not generated; run python main.py viz-export",
         )
-    return FileResponse(path)
+    graphiti = await get_graphiti_dep()
+    latest = await last_erasure_at(graphiti)
+    if latest is not None and path.stat().st_mtime < latest.timestamp():
+        raise HTTPException(status_code=409, detail="graph export predates an erasure; export it again")
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health", tags=["System"])
@@ -333,6 +340,8 @@ async def upload_file(
     except UnicodeDecodeError:
         content = raw.decode("cp1251", errors="replace")
 
+    graphiti = await get_graphiti_dep()
+    expected_revision, _ = await read_erasure_state(graphiti)
     cleanup_old_jobs()
     job_id = create_upload_job()
     job = get_upload_job(job_id)
@@ -340,7 +349,7 @@ async def upload_file(
         job["timing"]["upload_request_started_at"] = datetime.now(timezone.utc)
 
     spawn(
-        run_ingest_job(job_id, content, source_description, memory_type, owner),
+        run_ingest_job(job_id, content, source_description, memory_type, owner, expected_revision),
         name=f"upload:{job_id}",
     )
     return {"job_id": job_id}
@@ -363,32 +372,13 @@ async def delete_node(req: DeleteRequest):
     if req.hard and os.getenv("FRACTAL_ALLOW_HARD_DELETE") != "1":
         raise HTTPException(status_code=403, detail="hard delete is disabled")
 
+    owner = _owner()
     graphiti = await get_graphiti_dep()
-    if req.hard:
-        result = await graphiti.driver.execute_query(
-            "MATCH (n {uuid:$uuid}) DETACH DELETE n RETURN 1 AS done",
-            uuid=req.uuid,
-        )
-        return {
-            "status": "ok" if result.records else "not_found",
-            "deleted": bool(result.records),
-            "mode": "hard",
-        }
-
-    result = await graphiti.driver.execute_query(
-        """
-        MATCH (n {uuid:$uuid})
-        SET n.deleted=true, n.deleted_at=$ts
-        RETURN 1 AS done
-        """,
-        uuid=req.uuid,
-        ts=datetime.now(timezone.utc).isoformat(),
-    )
-    return {
-        "status": "ok" if result.records else "not_found",
-        "deleted": bool(result.records),
-        "mode": "soft",
-    }
+    result = await erase_node(graphiti, uuid=req.uuid, hard=req.hard)
+    if result["deleted"]:
+        clear_user_buffer(owner)
+        clear_recent_memories(owner)
+    return {"status": "ok" if result["deleted"] else "not_found", **result}
 
 
 @app.post("/buffer/clear", tags=["Memory"], dependencies=[Depends(require_api_token)])
@@ -411,11 +401,8 @@ async def clear_memory(x_fractal_confirm: str | None = Header(default=None)):
     if not hmac.compare_digest(x_fractal_confirm or "", "CLEAR_ALL_MEMORY"):
         raise HTTPException(status_code=400, detail="missing destructive confirmation header")
 
-    graphiti = await get_graphiti_dep()
-    count_result = await graphiti.driver.execute_query("MATCH (n) RETURN count(n) AS total")
-    deleted = int(count_result.records[0]["total"]) if count_result.records else 0
-    await graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
-    return {"status": "ok", "deleted_nodes": deleted}
+    # Online wipe cannot fence upstream writes or safely remove the ledger.
+    raise HTTPException(status_code=409, detail="online clear-all is disabled; coordinated offline erasure required")
 
 
 @app.get(
@@ -493,9 +480,9 @@ async def diagnose_memory_conflicts(entity_name: str, limit: int = 20):
         """
         MATCH (e:Entity)
         WHERE toLower(e.name) CONTAINS toLower($entity_name)
-          AND coalesce(e.deleted, false) = false
+          AND """ + visible_node("e") + """
         OPTIONAL MATCH (e)<-[:MENTIONS]-(ep:Episodic)
-        WHERE coalesce(ep.deleted, false) = false
+        WHERE """ + visible_node("ep") + """
         RETURN e.name AS entity_name,
                e.summary AS entity_summary,
                collect({

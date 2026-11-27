@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from tests.helpers.fence import mock_chat_erasure  # noqa: F401
 
 import simple_chat_agent as chat_module
 from core.config import get_config

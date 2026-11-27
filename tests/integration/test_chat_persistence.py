@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 async def _count_turns(driver, *, user_id: str, marker: str) -> int:
     result = await driver.execute_query(
         """
-        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {episode_kind:'chat_turn'})
+        MATCH (e:Episodic {episode_kind:'chat_turn'})-[:STORED_FOR]->(:User {user_id:$user_id})
         WHERE e.content CONTAINS $marker
         RETURN count(e) AS count
         """,
@@ -64,7 +64,7 @@ async def test_concurrent_chat_turn_indices_are_unique_and_sequential(graphiti_c
 
     result = await graphiti.driver.execute_query(
         """
-        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(e:Episodic {episode_kind:'chat_turn'})
+        MATCH (e:Episodic {episode_kind:'chat_turn'})-[:STORED_FOR]->(:User {user_id:$user_id})
         WHERE e.content CONTAINS $marker_prefix
         RETURN e.turn_index AS turn_index, e.conversation_id AS conversation_id
         ORDER BY e.turn_index ASC
@@ -94,7 +94,7 @@ async def test_summary_references_real_persisted_turn_uuids(graphiti_client, llm
 
     summary_result = await graphiti.driver.execute_query(
         """
-        MATCH (:User {user_id:$user_id})-[:AUTHORED]->(s:Episodic {episode_kind:'chat_summary'})
+        MATCH (s:Episodic {episode_kind:'chat_summary'})-[:STORED_FOR]->(:User {user_id:$user_id})
         RETURN s.uuid AS uuid,
                s.conversation_id AS conversation_id,
                s.covers_turns AS covers_turns,

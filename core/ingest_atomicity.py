@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 from neo4j.exceptions import ConstraintError
 
+from core.erasure_guard import ErasureFenceChanged, LOCK_ERASURE_CONTROL, ensure_erasure_constraints
+
 
 VALID_ORIGIN_CLASSES = {"owner", "agent_derived", "untrusted", "system"}
 
@@ -38,9 +40,13 @@ async def acquire_ingest_claim(
     group_id: str,
     fingerprint: str,
     ttl_seconds: int = 300,
+    expected_revision: int | None = None,
 ) -> str | None:
     """Acquire one unique claim or return None when another claim owns identity."""
     await ensure_ingest_claim_constraint(graphiti)
+    await ensure_erasure_constraints(graphiti)
+    if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+        raise ValueError("invalid expected erasure revision")
     key = claim_key(group_id, fingerprint)
     token = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -54,8 +60,12 @@ async def acquire_ingest_claim(
     # other existing claim stays until reconciliation.
     for _ in range(2):
         try:
+            # Admitted only if no erasure *in this group* happened since the caller observed
+            # revision `expected_revision`; erasures in other groups do not affect this write.
             result = await graphiti.driver.execute_query(
-                """
+                LOCK_ERASURE_CONTROL + """
+                WHERE $expected_revision IS NULL OR NOT EXISTS {
+                    MATCH (t:FractalErasure {group_id:$group_id}) WHERE t.revision > $expected_revision }
                 CREATE (c:FractalIngestClaim {
                     claim_key:$claim_key,
                     group_id:$group_id,
@@ -63,6 +73,7 @@ async def acquire_ingest_claim(
                     token:$token,
                     state:'PENDING',
                     attempt_protocol:1,
+                    erasure_revision:coalesce(gate.revision,0),
                     created_at:datetime($now),
                     expires_at:datetime($expires)
                 })
@@ -74,8 +85,11 @@ async def acquire_ingest_claim(
                 token=token,
                 now=now.isoformat(),
                 expires=expires.isoformat(),
+                expected_revision=expected_revision,
             )
-            return str(result.records[0]["token"]) if result.records else None
+            if not result.records:
+                raise ErasureFenceChanged("ingest claim not admitted: an erasure in this group happened meanwhile")
+            return str(result.records[0]["token"])
         except ConstraintError:
             # Only a uniqueness conflict is evidence of an existing claim.
             # Database outages, auth errors, and query failures must propagate.
@@ -209,6 +223,10 @@ async def mark_ingest_claim_failed(
         MATCH (c:FractalIngestClaim {claim_key:$claim_key, token:$token, state:'PENDING'})
         SET c.state='RECONCILIATION_REQUIRED',
             c.failed_at=datetime(), c.error_type=$error_type
+        WITH c
+        OPTIONAL MATCH (e:Episodic {uuid:c.episode_uuid})
+        FOREACH (_ IN CASE WHEN e IS NULL THEN [] ELSE [1] END |
+            SET e.erasure_quarantined=true)
         """,
         claim_key=claim_key(group_id, fingerprint),
         token=token,
@@ -229,7 +247,9 @@ async def read_ingest_claim(graphiti, *, group_id: str, fingerprint: str) -> dic
         RETURN c.state AS state, c.episode_uuid AS episode_uuid,
                c.ingest_quality AS ingest_quality, c.content_sha256 AS content_sha256,
                c.error_type AS error_type,
-               (e IS NOT NULL AND coalesce(e.deleted,false)=false) AS episode_live
+               (e IS NOT NULL AND coalesce(e.deleted,false)=false
+                AND coalesce(e.erasure_quarantined,false)=false
+                AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }) AS episode_live
         """,
         claim_key=claim_key(group_id, fingerprint),
     )
@@ -312,10 +332,13 @@ async def finalize_episode_identity(
         raise ValueError("exact content digest required for known ingest quality")
 
     result = await graphiti.driver.execute_query(
-        """
+        LOCK_ERASURE_CONTROL + """
         MATCH (e:Episodic {uuid:$episode_uuid})
         MATCH (c:FractalIngestClaim {claim_key:$claim_key, token:$claim_token, state:'PENDING'})
         WHERE c.episode_uuid=$episode_uuid
+          AND NOT EXISTS { MATCH (t:FractalErasure {group_id:$group_id}) WHERE t.revision > c.erasure_revision }
+          AND coalesce(e.erasure_quarantined,false)=false
+          AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
           AND coalesce(e.deleted,false)=false
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
@@ -324,6 +347,7 @@ async def finalize_episode_identity(
             e.content_sha256=$content_sha256,
             e.ingest_event_id=$claim_token,
             e.source_identity_status='unknown',
+            e.ingest_erasure_revision=c.erasure_revision,
             c.ingest_quality=$ingest_quality,
             c.content_sha256=$content_sha256,
             c.state='COMMITTED',
@@ -355,4 +379,4 @@ async def finalize_episode_identity(
         content_sha256=content_sha256,
     )
     if not result.records:
-        raise RuntimeError("episode finalization failed: episode or matching ingest claim not found")
+        raise RuntimeError("episode finalization not admitted: missing target, claim, or an erasure in this group happened meanwhile")

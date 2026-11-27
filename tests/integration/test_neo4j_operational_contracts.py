@@ -383,3 +383,118 @@ async def test_live_neo4j_quality_attribution_and_claim_recovery(isolated_graph)
         assert await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="uncertain") is None
     finally:
         await graphiti.reset()
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_original(isolated_graph):
+    """GF-02: actual Neo4j, stale search objects, no provider calls."""
+    from types import SimpleNamespace
+    from core.erasure_guard import erase_node, read_erasure_state
+    from core.memory_ops import MemoryOps
+
+    graphiti = isolated_graph
+    try:
+        await graphiti.reset()
+        await graphiti.driver.execute_query("""
+            CREATE (a:Episodic {uuid:'erase-me',group_id:'knowledge',content:'secret marker',origin_class:'owner'}),
+                   (b:Episodic {uuid:'keep-me',group_id:'knowledge',content:'independent marker',origin_class:'owner'}),
+                   (d:Episodic {uuid:'derived',group_id:'knowledge',content:'secret marker in summary',
+                                origin_class:'agent_derived',derived_source_ids:['erase-me']}),
+                   (x:Entity {uuid:'x',group_id:'knowledge',summary:'secret marker'}),
+                   (y:Entity {uuid:'y',group_id:'knowledge',summary:'other'}),
+                   (c:Community {uuid:'community',group_id:'knowledge',summary:'secret marker'}),
+                   (a)-[:MENTIONS]->(x),
+                   (c)-[:HAS_MEMBER]->(x),
+                   (x)-[:RELATES_TO {uuid:'edge',group_id:'knowledge',fact:'secret marker'}]->(y)
+        """)
+        async def stale_search(**kwargs):
+            return SimpleNamespace(
+                episodes=[SimpleNamespace(uuid=uid,content=body,group_id='knowledge')
+                          for uid,body in [('erase-me','secret marker'),('keep-me','independent marker'),
+                                           ('derived','secret marker in summary')]],
+                nodes=[SimpleNamespace(uuid='x',name='X',summary='secret marker',group_id='knowledge')],
+                edges=[SimpleNamespace(uuid='edge',fact='secret marker',group_id='knowledge')],
+                communities=[SimpleNamespace(uuid='community',name='C',summary='secret marker',group_id='knowledge')],
+            )
+        graphiti.search_ = stale_search
+        memory = MemoryOps(graphiti, "owner")
+        before = await memory.search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert {e["uuid"] for e in before.episodes} == {"erase-me", "keep-me", "derived"}
+        assert before.entities and before.edges and before.communities
+        assert await read_erasure_state(graphiti) == (0, False)
+        assert (await erase_node(graphiti, uuid="erase-me"))["deleted"] is True
+        assert await read_erasure_state(graphiti) == (1, True)
+        other = isolated_graph.sibling()
+        other.search_ = stale_search
+        after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert [e["uuid"] for e in after.episodes] == ["keep-me"]
+        assert not after.entities and not after.edges and not after.communities
+        upgrade = await erase_node(graphiti, uuid="erase-me", hard=True)
+        assert upgrade["deleted"] is True and upgrade["performed_mode"] == "hard"
+        # hard after soft is the SAME event: physical deletion only, no new revision (idempotency contract)
+        assert await read_erasure_state(other) == (1, True)
+        after = await MemoryOps(other, "owner").search_memory("marker", scopes=["knowledge"], retrieval_mode="drift")
+        assert [e["uuid"] for e in after.episodes] == ["keep-me"]
+        marker = await graphiti.driver.execute_query(
+            "MATCH (t:FractalErasure {target_uuid:'erase-me'}) RETURN t.mode AS mode, t.hard_deleted_at AS h")
+        assert marker.records[0]["mode"] == "soft" and marker.records[0]["h"]
+    finally:
+        await graphiti.reset()
+
+
+@pytest.mark.asyncio
+async def test_live_neo4j_erasure_fence_rejects_old_claim_and_late_finalization(isolated_graph):
+    """Real Neo4j commit boundary; simulate an upstream writer crossing erasure."""
+    import hashlib
+    from core.erasure_guard import erase_node, read_erasure_state, ErasureFenceChanged
+    from core.ingest_atomicity import (
+        mark_ingest_claim_failed, read_ingest_claim,
+    )
+
+    graphiti = isolated_graph
+    try:
+        await graphiti.reset()
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'erasure-target',group_id:'knowledge',content:'old'})")
+        revision, _ = await read_erasure_state(graphiti)
+        token = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="late",
+                                           expected_revision=revision)
+        assert token
+        assert (await erase_node(isolated_graph.sibling(), uuid="erasure-target"))["deleted"]
+        with pytest.raises(ErasureFenceChanged):
+            await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="queued",
+                                       expected_revision=revision)
+        # The upstream transaction is outside Fractal's lock and can still land.
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'late-episode',group_id:'knowledge',content:'late'})")
+        await mark_ingest_claim_episode_created(graphiti, group_id="knowledge", fingerprint="late",
+                                               token=token, episode_uuid="late-episode")
+        with pytest.raises(RuntimeError, match="not admitted"):
+            await finalize_episode_identity(
+                graphiti, group_id="knowledge", fingerprint="late", claim_token=token,
+                episode_uuid="late-episode", user_id="owner", origin_class="owner",
+                ingest_quality="complete", content_sha256=hashlib.sha256(b"late").hexdigest())
+        await mark_ingest_claim_failed(graphiti, group_id="knowledge", fingerprint="late",
+                                       token=token, error_type="ErasureFenceChanged")
+        receipt = await read_ingest_claim(graphiti, group_id="knowledge", fingerprint="late")
+        assert receipt["status"] == "unconfirmed"
+        assert receipt["state"] == "RECONCILIATION_REQUIRED"
+        row = (await graphiti.driver.execute_query(
+            "MATCH (e:Episodic {uuid:'late-episode'}) "
+            "RETURN e.origin_class AS origin, e.erasure_quarantined AS quarantine")).records[0]
+        assert row["origin"] is None and row["quarantine"] is True
+        current, _ = await read_erasure_state(graphiti)
+        fresh = await acquire_ingest_claim(graphiti, group_id="knowledge", fingerprint="fresh",
+                                           expected_revision=current)
+        assert fresh
+        await graphiti.driver.execute_query(
+            "CREATE (:Episodic {uuid:'fresh-episode',group_id:'knowledge',content:'fresh'})")
+        await mark_ingest_claim_episode_created(graphiti, group_id="knowledge", fingerprint="fresh",
+                                               token=fresh, episode_uuid="fresh-episode")
+        await finalize_episode_identity(
+            graphiti, group_id="knowledge", fingerprint="fresh", claim_token=fresh,
+            episode_uuid="fresh-episode", user_id="owner", origin_class="owner",
+            ingest_quality="complete", content_sha256=hashlib.sha256(b"fresh").hexdigest())
+        assert (await read_ingest_claim(graphiti, group_id="knowledge", fingerprint="fresh"))["status"] == "committed_complete"
+    finally:
+        await graphiti.reset()

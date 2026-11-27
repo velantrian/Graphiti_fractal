@@ -15,7 +15,8 @@ _conversation_buffers = {}
 class ConversationBuffer:
     """RAM buffer for recent conversation messages per user."""
 
-    def __init__(self, max_messages: int = 12):
+    def __init__(self, max_messages: int = 12, *, erasure_state: tuple[int, bool] | None = None):
+        self.erasure_state = erasure_state
         self.conversation_id = str(uuid.uuid4())[:8]
         self.buffer = deque(maxlen=max_messages)
         self.turn_index = 0
@@ -74,13 +75,23 @@ class ConversationBuffer:
         ]
 
 
-def get_user_conversation_buffer(user_id: str) -> ConversationBuffer:
-    """Get or create the configured conversation buffer for one user."""
+def get_user_conversation_buffer(
+    user_id: str, *, erasure_state: tuple[int, bool] | None = None,
+) -> ConversationBuffer:
+    """Use a freshly observed database state at every live chat boundary.
+
+    A legacy unbound buffer cannot be assumed to belong to the current revision.
+    The optional argument is for legacy inspection/clearing, never live admission.
+    """
+    existing = _conversation_buffers.get(user_id)
+    if erasure_state is not None and existing is not None and existing.erasure_state != erasure_state:
+        clear_user_buffer(user_id)
     if user_id not in _conversation_buffers:
         from core.config import get_config
 
         _conversation_buffers[user_id] = ConversationBuffer(
-            max_messages=get_config().app.conversation_buffer_max_messages
+            max_messages=get_config().app.conversation_buffer_max_messages,
+            erasure_state=erasure_state,
         )
     return _conversation_buffers[user_id]
 
@@ -104,7 +115,9 @@ def cleanup_inactive_buffers(max_age_hours: int = 24):
 def clear_user_buffer(user_id: str) -> int:
     """Clear a user's process-local conversation buffer and return message count."""
     if user_id in _conversation_buffers:
-        count = len(_conversation_buffers[user_id].buffer)
-        del _conversation_buffers[user_id]
+        buffer = _conversation_buffers.pop(user_id)
+        count = len(buffer.buffer)
+        # Also empty detached references held by an in-flight local request.
+        buffer.buffer.clear()
         return count
     return 0

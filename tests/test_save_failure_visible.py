@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from tests.helpers.fence import mock_ingest_revision, mock_chat_erasure  # noqa: F401
 from fastapi.testclient import TestClient
 
 import simple_chat_agent
@@ -64,9 +65,9 @@ async def test_persist_failure_is_reported_in_registry(monkeypatch):
         raise RuntimeError("neo4j down")
 
     agent._persist_episode = boom
-    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:x")
-    assert out["status"] == "failed" and "neo4j down" in out["error"]
-    assert persist_outcomes.get("chat:x", user_id="u1")["status"] == "failed"
+    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:x", expected_state=(0, False))
+    assert out["status"] == "unknown" and "neo4j down" in out["error"]
+    assert persist_outcomes.get("chat:x", user_id="u1")["status"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -78,7 +79,7 @@ async def test_timeout_during_episode_write_is_unknown(monkeypatch):
         raise asyncio.TimeoutError()
 
     agent._persist_episode = slow
-    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:y")
+    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:y", expected_state=(0, False))
     assert out["status"] == "unknown"
 
 
@@ -90,7 +91,7 @@ async def test_timeout_in_allocate_before_any_write_is_failed(monkeypatch):
     monkeypatch.setattr(simple_chat_agent, "allocate_turn_index", idx_timeout)
     agent = _agent()
     agent._persist_episode = AsyncMock()
-    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:z")
+    out = await agent._persist_turn_pipeline(conversation_id="c", conversation_text="t", persist_id="chat:z", expected_state=(0, False))
     assert out["status"] == "failed"
     agent._persist_episode.assert_not_called()
 
@@ -122,7 +123,7 @@ async def test_parallel_documents_get_unique_ids_and_outcomes(monkeypatch):
         return {"status": "ok", "completeness": "complete"}
 
     monkeypatch.setattr("knowledge.ingest.ingest_text_document", ingest)
-    monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid: Mock())
+    monkeypatch.setattr(simple_chat_agent, "get_user_conversation_buffer", lambda uid, **kwargs: Mock())
     agent = _agent()
     ids = []
     for _ in range(2):

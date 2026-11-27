@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from core.memory_ops import MemoryOps
+from tests.helpers.erasure import mock_admission  # noqa: F401
 
 
 class FakeGraphiti:

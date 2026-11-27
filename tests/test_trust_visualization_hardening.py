@@ -195,7 +195,7 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
 
     async def fake_ingest(graphiti, text, **kwargs):
         captured["ingest"] = (text, kwargs)
-        return {"status": "ok", "added": 0, "skipped": 1, "warnings": []}
+        return {"status": "ok", "completeness": "complete", "added": 0, "skipped": 1, "warnings": []}
 
     async def fake_persist(graphiti, episode_uuid, metadata):
         captured["persist"] = (episode_uuid, metadata)
@@ -210,6 +210,10 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
                 return SimpleNamespace(records=[{"uuid": "l3-episode", "tainted_entities": 1}])
             raise AssertionError(f"unexpected query: {query}")
 
+    async def fake_state(graphiti):
+        return 7, False
+
+    monkeypatch.setattr(l3, "read_erasure_state", fake_state)   # the DB-backed revision read is covered live
     graphiti = SimpleNamespace(driver=Driver())
     monkeypatch.setattr(l3, "get_l2_semantic_context_with_sources", fake_l2)
     monkeypatch.setattr(l3, "llm_chat_response", fake_llm)
@@ -224,6 +228,7 @@ async def test_l3_uses_json_data_boundary_marks_derived_origin_and_repairs_repla
     assert text == "Derived profile"
     assert ingest_kwargs["origin_class"] == "agent_derived"
     assert ingest_kwargs["group_id"] == "knowledge"
+    assert ingest_kwargs["expected_revision"] == 7   # revision observed before the L2 read
     assert ingest_kwargs["user_id"] == "owner"
 
     messages = captured["messages"]
@@ -264,8 +269,11 @@ async def test_visualization_export_uses_d3_edge_contract_and_prelimit_node_set(
 
 def test_visualization_queries_filter_deleted_nodes_and_irrelevant_edges_before_limit():
     source = Path("visualization/visualization_export.py").read_text(encoding="utf-8")
-    assert "coalesce(n.deleted, false) = false" in source
-    assert "coalesce(m.deleted, false) = false" in source
+    # Deleted/tombstoned/quarantined state is filtered by the shared object-level predicate
+    # (node endpoints and the edge itself) before LIMIT; it contains the deleted check.
+    assert 'visible_node("n")' in source and 'visible_edge("r", "n", "m")' in source
+    from core.erasure_guard import visible_node
+    assert "coalesce(n.deleted,false) = true" in visible_node("n")
     assert "(n:Entity OR n:Community)" in source
     assert "(m:Entity OR m:Community)" in source
     assert "n.uuid IN $node_uuids" in source
