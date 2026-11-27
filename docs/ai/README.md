@@ -15,6 +15,10 @@ primary_graph_backend: neo4j
 runtime_authorization_from_docs: false
 ```
 
+## Project journal
+
+[Журнал проекта](../PROJECT_JOURNAL.md) фиксирует последний подтверждённый этап, оставшиеся задачи и ссылки на проверки. Для текущей задачи сверь указанный статус с `main`, профильными документами и CI.
+
 ## Required reading order
 
 1. `docs/ai/README.md` — this routing contract.
