@@ -21,7 +21,7 @@
 
 Приёмка на `8168edb` (27.11.2026, одноразовая Neo4j 5.26.29 и вторая база с контрольной записью, без ключа провайдера): контракты 261 passed, 1 xfailed; guard 29 passed; обычный `pytest tests/e2e` без тестовых настроек пропускает тесты, с `FRACTAL_REQUIRE_TEST_NEO4J=1` завершается ошибкой, драйвер не создаётся; допуск e2e 2 passed, прогон с моделью пропущен; чужая база и чужой маркер отклонены до первой записи (5 проверок). Все 33 запроса Graphiti ушли в допущенную базу, 5 попыток назвать другую базу отклонены до драйвера, маркер цел. **Прогон с настоящей моделью не выполнялся.**
 
-Приёмка #64 на `8b7a8c8` прошла на `main`: 176 интеграционных тестов Neo4j, контракты Python 3.10 и 3.12, сборка Docker. Вызов реального LLM-провайдера пропущен. [Neo4j CI](https://github.com/velantrian/Graphiti_fractal/actions/runs/46003456180) · [CI](https://github.com/velantrian/Graphiti_fractal/actions/runs/46003456293)
+На коммите `8b7a8c8` в `main` прошли 176 интеграционных тестов Neo4j, контракты Python 3.10 и 3.12 и сборка Docker. Вызов реального LLM-провайдера пропущен. [Neo4j CI](https://github.com/velantrian/Graphiti_fractal/actions/runs/46003456180) · [CI](https://github.com/velantrian/Graphiti_fractal/actions/runs/46003456293)
 
 ## Откуда продолжить
 
