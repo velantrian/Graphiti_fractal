@@ -218,3 +218,30 @@ async def test_a_retelling_deduplicated_onto_an_owner_episode_does_not_taint_it(
     assert row == [{"o": "owner", "ids": None}]
     await erase(env, src, hard=False)
     assert RET in (await observe(env, ask=False))["episodes"], "an independent owner statement is not destroyed with the source"
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hard", [False, True], ids=["soft", "hard"])
+async def test_retelling_of_cross_group_entity_is_transitively_contained(env, hard):
+    """Receipt lineage alternates episode -> extracted entity -> episode across groups."""
+    src = await seed_source(env)
+    first = await read_source(env, src)
+    assert (await retell(env, first, [src]))["completeness"] == "complete"
+    second = await mcp("memory.search_knowledge", query="Mira Venn vault secret phrase", group_id=P)
+    entity = next(row for row in second["items"] if row["kind"] == "Entity" and RET in row["text"])
+    body = f"[[Quill Raven]] repeats the vault secret phrase {RET} for [[Glass Door]]."
+    assert (await retell(env, second, [entity["uuid"]], text=body, group="personal"))["completeness"] == "complete"
+    before = await observe(env, ask=False)
+    assert RET in before["episodes"] and RET in before["edges"]
+    await erase(env, src, hard=hard)
+    rows = await env.q(
+        "MATCH (e:Episodic) WHERE e.content IN [$first, $second] "
+        "RETURN e.group_id AS group, coalesce(e.erasure_quarantine,[]) AS marks",
+        first=D_TEXT, second=body,
+    )
+    provenance = {row["group"]: row["marks"] for row in rows}
+    assert provenance["project"] and provenance["personal"]
+    after = await observe(env)
+    assert gone(after, SRC) and gone(after, RET)
+    assert CONTROL in after["search_all"] and CONTROL in after["mcp_search"] and CONTROL in after["model_input"]

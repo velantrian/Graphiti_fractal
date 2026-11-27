@@ -149,7 +149,15 @@ async def compute_area(graphiti, seed: Seed) -> Area:
     await extend_lineage(graphiti, area, seed,
                          {t} | {u for u, c in {**area.entities, **area.edges, **area.communities}.items()
                                 if c in ("pure", "mixed")})
-    await close_derived_graph(graphiti, area, seed)
+    # A receipt may name an Entity extracted from a dependent episode rather
+    # than the episode itself. Alternate the two traversals until no additional
+    # episode is discovered; every iteration uses the full dependent set.
+    while True:
+        await close_derived_graph(graphiti, area, seed)
+        previous = len(area.derived)
+        await extend_lineage(graphiti, area, seed, set(area.groups))
+        if len(area.derived) == previous:
+            break
     return area
 
 
@@ -172,8 +180,9 @@ async def close_derived_graph(graphiti, area: Area, seed: Seed) -> None:
         RETURN e.uuid AS uuid, e.group_id AS g, count(o) AS others""", d=sorted(area.derived), t=seed.target_uuid, dep=dep)
     for r in ents:
         cls = "mixed" if r["others"] else "pure"
-        if area.entities.get(r["uuid"]) in (None, "exposed"):
-            area.entities[r["uuid"]] = cls
+        # Reclassify on every round: an apparent independent source may
+        # itself have become dependent through a newly discovered entity.
+        area.entities[r["uuid"]] = cls
         area.groups[r["uuid"]] = r["g"]
     edges = await _rows(graphiti, f"""
         MATCH ()-[r:RELATES_TO]->() WHERE any(x IN coalesce(r.episodes,[]) WHERE x IN $d)
@@ -181,8 +190,7 @@ async def close_derived_graph(graphiti, area: Area, seed: Seed) -> None:
         RETURN r.uuid AS uuid, r.group_id AS g, count(o) AS others""", d=sorted(area.derived), dep=dep)
     for r in edges:
         cls = "mixed" if r["others"] else "pure"
-        if area.edges.get(r["uuid"]) in (None, "exposed"):
-            area.edges[r["uuid"]] = cls
+        area.edges[r["uuid"]] = cls
         area.groups[r["uuid"]] = r["g"]
     touched = sorted({r["uuid"] for r in ents})
     if touched:
