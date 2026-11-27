@@ -34,6 +34,7 @@ def successful_ingest_claims():
             "knowledge.ingest.acquire_ingest_claim",
             new=AsyncMock(return_value="test-claim-token"),
         ) as acquire,
+        patch("knowledge.ingest.mark_ingest_claim_write_attempt", new=AsyncMock(return_value=1)),
         patch(
             "knowledge.ingest.mark_ingest_claim_episode_created",
             new=AsyncMock(),

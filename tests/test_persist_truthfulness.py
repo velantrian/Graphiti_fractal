@@ -77,8 +77,8 @@ def _graphiti_failing_chunk(fail_index):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claim, exists, fail, completeness, status", [
     ("t", False, None, "complete", "ok"),
-    ("t", False, 2, "partial", "ok"),        # legacy status stays "ok": completeness tells the truth
-    ("t", False, "all", "failed", "error"),
+    ("t", False, 2, "unconfirmed", "ok"),  # upstream write may already have committed
+    ("t", False, "all", "unconfirmed", "ok"),
     (None, False, None, "unconfirmed", "ok"),  # every claim held by another writer: not "failed"
     ("t", True, None, "complete", "ok"),     # already stored earlier
 ])
@@ -91,7 +91,8 @@ async def test_ingest_completeness_real_loop(claim, exists, fail, completeness, 
     with (
         patch("knowledge.ingest.episode_exists", new=AsyncMock(return_value=exists)),
         patch("knowledge.ingest.acquire_ingest_claim", new=AsyncMock(return_value=claim)),
-        patch("knowledge.ingest.release_ingest_claim", new=AsyncMock()),
+        patch("knowledge.ingest.mark_ingest_claim_failed", new=AsyncMock()),
+        patch("knowledge.ingest.mark_ingest_claim_write_attempt", new=AsyncMock(return_value=1)),
         patch("knowledge.ingest.mark_ingest_claim_episode_created", new=AsyncMock()),
         patch("knowledge.ingest.finalize_episode_identity", new=AsyncMock()),
         patch("knowledge.ingest.get_embedding", new=AsyncMock(return_value=None)),
@@ -100,7 +101,8 @@ async def test_ingest_completeness_real_loop(claim, exists, fail, completeness, 
     assert res["chunks"] > 1
     assert res["completeness"] == completeness
     assert res["status"] == status
-    assert res["added"] + res["skipped_existing"] + res["skipped_claim_held"] + res["failed_chunks"] == res["chunks"]
+    assert sum(res[key] for key in ("added", "skipped_existing", "skipped_claim_held",
+                                    "unconfirmed_existing", "unconfirmed_writes", "failed_chunks")) == res["chunks"]
 
 
 def test_registry_restart_loses_outcomes_and_404_is_not_absence():

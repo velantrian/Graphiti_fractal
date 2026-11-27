@@ -127,6 +127,7 @@ async def _read_success_pattern_page(
         """
         MATCH (tr:TaskRun)
         WHERE tr.group_id = $gid
+          AND coalesce(tr.deleted, false) = false
           AND tr.status = 'success'
           AND ($task_type IS NULL OR tr.task_type = $task_type)
           AND ($ctx IS NULL OR tr.context_hash = $ctx)
@@ -228,6 +229,7 @@ async def get_antipatterns(
         """
         MATCH (tr:TaskRun)
         WHERE tr.group_id = $gid
+          AND coalesce(tr.deleted, false) = false
           AND tr.status IN ['failure','timeout','aborted']
           AND ($task_type IS NULL OR tr.task_type = $task_type)
           AND ($ctx IS NULL OR tr.context_hash = $ctx)

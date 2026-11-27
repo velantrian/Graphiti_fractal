@@ -95,6 +95,10 @@ class IsolatedGraph:
     async def reset(self):
         await reset_test_graph(self._raw, self._settings)
 
+    def sibling(self):
+        """A separate adapter object over the same admitted driver."""
+        return IsolatedGraph(self._raw, self._settings)
+
 
 @pytest_asyncio.fixture
 async def isolated_graph(neo4j_isolation):
