@@ -117,3 +117,27 @@ async def test_candidate_without_raw_text_keeps_identity_only_behaviour(world):
         {"type": "entity", "uuid": "en-a", "group_id": G, "_raw_text": ["Needle a", "stale summary"]},
     ])
     assert keys == {("episode", "ep-a", G), ("entity", "en-b", G)}
+
+
+@pytest.mark.asyncio
+async def test_two_visible_objects_with_one_uuid_are_ambiguous_even_if_only_one_matches_the_text(world):
+    """Identity is decided first (exactly one visible object of that type, uuid and group); only then is the
+    text compared. Filtering by text first would turn two objects into one match and admit an ambiguous uuid."""
+    from core.erasure_guard import admit_search_candidates
+    q = world.q
+    await q("CREATE (:Episodic {uuid:'dup-ep', group_id:$g, content:'first copy', name:'a', origin_class:'owner', "
+            "source:'text', entity_edges:[], created_at:datetime(), valid_at:datetime()}), "
+            "(:Episodic {uuid:'dup-ep', group_id:$g, content:'second copy', name:'b', origin_class:'owner', "
+            "source:'text', entity_edges:[], created_at:datetime(), valid_at:datetime()}), "
+            "(:Entity {uuid:'dup-en', group_id:$g, name:'Dup', summary:'first copy'}), "
+            "(:Entity {uuid:'dup-en', group_id:$g, name:'Dup', summary:'second copy'})", g=G)
+    keys = await admit_search_candidates(world.graphiti, [
+        {"type": "episode", "uuid": "dup-ep", "group_id": G, "_raw_text": ["first copy", ""]},
+        {"type": "entity", "uuid": "dup-en", "group_id": G, "_raw_text": ["Dup", "second copy"]},
+        {"type": "episode", "uuid": "ep-b", "group_id": G, "_raw_text": [f"{TOKEN} episode b", ""]},   # unique and unchanged
+    ])
+    assert keys == {("episode", "ep-b", G)}
+    # without _raw_text the old rule applies: identity and visibility only, and two objects are still ambiguous
+    plain = await admit_search_candidates(world.graphiti, [
+        {"type": "episode", "uuid": "dup-ep", "group_id": G}, {"type": "episode", "uuid": "ep-b", "group_id": G}])
+    assert plain == {("episode", "ep-b", G)}

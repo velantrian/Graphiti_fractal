@@ -384,7 +384,8 @@ RAW_TEXT = "_raw_text"   # key under which search code carries the text exactly 
 async def admit_search_candidates(graphiti, candidates: list[dict]) -> set[tuple[str, str, str]]:
     """Check durable identity, erasure state and freshness of text, after Graphiti search, before ranking.
 
-    One batched statement. A candidate that carries ``_raw_text`` = [t1, t2] (the text Graphiti returned,
+    One batched statement; the order matters. First identity: exactly one VISIBLE object of that type, uuid and
+    group must exist (two are ambiguous and rejected, whatever their text). Only then is the text compared. A candidate that carries ``_raw_text`` = [t1, t2] (the text Graphiti returned,
     BEFORE any truncation for display) is admitted only if the same fields in Neo4j are still exactly equal:
     episode content; entity name+summary; edge fact+name; community name+summary. If the text changed after the
     search, the candidate is excluded: its relevance score was computed for the old text and must not pass to a
@@ -407,29 +408,25 @@ async def admit_search_candidates(graphiti, candidates: list[dict]) -> set[tuple
         CALL (candidate) {
             MATCH (n:Episodic {uuid:candidate.uuid})
             WHERE candidate.kind='episode' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
-              AND (NOT candidate.check OR coalesce(n.content, n.summary, '') = candidate.t1)
-            RETURN n.uuid AS uuid
+            RETURN n.uuid AS uuid, coalesce(n.content, n.summary, '') AS d1, '' AS d2
             UNION ALL
             MATCH (n:Entity {uuid:candidate.uuid})
             WHERE candidate.kind='entity' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
-              AND (NOT candidate.check OR (coalesce(n.name,'') = candidate.t1 AND coalesce(n.summary,'') = candidate.t2))
-            RETURN n.uuid AS uuid
+            RETURN n.uuid AS uuid, coalesce(n.name,'') AS d1, coalesce(n.summary,'') AS d2
             UNION ALL
             MATCH (n:Community {uuid:candidate.uuid})
             WHERE candidate.kind='community' AND n.group_id=candidate.group_id AND """ + visible_node("n") + """
-              AND (NOT candidate.check OR (coalesce(n.name,'') = candidate.t1 AND coalesce(n.summary,'') = candidate.t2))
-            RETURN n.uuid AS uuid
+            RETURN n.uuid AS uuid, coalesce(n.name,'') AS d1, coalesce(n.summary,'') AS d2
             UNION ALL
             MATCH (s:Entity)-[r:RELATES_TO]->(t:Entity)
             WHERE candidate.kind='edge' AND r.uuid=candidate.uuid
               AND r.group_id=candidate.group_id
               AND s.group_id=candidate.group_id AND t.group_id=candidate.group_id
               AND """ + visible_edge("r", "s", "t") + """
-              AND (NOT candidate.check OR (coalesce(r.fact,'') = candidate.t1 AND coalesce(r.name,'') = candidate.t2))
-            RETURN r.uuid AS uuid
+            RETURN r.uuid AS uuid, coalesce(r.fact,'') AS d1, coalesce(r.name,'') AS d2
         }
-        WITH candidate, count(uuid) AS matches
-        WHERE matches=1
+        WITH candidate, count(uuid) AS matches, head(collect(d1)) AS d1, head(collect(d2)) AS d2
+        WHERE matches=1 AND (NOT candidate.check OR (d1 = candidate.t1 AND d2 = candidate.t2))
         RETURN candidate.kind AS kind, candidate.uuid AS uuid, candidate.group_id AS group_id
         """,
         candidates=rows,
