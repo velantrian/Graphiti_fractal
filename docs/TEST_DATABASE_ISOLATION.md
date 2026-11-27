@@ -43,8 +43,8 @@ The same rule, admitted on Graphiti's own connection:
 3. `test_admission_hands_graphiti_the_admitted_connection` checks this without a
    provider key and without writing. The provider round trip needs
    `OPENAI_API_KEY`; without it, it is skipped with an explicit reason, and with
-   `FRACTAL_REQUIRE_PROVIDER_E2E=1` (the opt-in Provider E2E workflow) a missing
-   key is an error.
+   `FRACTAL_REQUIRE_PROVIDER_E2E=1` (the opt-in Provider E2E workflow and the
+   provider job of the External Validation Gate) a missing key is an error.
 4. A plain `pytest tests/e2e` follows the integration rule: no `FRACTAL_TEST_*`
    means skip (error when `FRACTAL_REQUIRE_TEST_NEO4J=1`) and no driver is
    created. A rejected database fails every E2E test of the session after a
@@ -86,5 +86,5 @@ access mode. The acceptance test requires:
 * The marker proves which database a process talks to; it does not stop a
   person from deliberately provisioning an empty production database.
 * The provenance dry-run workflow still uses its own `NEO4J_*` settings and is
-  not covered by this guard. `tests/e2e` and the Provider E2E workflow are
-  (see above).
+  not covered by this guard. `tests/e2e`, the Provider E2E workflow and the
+  provider job of the External Validation Gate are (see above).
