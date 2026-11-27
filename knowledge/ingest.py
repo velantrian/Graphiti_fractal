@@ -383,29 +383,28 @@ async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: 
         from core.erasure_scope import mark_late_write
         from core.late_writes import reopen_for_unsettled_writes
         if episode_uuids:
-            result = await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+            result = await mark_late_write(
+                graphiti, group_id, since_revision, episode_uuids,
+                ingest_claim_key=claim_key(group_id, claim_fingerprint) if claim_fingerprint else None)
             if result.get("events") and claim_fingerprint:
                 await graphiti.driver.execute_query(
                     "MATCH (c:FractalIngestClaim {claim_key:$k}) "
                     "WHERE c.late_settled_at IS NULL AND c.recall_receipt_id IS NULL "
                     "SET c.late_settled_at=datetime(), c.late_settlement='contained'",
                     k=claim_key(group_id, claim_fingerprint))
-        elif claim_fingerprint:
+        if claim_fingerprint:
+            # Even with a known UUID, an event's relation can still be UNKNOWN.
+            # Only the durable claim may hold it until the scope is verified.
             await reopen_for_unsettled_writes(graphiti)
     except Exception:  # noqa: BLE001
         logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
 
 
-async def _contain_stale_derivation(graphiti, group_id: str, episode_uuid: str, receipt) -> None:
-    """A source of a derived write vanished between the check and finalization: the episode already exists.
-    Isolate it and mark everything derived from it as exposed to every erasure since the read (any group)."""
+async def _contain_stale_derivation(graphiti, episode_uuid: str) -> None:
+    """Isolate an unfinalized episode; the common claim-based late-write path marks its graph."""
     try:
         from core.erasure_guard import quarantine_unconfirmed_episode
-        from core.erasure_scope import mark_late_write
         await quarantine_unconfirmed_episode(graphiti, episode_uuid)
-        await mark_late_write(graphiti, group_id, receipt.revision, [episode_uuid], any_group=True)
-        # With no newer erasure, the durable recall claim remains the hold.
-        # Never invent a tombstone or automatically settle an unconfirmed receipt.
     except Exception:  # noqa: BLE001
         logger.error("Could not contain a derived episode whose source vanished")
 
@@ -673,7 +672,7 @@ async def ingest_text_document(
                     write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
             if isinstance(exc, ReadReceiptStale) and episode_uuid:
-                await _contain_stale_derivation(graphiti, group_id, episode_uuid, read_receipt)
+                await _contain_stale_derivation(graphiti, episode_uuid)
             if write_started:
                 await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision,
                                                    written_uuids[chunk_uuid_start:], claim_fingerprint=chunk_fp)

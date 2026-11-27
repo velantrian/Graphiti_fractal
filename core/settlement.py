@@ -35,7 +35,7 @@ import hashlib
 import json
 from uuid import uuid4
 
-from core.erasure_guard import LOCK_ERASURE_CONTROL
+from core.erasure_guard import LOCK_ERASURE_CONTROL, ingest_erasure_relation, ingest_crosses_erasure
 from core.late_writes import _rows
 from core.text_utils import fingerprint
 
@@ -182,8 +182,15 @@ async def settle_unsettled_write(graphiti, *, kind: str, key: str, group_id: str
             # A stale edit is not an erasure. Existing event-based rebuild
             # cannot contain its graph until a real owner-authorized erasure
             # provides a durable scope, so retain the claim rather than fake it.
-            events = await _rows(graphiti, "MATCH (t:FractalErasure) WHERE t.revision > $r "
-                                 "RETURN count(t) AS n", r=att["recall_revision"])
+            events = await _rows(graphiti, f"""
+                MATCH (c:FractalIngestClaim {{claim_key:$k}})
+                MATCH (t:FractalErasure) WHERE {ingest_crosses_erasure()}
+                WITH t, {ingest_erasure_relation()} AS relation
+                RETURN count(t) AS n,
+                       count(CASE WHEN relation='UNKNOWN' OR coalesce(t.status,'PENDING_SCOPE')='PENDING_SCOPE'
+                                  THEN 1 END) AS uncertain""", k=key)
+            if events[0]["uncertain"]:
+                return _refuse("recall_containment_uncertain")
             if not events[0]["n"]:
                 return _refuse("recall_containment_requires_erasure")
     else:
@@ -229,23 +236,38 @@ async def settle_unsettled_write(graphiti, *, kind: str, key: str, group_id: str
         return _refuse("changed_during_settlement")
     audit_id = rows[0]["audit_id"]
 
+    marked_events = []
+    receipt_guard = ""
     if outcome == "contained":
         from core.erasure_scope import mark_late_write
         receipt = att.get("recall_receipt_id") is not None
-        marked = await mark_late_write(graphiti, group_id, att["recall_revision"] if receipt else att["rev"],
-                                       uuids, any_group=(kind == "chat" or receipt))
-        if receipt and not marked["events"]:
-            raise RuntimeError("receipt containment has no durable erasure event; claim remains held")
+        marked = await mark_late_write(graphiti, group_id, att["rev"], uuids,
+                                       any_group=(kind == "chat"), ingest_claim_key=key if kind == "ingest" else None)
+        marked_events = marked["events"]
+        if receipt:
+            if not marked_events:
+                return _refuse("recall_containment_requires_erasure")
+            # A new erasure or incomplete scope can appear between marking and
+            # settling. Re-evaluate the exact same relation under the commit lock.
+            # A retry may add marks; it may never lift an unresolved hold.
+            receipt_guard = f"""AND NOT EXISTS {{
+                MATCH (t:FractalErasure) WHERE {ingest_crosses_erasure("x", "t")}
+                AND ({ingest_erasure_relation("x", "t")} <> 'RELATED'
+                     OR coalesce(t.status,'PENDING_SCOPE')='PENDING_SCOPE'
+                     OR NOT t.event_id IN $marked_events)
+            }}"""
     await _checkpoint("after_isolation")
 
     done = await _rows(graphiti, LOCK_ERASURE_CONTROL + f"""
         MATCH {match} WHERE x.settling_audit=$aid AND x.settling_decision=$dh
           AND coalesce(x.late_settled_at, null) IS NULL AND coalesce(x.state,'') <> 'SETTLED'
+          {receipt_guard}
         SET x.late_settled_at=datetime(), x.late_settlement=$outcome, x.settled_by=$by
             {", x.state='SETTLED', x.settled_at=datetime()" if kind == "chat" else ""}
         WITH x MATCH (a:FractalSettlementAudit {{audit_id:$aid}})
         SET a.status='COMMITTED', a.committed_at=datetime()
-        RETURN a.audit_id AS id""", key=key, aid=audit_id, dh=dh, outcome=outcome, by=decided_by.strip())
+        RETURN a.audit_id AS id""", key=key, aid=audit_id, dh=dh, outcome=outcome, by=decided_by.strip(),
+        marked_events=marked_events)
     already = len(done) != 1
     if already:
         now = await _load(graphiti, kind, key)

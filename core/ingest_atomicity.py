@@ -167,7 +167,11 @@ async def mark_ingest_claim_write_attempt(
         SET c.write_attempts = coalesce(c.write_attempts, 0) + 1,
             c.write_attempted_at = coalesce(c.write_attempted_at, datetime()),
             c.recall_receipt_id = $source_receipt_id,
-            c.recall_receipt_revision = $receipt_revision
+            c.recall_receipt_revision = $receipt_revision,
+            c.recall_scope_version = CASE WHEN $source_receipt_id IS NULL THEN null ELSE 1 END,
+            c.recall_source_ids = CASE WHEN $source_receipt_id IS NULL THEN null ELSE [s IN $source_checks | s.uuid] END,
+            c.recall_source_groups = CASE WHEN $source_receipt_id IS NULL THEN null ELSE [s IN $source_checks | s.group_id] END,
+            c.recall_source_types = CASE WHEN $source_receipt_id IS NULL THEN null ELSE [s IN $source_checks | s.type] END
         RETURN c.write_attempts AS attempts
         """,
         claim_key=claim_key(group_id, fingerprint),

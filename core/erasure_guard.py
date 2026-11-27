@@ -218,12 +218,43 @@ def recall_group_hold(group_expr: str, *, source_claim: bool = False) -> str:
             + " AND " + active_recall_claim("fz_rc") + exclude + " }")
 
 
+def ingest_erasure_relation(claim: str = "c", tomb: str = "t") -> str:
+    """Cypher: RELATED, UNRELATED or UNKNOWN, from durable selected sources and event scope.
+
+    Same-group extraction retains its existing revision fence. For a receipt from another
+    group, a newer revision alone is not evidence of dependence. The event's pre-purge
+    footprint includes transitive episode -> entity -> episode lineage. Pending scope or
+    legacy/incomplete metadata cannot prove independence. Never use mutable blocked_groups
+    as evidence: recovery itself writes that property.
+    """
+    c, t = claim, tomb
+    return f"""(CASE
+        WHEN {t}.revision IS NULL THEN
+            CASE WHEN {c}.recall_receipt_id IS NULL THEN 'UNRELATED' ELSE 'UNKNOWN' END
+        WHEN {c}.group_id = {t}.group_id AND
+             coalesce({c}.erasure_revision,0) < {t}.revision THEN 'RELATED'
+        WHEN {c}.recall_receipt_id IS NULL THEN 'UNRELATED'
+        WHEN {c}.recall_receipt_revision IS NOT NULL AND
+             {t}.revision <= {c}.recall_receipt_revision THEN 'UNRELATED'
+        WHEN any(id IN coalesce({c}.recall_source_ids,[]) WHERE
+                 id = {t}.target_uuid OR id IN coalesce({t}.seed_entities,[])
+                 OR id IN coalesce({t}.seed_edges,[])
+                 OR id IN coalesce({t}.scope_affected_ids,[])) THEN 'RELATED'
+        WHEN {t}.revision > coalesce({c}.erasure_revision,0) AND
+             {c}.group_id IN coalesce({t}.scope_affected_groups,[]) THEN 'RELATED'
+        WHEN coalesce({c}.recall_scope_version,0) <> 1
+             OR {c}.recall_receipt_revision IS NULL
+             OR size(coalesce({c}.recall_source_ids,[])) = 0
+             OR {t}.status IS NULL OR {t}.status = 'PENDING_SCOPE'
+             OR coalesce({t}.scope_relation_version,0) <> 1
+             OR {t}.scope_affected_ids IS NULL OR {t}.scope_affected_groups IS NULL
+             THEN 'UNKNOWN'
+        ELSE 'UNRELATED' END)"""
+
+
 def ingest_crosses_erasure(claim: str = "c", tomb: str = "t") -> str:
-    """Receipt-derived writes may depend on sources in another group."""
-    return (f"(({claim}.group_id = {tomb}.group_id AND "
-            f"coalesce({claim}.erasure_revision,0) < {tomb}.revision) OR "
-            f"({claim}.recall_receipt_id IS NOT NULL AND "
-            f"coalesce({claim}.recall_receipt_revision,{claim}.erasure_revision,0) < {tomb}.revision))")
+    """Unknown relation keeps the hold; only proven relation permits exposure marks."""
+    return f"({ingest_erasure_relation(claim, tomb)} <> 'UNRELATED')"
 
 # Read side of the same fact (variable names unique: callers bind s/t/r/n/m/e/c/a). While such an attempt
 # exists in a node's group, the group's DERIVED objects (entities, edges, communities, non-original episodes)
@@ -232,8 +263,9 @@ def ingest_crosses_erasure(claim: str = "c", tomb: str = "t") -> str:
 _UNSETTLED_GROUP = ("EXISTS { MATCH (fz_c:FractalIngestClaim|FractalChatWriteAttempt {group_id:@N.group_id}) "
                     "WHERE fz_c.state IN ['OPEN','PENDING','RECONCILIATION_REQUIRED'] AND fz_c.late_settled_at IS NULL "
                     "AND (fz_c:FractalChatWriteAttempt OR fz_c.write_attempted_at IS NOT NULL) "
-                    "AND EXISTS { MATCH (fz_u:FractalErasure) WHERE fz_u.revision > coalesce(fz_c.erasure_revision,0) "
-                    "AND (fz_c:FractalChatWriteAttempt OR fz_u.group_id = fz_c.group_id) } }")
+                    "AND EXISTS { MATCH (fz_u:FractalErasure) WHERE "
+                    "((fz_c:FractalChatWriteAttempt AND fz_u.revision > coalesce(fz_c.erasure_revision,0)) OR "
+                    "(fz_c:FractalIngestClaim AND " + ingest_crosses_erasure("fz_c", "fz_u") + ")) } }")
 
 
 async def require_group_writable(graphiti, group_id: str) -> None:
@@ -246,7 +278,7 @@ async def require_group_writable(graphiti, group_id: str) -> None:
         "OPTIONAL MATCH (t:FractalErasure) WHERE " + OPEN_TOMBSTONE
         + " AND $g IN coalesce(t.blocked_groups, [t.group_id]) WITH count(t) AS n RETURN n, "
         + "EXISTS { MATCH (c:FractalIngestClaim {group_id:$g}) WHERE " + UNSETTLED_INGEST
-        + " AND EXISTS { MATCH (u:FractalErasure {group_id:$g}) WHERE u.revision > coalesce(c.erasure_revision,0) } }"
+        + " AND EXISTS { MATCH (u:FractalErasure) WHERE " + ingest_crosses_erasure("c", "u") + " } }"
         + " AS ingest_unsettled, "
         + "EXISTS { MATCH (a:FractalChatWriteAttempt {group_id:$g}) WHERE " + UNSETTLED_CHAT
         + " AND EXISTS { MATCH (u:FractalErasure) WHERE u.revision > coalesce(a.erasure_revision,0) } }"

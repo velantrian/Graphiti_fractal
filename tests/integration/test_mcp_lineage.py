@@ -368,3 +368,144 @@ async def test_expired_receipt_during_write_cannot_finalize(env):
     assert result["unconfirmed_writes"] == 1
     assert any("ReadReceiptStale" in warning for warning in result["warnings"])
     assert gone(await observe(env), RET)
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", ["episode", "cross_group_entity"])
+@pytest.mark.parametrize("hard", [False, True], ids=["soft", "hard"])
+async def test_unknown_receipt_write_holds_only_related_erasure_after_recovery(env, monkeypatch, neo4j_isolation,
+                                                                               source_kind, hard):
+    """Codex follow-up: two erasures, one lost reply, fresh connection, explicit settlement."""
+    from graphiti_core import Graphiti
+    from core.erasure_guard import GroupWriteRestricted, require_group_writable
+    from core.erasure_scope import rebuild_area, scope_pending_erasures
+    from core.late_writes import list_unsettled_writes
+    from core.settlement import settle_unsettled_write
+    from mcp_server import server
+    from tests.support.recording_model import HashEmbedder, ZeroRanker
+
+    src = await seed_source(env)
+    await env.add("[[Weather Station]] reports MORNINGSKY near [[Hill Observatory]].", "experience")
+    other = await env.uuid_of("MORNINGSKY")
+    receipt = await read_source(env, src)
+    selected, body = src, D_TEXT
+    if source_kind == "cross_group_entity":
+        assert (await retell(env, receipt, [src], group="personal"))["completeness"] == "complete"
+        receipt = await mcp("memory.search_knowledge", query="Mira Venn vault secret phrase", group_id="personal")
+        selected = next(row["uuid"] for row in receipt["items"] if row["kind"] == "Entity" and RET in row["text"])
+        body = f"[[Quill Raven]] repeats the vault secret phrase {RET} for [[Glass Door]]."
+    add_episode = env.graphiti.add_episode
+
+    async def lose_reply(*args, **kwargs):
+        await add_episode(*args, **kwargs)
+        raise RuntimeError("Simulated lost Graphiti reply after commit")
+
+    monkeypatch.setattr(env.graphiti, "add_episode", lose_reply)
+    gate = env.llm.hold_next("extract_nodes.extract_message")
+    task = asyncio.create_task(retell(env, receipt, [selected], text=body))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 30)
+        claim = (await env.q("MATCH (c:FractalIngestClaim {group_id:$g,state:'PENDING'}) "
+                             "WHERE c.recall_receipt_id IS NOT NULL "
+                             "RETURN c.recall_source_ids AS ids, c.recall_scope_version AS version", g=P))[0]
+        assert claim == {"ids": [selected], "version": 1}
+        unrelated = await erase(env, other, hard=hard)
+        related = await erase(env, src, hard=hard)
+        await scope_pending_erasures(env.graphiti)
+        assert (await rebuild_area(env.graphiti, unrelated["event_id"]))["held_for_recall_claim"] == 0
+        attempt = next(a for a in await list_unsettled_writes(env.graphiti) if a["group_id"] == P)
+        assert set(attempt["events"]) == {related["event_id"]}
+        assert (await rebuild_area(env.graphiti, related["event_id"]))["held_for_recall_claim"] == 1
+    finally:
+        gate.release.set()
+        result = await task
+        monkeypatch.setattr(env.graphiti, "add_episode", add_episode)
+    assert result["unconfirmed_writes"] == 1
+    stored = await env.q("MATCH (e:Episodic {group_id:$g,content:$body}) RETURN e.uuid AS u", g=P, body=body)
+    assert len(stored) == 1
+
+    settings = neo4j_isolation
+    fresh = Graphiti(settings.uri, settings.user, settings.password, llm_client=env.llm,
+                     embedder=HashEmbedder(), cross_encoder=ZeroRanker())
+    with monkeypatch.context() as patch:
+        patch.setattr(env, "graphiti", fresh)
+        patch.setattr(server, "_graphiti", fresh)
+        try:
+            async def statuses():
+                rows = await env.q("MATCH (t:FractalErasure) RETURN t.event_id AS id,t.status AS status")
+                return {row["id"]: row["status"] for row in rows}
+
+            await scope_pending_erasures(fresh)
+            await rebuild_area(fresh)
+            before = await statuses()
+            assert before[related["event_id"]] == "SCOPED"
+            assert before[unrelated["event_id"]] == "RESOLVED"
+            with pytest.raises(GroupWriteRestricted):
+                await require_group_writable(fresh, P)
+            attempt = next(a for a in await list_unsettled_writes(fresh) if a["group_id"] == P)
+            assert attempt["episode_uuid"] is None and set(attempt["events"]) == {related["event_id"]}
+            after = await observe(env)
+            assert gone(after, SRC) and gone(after, RET)
+            assert CONTROL in after["episodes"] and CONTROL in after["model_input"]
+
+            decision = await settle_unsettled_write(
+                fresh, kind="ingest", key=attempt["key"], group_id=P, outcome="contained",
+                decided_by="owner", episode_uuids=[stored[0]["u"]],
+            )
+            assert decision["settled"], decision
+            assert not any(a["key"] == attempt["key"] for a in await list_unsettled_writes(fresh))
+            assert (await statuses())[unrelated["event_id"]] == "RESOLVED"
+            wrong_marks = await env.q(
+                "MATCH (n) WHERE any(m IN coalesce(n.erasure_quarantine,[]) WHERE m STARTS WITH $prefix) "
+                "RETURN count(n) AS n", prefix=unrelated["event_id"] + ":")
+            wrong_edges = await env.q(
+                "MATCH ()-[r:RELATES_TO]->() WHERE any(m IN coalesce(r.erasure_quarantine,[]) "
+                "WHERE m STARTS WITH $prefix) RETURN count(r) AS n", prefix=unrelated["event_id"] + ":")
+            assert wrong_marks == [{"n": 0}] and wrong_edges == [{"n": 0}]
+            after = await observe(env)
+            assert gone(after, SRC) and gone(after, RET)
+            assert CONTROL in after["episodes"] and CONTROL in after["model_input"]
+        finally:
+            await fresh.close()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_event_cannot_settle_stale_receipt_and_missing_scope_fails_closed(env, monkeypatch):
+    from core.erasure_scope import rebuild_area, scope_pending_erasures
+    from core.late_writes import list_unsettled_writes
+    from core.settlement import settle_unsettled_write
+
+    src = await seed_source(env)
+    await env.add("[[Weather Station]] reports MORNINGSKY near [[Hill Observatory]].", "experience")
+    other = await env.uuid_of("MORNINGSKY")
+    receipt = await read_source(env, src)
+    gate = env.llm.hold_next("extract_nodes.extract_message")
+    task = asyncio.create_task(retell(env, receipt, [src]))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 30)
+        await env.q("MATCH (e:Episodic {uuid:$u}) SET e.content='Changed source'", u=src)
+        unrelated = await erase(env, other, hard=False)
+    finally:
+        gate.release.set()
+        result = await task
+    assert result["unconfirmed_writes"] == 1
+    await scope_pending_erasures(env.graphiti)
+    assert (await rebuild_area(env.graphiti, unrelated["event_id"]))["held_for_recall_claim"] == 0
+    attempt = next(a for a in await list_unsettled_writes(env.graphiti) if a["group_id"] == P)
+    assert attempt["episode_uuid"] and attempt["events"] == []
+    args = dict(kind="ingest", key=attempt["key"], group_id=P, outcome="contained",
+                decided_by="owner", episode_uuids=[attempt["episode_uuid"]])
+    refused = await settle_unsettled_write(env.graphiti, **args)
+    assert refused["refused"] == "recall_containment_requires_erasure"
+
+    # Simulate a legacy/incomplete footprint: no proof of independence is
+    # available. Recovery holds the event but settlement must not invent marks.
+    await env.q("MATCH (t:FractalErasure {event_id:$e}) REMOVE t.scope_relation_version", e=unrelated["event_id"])
+    await scope_pending_erasures(env.graphiti)
+    attempt = next(a for a in await list_unsettled_writes(env.graphiti) if a["group_id"] == P)
+    assert set(attempt["events"]) == {unrelated["event_id"]}
+    assert (await rebuild_area(env.graphiti, unrelated["event_id"]))["held_for_recall_claim"] == 1
+    refused = await settle_unsettled_write(env.graphiti, **args)
+    assert refused["refused"] == "recall_containment_uncertain"
+    assert gone(await observe(env), RET)

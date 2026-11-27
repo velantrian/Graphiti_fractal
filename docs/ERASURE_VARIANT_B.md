@@ -223,3 +223,24 @@ soft-erase a provably linked rejected output before using event-based settlement
 This is intentionally conservative: a dedicated no-erasure clean-rebuild protocol is not
 implemented by this change. Event-based rebuild skips affected events while receipt claims
 remain unsettled, since temporary invisibility is not proof of absent independent sources.
+
+
+### Scoped receipt-attempt / erasure relation (PR #64 follow-up)
+
+Before Graphiti is called, the attempt marker stores only the UUIDs, kinds and groups
+of the **selected, verified** receipt sources (not every item returned by the search).
+Phase 2 of an erasure records its affected identity footprint before purging graph
+objects. It includes the seed, affected entities/edges/communities, and the transitive
+dependent episodes and their extracted objects across groups. The completed episodic
+scope publishes a version; the footprint is retained when the event resolves.
+
+`ingest_erasure_relation` is the shared rule: RELATED (same-destination-group fence
+or intersecting source/affected identity or destination exposure), UNRELATED (newer
+but complete, disjoint scope), UNKNOWN (pending/legacy/incomplete evidence).
+An unsettled receipt always holds its destination graph. RELATED and UNKNOWN hold
+the relevant event open; only RELATED is allowed to receive late-write exposure
+marks. The existing mutable blocked_groups field is not evidence of a relationship.
+Manual containment refuses unknown relationships or missing related events and
+rechecks the marked event set under the final settlement lock. Old claims/events
+without scope evidence remain conservative; no migration is assumed. The completed
+scope version is limited to episodic erasures under the existing variant B policy.

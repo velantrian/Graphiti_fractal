@@ -100,10 +100,10 @@ async def contain_known_unsettled_writes(graphiti) -> dict:
     claims = await _rows(graphiti, f"""
         MATCH (c:FractalIngestClaim) WHERE {UNSETTLED_INGEST} AND c.episode_uuid IS NOT NULL
           AND c.recall_receipt_id IS NULL
-          AND EXISTS {{ MATCH (t:FractalErasure {{group_id:c.group_id}}) WHERE t.revision > coalesce(c.erasure_revision,0) }}
+          AND EXISTS {{ MATCH (t:FractalErasure) WHERE {ingest_crosses_erasure()} }}
         RETURN c.claim_key AS k, c.group_id AS g, coalesce(c.erasure_revision,0) AS r, c.episode_uuid AS u""")
     for c in claims:
-        await mark_late_write(graphiti, c["g"], c["r"], [c["u"]])
+        await mark_late_write(graphiti, c["g"], c["r"], [c["u"]], ingest_claim_key=c["k"])
         await graphiti.driver.execute_query(
             "MATCH (c:FractalIngestClaim {claim_key:$k}) SET c.late_settled_at=datetime(), c.late_settlement='contained'",
             k=c["k"])

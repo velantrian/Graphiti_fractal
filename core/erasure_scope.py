@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from core.erasure_guard import (
     LOCK_ERASURE_CONTROL, OPEN_STATUSES, UNSETTLED_CHAT, UNSETTLED_INGEST, ErasureFenceChanged, blocked_node,
-    read_erasure_state, token_hashes, active_recall_claim, ingest_crosses_erasure,
+    read_erasure_state, token_hashes, active_recall_claim, ingest_crosses_erasure, ingest_erasure_relation,
 )
 
 WINDOW = 10
@@ -146,9 +146,12 @@ async def compute_area(graphiti, seed: Seed) -> Area:
             hard = any(area.entities[m] in ("pure", "mixed") for m in r["members"])
             area.communities[r["uuid"]] = "mixed" if hard else "exposed"
 
+    # A receipt may refer to a derived object's UUID even when the object
+    # has already been purged. The seed retains that identity. Exposed
+    # graph objects also carry suspect text and can be receipt sources.
     await extend_lineage(graphiti, area, seed,
-                         {t} | {u for u, c in {**area.entities, **area.edges, **area.communities}.items()
-                                if c in ("pure", "mixed")})
+                         {t} | set(seed.entities) | set(seed.edges)
+                         | set(area.entities) | set(area.edges) | set(area.communities))
     # A receipt may name an Entity extracted from a dependent episode rather
     # than the episode itself. Alternate the two traversals until no additional
     # episode is discovered; every iteration uses the full dependent set.
@@ -266,6 +269,21 @@ async def scope_erasure(graphiti, event_id: str) -> dict:
     seed = _seed(tomb)
     area = await compute_area(graphiti, seed) if tomb.get("target_label") == "Episodic" else Area()
 
+    # Persist the actual affected identities BEFORE any destructive operations.
+    # This is not blocked_groups (which may contain temporary recovery holds).
+    # Retrying after a partial purge retains the earlier footprint.
+    affected_ids = sorted({seed.target_uuid} | set(seed.entities) | set(seed.edges)
+                          | set(area.entities) | set(area.edges) | set(area.communities) | set(area.derived))
+    affected_groups = sorted(g for g in {seed.group_id, *area.groups.values(), *area.derived.values()} if g)
+    recorded = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
+        MATCH (t:FractalErasure {event_id:$e})
+        WHERE t.status='PENDING_SCOPE' AND t.scope_lease=$tok
+        SET t.scope_affected_ids = [id IN coalesce(t.scope_affected_ids,[]) WHERE NOT id IN $ids] + $ids,
+            t.scope_affected_groups = [g IN coalesce(t.scope_affected_groups,[]) WHERE NOT g IN $groups] + $groups
+        RETURN t.event_id AS event""", e=event_id, tok=token, ids=affected_ids, groups=affected_groups)
+    if len(recorded) != 1:
+        raise ErasureFenceChanged("erasure scope lease changed before recording affected identities")
+
     pure_edges = [u for u, c in area.edges.items() if c == "pure"]
     pure_entities = [u for u, c in area.entities.items() if c == "pure"]
     if pure_edges:
@@ -286,6 +304,7 @@ async def scope_erasure(graphiti, event_id: str) -> dict:
     await graphiti.driver.execute_query(
         "MATCH (t:FractalErasure {event_id:$e}) WHERE t.scope_lease=$tok "
         "SET t.status='SCOPED', t.scoped_at=datetime(), t.scope_lease=null, "
+        "t.scope_relation_version=CASE WHEN t.target_label='Episodic' THEN 1 ELSE null END, "
         "t.blocked_groups=$blocked, t.area_counts_json=$counts",
         e=event_id, blocked=blocked, counts=_json(counts), tok=token)
     return {"status": "SCOPED", "event_id": event_id, "counts": counts, "blocked_groups": blocked,
@@ -416,7 +435,7 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
         holds = await _rows(graphiti, f"""
             MATCH (t:FractalErasure {{event_id:$e}})
             MATCH (c:FractalIngestClaim) WHERE {active_recall_claim()}
-              AND (c.group_id IN coalesce(t.blocked_groups,[t.group_id]) OR {ingest_crosses_erasure()})
+              AND {ingest_crosses_erasure()}
             RETURN count(c) AS n""", e=ev)
         if holds[0]["n"]:
             summary["held_for_recall_claim"] += 1
@@ -582,23 +601,29 @@ async def _commit(graphiti, rev: int, prefix: str, label: str, items: list[dict]
 
 
 async def mark_late_write(graphiti, group_id: str | None, since_revision: int, episode_uuids: list[str],
-                          *, any_group: bool = False) -> dict:
+                          *, any_group: bool = False, ingest_claim_key: str | None = None) -> dict:
     """Contain objects of a write that was already in flight when an erasure happened.
 
     add_episode reads its context, calls the model and writes its derived objects in one long
     call; an erasure that lands meanwhile cannot have scoped objects that did not exist yet.
-    Every entity/edge derived from the given episodes is marked as exposed to each erasure newer
-    than ``since_revision`` (of this group, or of any group with ``any_group`` - the chat path is
-    fenced globally), the episodes themselves are isolated until reconciliation, and each of those
-    events is reopened (a RESOLVED one included) and its group paused.
+    Every entity/edge derived from the given episodes is marked as exposed to the relevant
+    erasures. For a durable ingest claim the same relation predicate as recovery and diagnostics
+    selects only RELATED events (UNKNOWN retains the claim's hold without making speculative
+    marks). Other callers retain the same-group fence or global chat fence. The episodes are
+    isolated until reconciliation, and marked events are reopened (including RESOLVED).
 
     ONE statement under the erasure control lock: registration is serialized against
     _close_event(), so the event is never closed on a count that predates this write.
     """
     if not episode_uuids:
         return {"marked": 0, "events": []}
-    rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
-        MATCH (t:FractalErasure) WHERE t.revision > $r AND ($any OR t.group_id = $g)
+    event_match = (
+        "MATCH (c:FractalIngestClaim {claim_key:$ingest_claim_key}) WHERE c.group_id=$g "
+        "MATCH (t:FractalErasure) WHERE " + ingest_erasure_relation() + " = 'RELATED' "
+        if ingest_claim_key is not None else
+        "MATCH (t:FractalErasure) WHERE t.revision > $r AND ($any OR t.group_id = $g) "
+    )
+    rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + event_match + """
         WITH gate, collect(t) AS tombs WHERE size(tombs) > 0
         OPTIONAL MATCH (e:Episodic) WHERE e.uuid IN $u
         WITH gate, tombs, collect(DISTINCT e) AS eps
@@ -626,7 +651,7 @@ async def mark_late_write(graphiti, group_id: str | None, since_revision: int, e
               t.resolved_at = null,
               t.late_writes = coalesce(t.late_writes,0) + 1)
         RETURN size(ents) + size(rels) + size(communities) AS marked, [t IN tombs | t.event_id] AS events""",
-        r=since_revision, g=group_id, any=any_group, u=episode_uuids)
+        r=since_revision, g=group_id, any=any_group, u=episode_uuids, ingest_claim_key=ingest_claim_key)
     if not rows:
         return {"marked": 0, "events": []}
     return {"marked": rows[0]["marked"], "events": rows[0]["events"]}
