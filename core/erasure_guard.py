@@ -77,7 +77,7 @@ _PENDING_ANY = "EXISTS { MATCH (fz_t:FractalErasure) WHERE " + _UNSCOPED + " }"
 _ANY_TOMBSTONE = "EXISTS { MATCH (:FractalErasure) }"
 
 
-def blocked_node(alias: str) -> str:
+def blocked_node(alias: str, *, source_claim: bool = False) -> str:
     """True when readers must not return this node.
 
     Object level: the object is deleted, tombstoned, individually quarantined, or carries a
@@ -94,6 +94,8 @@ def blocked_node(alias: str) -> str:
         OR (@N:Episodic AND NOT """ + _ORIGINAL + """ AND """ + _PENDING_GROUP + """)
         OR (NOT @N:Episodic AND """ + _UNSETTLED_GROUP + """)
         OR (@N:Episodic AND NOT """ + _ORIGINAL + """ AND """ + _UNSETTLED_GROUP + """)
+        OR ((NOT @N:Episodic OR NOT """ + _ORIGINAL + """) AND """
+              + recall_group_hold("@N.group_id", source_claim=source_claim) + """)
         OR (""" + _DERIVED_KIND + """ AND """ + _PENDING_ANY + """)
         OR (""" + _UNKNOWN_LINEAGE + """ AND """ + _ANY_TOMBSTONE + """)
     )""", alias)
@@ -104,8 +106,8 @@ def unknown_lineage(alias: str) -> str:
     return _sub(_UNKNOWN_LINEAGE, alias)
 
 
-def visible_node(alias: str) -> str:
-    return "NOT " + blocked_node(alias)
+def visible_node(alias: str, *, source_claim: bool = False) -> str:
+    return "NOT " + blocked_node(alias, source_claim=source_claim)
 
 
 def visible_edge(rel: str, start: str, end: str) -> str:
@@ -113,7 +115,8 @@ def visible_edge(rel: str, start: str, end: str) -> str:
         AND size(coalesce(@N.erasure_quarantine,[])) = 0
         AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:@N.uuid}) }
         AND NOT """ + _PENDING_GROUP + ")", rel)
-    return own + " AND " + visible_node(start) + " AND " + visible_node(end)
+    return (own + " AND NOT " + recall_group_hold(f"{rel}.group_id")
+            + " AND " + visible_node(start) + " AND " + visible_node(end))
 
 
 # --- state ----------------------------------------------------------------------------
@@ -199,6 +202,29 @@ _UNSETTLED_INGEST_T = """{c}.state IN ['PENDING','RECONCILIATION_REQUIRED'] AND 
         AND {c}.late_settled_at IS NULL"""
 UNSETTLED_INGEST = _UNSETTLED_INGEST_T.format(c="c")
 UNSETTLED_CHAT = "a.state = 'OPEN'"
+
+
+def active_recall_claim(alias: str = "c") -> str:
+    """A receipt-bearing attempt that may have reached Graphiti but is not confirmed or settled."""
+    return _UNSETTLED_INGEST_T.format(c=alias) + f" AND {alias}.recall_receipt_id IS NOT NULL"
+
+
+def recall_group_hold(group_expr: str, *, source_claim: bool = False) -> str:
+    # Only the writer's atomic source validation may exclude its own claim.
+    # All public readers and all other writers see the durable hold.
+    exclude = (" AND ($source_claim_token IS NULL OR fz_rc.token <> $source_claim_token)"
+               if source_claim else "")
+    return ("EXISTS { MATCH (fz_rc:FractalIngestClaim) WHERE fz_rc.group_id = " + group_expr
+            + " AND " + active_recall_claim("fz_rc") + exclude + " }")
+
+
+def ingest_crosses_erasure(claim: str = "c", tomb: str = "t") -> str:
+    """Receipt-derived writes may depend on sources in another group."""
+    return (f"(({claim}.group_id = {tomb}.group_id AND "
+            f"coalesce({claim}.erasure_revision,0) < {tomb}.revision) OR "
+            f"({claim}.recall_receipt_id IS NOT NULL AND "
+            f"coalesce({claim}.recall_receipt_revision,{claim}.erasure_revision,0) < {tomb}.revision))")
+
 # Read side of the same fact (variable names unique: callers bind s/t/r/n/m/e/c/a). While such an attempt
 # exists in a node's group, the group's DERIVED objects (entities, edges, communities, non-original episodes)
 # are held from every reader: the unknown write may have stored text of an erased object in any of them,
@@ -224,12 +250,15 @@ async def require_group_writable(graphiti, group_id: str) -> None:
         + " AS ingest_unsettled, "
         + "EXISTS { MATCH (a:FractalChatWriteAttempt {group_id:$g}) WHERE " + UNSETTLED_CHAT
         + " AND EXISTS { MATCH (u:FractalErasure) WHERE u.revision > coalesce(a.erasure_revision,0) } }"
-        + " AS chat_unsettled",
+        + " AS chat_unsettled, " + recall_group_hold("$g") + " AS recall_unsettled",
         g=group_id,
     )
     if len(result.records) != 1:
         raise RuntimeError("write restriction state unavailable")
     row = result.records[0]
+    if row["recall_unsettled"]:
+        raise GroupWriteRestricted(
+            f"group {group_id!r}: a receipt-derived write is not yet confirmed or reconciled")
     if row["ingest_unsettled"] or row["chat_unsettled"]:
         raise GroupWriteRestricted(
             f"group {group_id!r}: a write whose outcome is unknown crossed an erasure; it must be settled "
@@ -246,7 +275,10 @@ async def live_previous_episode_uuids(graphiti, group_id: str, reference_time, l
     default) when the group has no tombstone, so unaffected groups behave exactly as before.
     """
     has = await graphiti.driver.execute_query(
-        "OPTIONAL MATCH (t:FractalErasure {group_id:$g}) RETURN count(t) AS n", g=group_id)
+        "OPTIONAL MATCH (t:FractalErasure {group_id:$g}) WITH count(t) AS n "
+        "RETURN n + CASE WHEN EXISTS { MATCH (e:Episodic {group_id:$g}) "
+        "WHERE coalesce(e.deleted,false) OR coalesce(e.erasure_quarantined,false) "
+        "OR size(coalesce(e.erasure_quarantine,[])) > 0 } THEN 1 ELSE 0 END AS n", g=group_id)
     if int(has.records[0]["n"]) == 0:
         return None
     rows = await graphiti.driver.execute_query(

@@ -66,6 +66,8 @@ _ATTEMPT = {
                toString(x.write_attempted_at) AS since, x.write_attempted_at IS NOT NULL AS attempted,
                x.late_settled_at IS NOT NULL AS settled, x.settling_audit AS audit, x.settling_decision AS dh,
                coalesce(x.erasure_revision,0) AS rev,
+               x.recall_receipt_id AS recall_receipt_id,
+               coalesce(x.recall_receipt_revision,x.erasure_revision,0) AS recall_revision,
                x.write_attempted_at < datetime() - duration({seconds:$age}) AS old_enough""",
     "chat": """MATCH (x:FractalChatWriteAttempt {attempt_id:$k})
         RETURN x.group_id AS group_id, x.state AS state, x.body_sha256 AS proof_key, x.episode_uuid AS recorded,
@@ -176,6 +178,14 @@ async def settle_unsettled_write(graphiti, *, kind: str, key: str, group_id: str
         if refusal:
             return refusal
         contents, proof = found["contents"], found["proof"]
+        if att.get("recall_receipt_id") is not None:
+            # A stale edit is not an erasure. Existing event-based rebuild
+            # cannot contain its graph until a real owner-authorized erasure
+            # provides a durable scope, so retain the claim rather than fake it.
+            events = await _rows(graphiti, "MATCH (t:FractalErasure) WHERE t.revision > $r "
+                                 "RETURN count(t) AS n", r=att["recall_revision"])
+            if not events[0]["n"]:
+                return _refuse("recall_containment_requires_erasure")
     else:
         if uuids:
             return _refuse("bad_uuid_list")
@@ -221,7 +231,11 @@ async def settle_unsettled_write(graphiti, *, kind: str, key: str, group_id: str
 
     if outcome == "contained":
         from core.erasure_scope import mark_late_write
-        await mark_late_write(graphiti, group_id, att["rev"], uuids, any_group=(kind == "chat"))
+        receipt = att.get("recall_receipt_id") is not None
+        marked = await mark_late_write(graphiti, group_id, att["recall_revision"] if receipt else att["rev"],
+                                       uuids, any_group=(kind == "chat" or receipt))
+        if receipt and not marked["events"]:
+            raise RuntimeError("receipt containment has no durable erasure event; claim remains held")
     await _checkpoint("after_isolation")
 
     done = await _rows(graphiti, LOCK_ERASURE_CONTROL + f"""

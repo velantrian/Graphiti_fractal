@@ -200,3 +200,26 @@ lineage is dependent too.
   `scripts/erasure_dry_run.py [--details]` lists, read-only and without content: flagged objects, derived-kind
   episodes without lineage, objects lineage cannot reach (`LINEAGE_GAP`: not restricted by this model, and their
   **content is unknown**: the report never reads it and an erasure cannot find them), tombstones without a seed.
+
+
+### Receipt-derived write: admission while the upstream outcome is unknown
+
+A receipt-bearing ingest claim records its receipt identity and revision at the durable
+write-attempt boundary, before Graphiti is called. While that attempt is pending or requires
+reconciliation, ordinary readers hold the destination group's derived graph and non-original
+episodes, but not independent original episodes or unrelated groups. New Graphiti ingest/chat
+attempts in that group are refused; receipt attempts also refuse other outstanding write
+attempts in the group. Only the atomic source check for the claim itself ignores that claim's
+temporary hold, and only for validating the declared sources.
+
+A successful atomic finalization checks the receipt row, owner, expiry, exact source type,
+identity and text, then commits the claim and the episode's lineage together. An unconfirmed
+outcome (including an edit with no erasure event) leaves the hold durable across restart.
+No synthetic erasure event is created. Automatic recovery does not settle receipt-bearing
+claims. The existing explicit settlement accepts independent no-write evidence; for contained
+writes it requires a real erasure newer than the receipt and durable exposure marks. With no
+such event, it refuses containment rather than releasing the hold. An owner may explicitly
+soft-erase a provably linked rejected output before using event-based settlement/rebuild.
+This is intentionally conservative: a dedicated no-erasure clean-rebuild protocol is not
+implemented by this change. Event-based rebuild skips affected events while receipt claims
+remain unsettled, since temporary invisibility is not proof of absent independent sources.

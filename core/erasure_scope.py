@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from core.erasure_guard import (
     LOCK_ERASURE_CONTROL, OPEN_STATUSES, UNSETTLED_CHAT, UNSETTLED_INGEST, ErasureFenceChanged, blocked_node,
-    read_erasure_state, token_hashes,
+    read_erasure_state, token_hashes, active_recall_claim, ingest_crosses_erasure,
 )
 
 WINDOW = 10
@@ -378,7 +378,7 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
     summary = {"re_extracted_edges": 0, "purged_unsupported_edges": 0, "purged_unsupported_entities": 0,
                "rebuilt_entities": 0, "held_edges": 0, "held_unmatched_edges": 0, "held_reworded_edges": 0,
                "held_entities": 0, "held_communities": 0, "held_for_missing_extractor": 0,
-               "owner_decision_needed": 0}
+               "owner_decision_needed": 0, "held_for_recall_claim": 0}
     all_open = await _rows(graphiti, f"MATCH (t:FractalErasure) WHERE t.status IN {OPEN_STATUSES} "
                                      "RETURN t.event_id AS e, t.group_id AS g, t.token_hashes AS h, t.status AS s")
     if event_id is not None:
@@ -411,6 +411,16 @@ async def rebuild_area(graphiti, event_id: str | None = None, *, extractor=None)
                                             + blocked_node("e") + " RETURN e.uuid AS u", u=episode_ids)]
 
     for ev in [o["e"] for o in opens]:
+        # A temporary read hold is not evidence that the underlying episodes
+        # are gone. Do not purge or rebuild from that incomplete source set.
+        holds = await _rows(graphiti, f"""
+            MATCH (t:FractalErasure {{event_id:$e}})
+            MATCH (c:FractalIngestClaim) WHERE {active_recall_claim()}
+              AND (c.group_id IN coalesce(t.blocked_groups,[t.group_id]) OR {ingest_crosses_erasure()})
+            RETURN count(c) AS n""", e=ev)
+        if holds[0]["n"]:
+            summary["held_for_recall_claim"] += 1
+            continue
         prefix = ev + ":"
         marked = lambda x: f"any(m IN coalesce({x}.erasure_quarantine,[]) WHERE m STARTS WITH $p)"  # noqa: E731
         edges = await _rows(graphiti, f"""
@@ -524,8 +534,8 @@ async def _close_event(graphiti, event_id: str, prefix: str, owner_decisions: in
         WITH t, collect(DISTINCT n.group_id) AS g1
         OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE {marked.format(x='r')}
         WITH t, g1, collect(DISTINCT r.group_id) AS g2
-        OPTIONAL MATCH (c:FractalIngestClaim) WHERE c.group_id = t.group_id AND {UNSETTLED_INGEST}
-          AND coalesce(c.erasure_revision,0) < t.revision
+        OPTIONAL MATCH (c:FractalIngestClaim) WHERE {UNSETTLED_INGEST}
+          AND {ingest_crosses_erasure()}
         WITH t, g1, g2, collect(DISTINCT c.group_id) AS g3
         OPTIONAL MATCH (a:FractalChatWriteAttempt) WHERE {UNSETTLED_CHAT} AND coalesce(a.erasure_revision,0) < t.revision
         WITH t, g1, g2, g3, collect(DISTINCT a.group_id) AS g4
@@ -595,20 +605,27 @@ async def mark_late_write(graphiti, group_id: str | None, since_revision: int, e
         OPTIONAL MATCH (e2:Episodic)-[:MENTIONS]->(n:Entity) WHERE e2.uuid IN $u
         WITH gate, tombs, eps, collect(DISTINCT n) AS ents
         OPTIONAL MATCH ()-[r:RELATES_TO]->()
-          WHERE r.group_id = coalesce($g, r.group_id) AND any(x IN coalesce(r.episodes,[]) WHERE x IN $u)
+          WHERE r.group_id = coalesce($g, r.group_id)
+            AND (any(x IN coalesce(r.episodes,[]) WHERE x IN $u)
+                 OR any(e IN eps WHERE r.uuid IN coalesce(e.entity_edges,[])))
         WITH gate, tombs, eps, ents, collect(DISTINCT r) AS rels
+        OPTIONAL MATCH (cm:Community)-[:HAS_MEMBER]->(member:Entity)
+          WHERE member IN ents
+        WITH gate, tombs, eps, ents, rels, collect(DISTINCT cm) AS communities
         FOREACH (e IN eps | SET e.erasure_quarantined = true)
         FOREACH (t IN tombs |
           FOREACH (n IN ents | SET n.erasure_quarantine =
             [m IN coalesce(n.erasure_quarantine,[]) WHERE NOT m STARTS WITH t.event_id + ':'] + [t.event_id + ':exposed'])
           FOREACH (r IN rels | SET r.erasure_quarantine =
             [m IN coalesce(r.erasure_quarantine,[]) WHERE NOT m STARTS WITH t.event_id + ':'] + [t.event_id + ':exposed'])
+          FOREACH (cm IN communities | SET cm.erasure_quarantine =
+            [m IN coalesce(cm.erasure_quarantine,[]) WHERE NOT m STARTS WITH t.event_id + ':'] + [t.event_id + ':exposed'])
           SET t.blocked_groups = [x IN coalesce(t.blocked_groups,[]) WHERE x <> coalesce($g, '')]
                                  + CASE WHEN $g IS NULL THEN [] ELSE [$g] END,
               t.status = CASE WHEN t.status = 'PENDING_SCOPE' THEN 'PENDING_SCOPE' ELSE 'SCOPED' END,
               t.resolved_at = null,
               t.late_writes = coalesce(t.late_writes,0) + 1)
-        RETURN size(ents) + size(rels) AS marked, [t IN tombs | t.event_id] AS events""",
+        RETURN size(ents) + size(rels) + size(communities) AS marked, [t IN tombs | t.event_id] AS events""",
         r=since_revision, g=group_id, any=any_group, u=episode_uuids)
     if not rows:
         return {"marked": 0, "events": []}

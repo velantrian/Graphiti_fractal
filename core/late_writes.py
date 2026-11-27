@@ -28,7 +28,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 from core.erasure_guard import (
-    LOCK_ERASURE_CONTROL, UNSETTLED_CHAT, UNSETTLED_INGEST, ErasureFenceChanged, ensure_erasure_constraints,
+    LOCK_ERASURE_CONTROL, UNSETTLED_CHAT, UNSETTLED_INGEST, ErasureFenceChanged,
+    ensure_erasure_constraints, ingest_crosses_erasure, recall_group_hold,
 )
 
 
@@ -48,6 +49,7 @@ async def begin_chat_write_attempt(graphiti, *, group_id: str, expected_revision
     attempt_id = str(uuid4())
     rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
         WHERE coalesce(gate.revision,0) = $rev
+          AND NOT """ + recall_group_hold("$g") + """
         CREATE (a:FractalChatWriteAttempt {attempt_id:$id, group_id:$g, state:'OPEN', persist_id:$p, body_sha256:$sha,
                                            erasure_revision:coalesce(gate.revision,0), started_at:datetime()})
         RETURN a.attempt_id AS id""", rev=expected_revision, id=attempt_id, g=group_id, p=persist_id, sha=body_sha256)
@@ -76,8 +78,8 @@ async def reopen_for_unsettled_writes(graphiti) -> list[str]:
     unconfirmed and again by the recovery sweep after a restart."""
     rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + f"""
         MATCH (t:FractalErasure)
-        OPTIONAL MATCH (c:FractalIngestClaim) WHERE c.group_id = t.group_id AND {UNSETTLED_INGEST}
-          AND coalesce(c.erasure_revision,0) < t.revision
+        OPTIONAL MATCH (c:FractalIngestClaim) WHERE {UNSETTLED_INGEST}
+          AND {ingest_crosses_erasure()}
         WITH t, collect(DISTINCT c.group_id) AS g1
         OPTIONAL MATCH (a:FractalChatWriteAttempt) WHERE {UNSETTLED_CHAT} AND coalesce(a.erasure_revision,0) < t.revision
         WITH t, g1, collect(DISTINCT a.group_id) AS g2
@@ -97,6 +99,7 @@ async def contain_known_unsettled_writes(graphiti) -> dict:
     contained = 0
     claims = await _rows(graphiti, f"""
         MATCH (c:FractalIngestClaim) WHERE {UNSETTLED_INGEST} AND c.episode_uuid IS NOT NULL
+          AND c.recall_receipt_id IS NULL
           AND EXISTS {{ MATCH (t:FractalErasure {{group_id:c.group_id}}) WHERE t.revision > coalesce(c.erasure_revision,0) }}
         RETURN c.claim_key AS k, c.group_id AS g, coalesce(c.erasure_revision,0) AS r, c.episode_uuid AS u""")
     for c in claims:
@@ -122,8 +125,8 @@ async def list_unsettled_writes(graphiti) -> list[dict]:
     """Read-only diagnostics: attempts that block a group, and the erasures that make them matter."""
     ingest = await _rows(graphiti, f"""
         MATCH (c:FractalIngestClaim) WHERE {UNSETTLED_INGEST}
-        OPTIONAL MATCH (t:FractalErasure {{group_id:c.group_id}}) WHERE t.revision > coalesce(c.erasure_revision,0)
-        WITH c, collect(t.event_id) AS events WHERE size(events) > 0
+        OPTIONAL MATCH (t:FractalErasure) WHERE {ingest_crosses_erasure()}
+        WITH c, collect(t.event_id) AS events WHERE size(events) > 0 OR c.recall_receipt_id IS NOT NULL
         RETURN 'ingest' AS kind, c.claim_key AS key, c.group_id AS group_id, c.state AS state,
                c.episode_uuid AS episode_uuid, toString(c.write_attempted_at) AS attempted_at, events""")
     chat = await _rows(graphiti, f"""

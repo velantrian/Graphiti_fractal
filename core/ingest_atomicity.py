@@ -12,7 +12,10 @@ from datetime import datetime, timedelta, timezone
 
 from neo4j.exceptions import ConstraintError
 
-from core.erasure_guard import ErasureFenceChanged, LOCK_ERASURE_CONTROL, ensure_erasure_constraints
+from core.erasure_guard import (
+    ErasureFenceChanged, LOCK_ERASURE_CONTROL, OPEN_TOMBSTONE,
+    UNSETTLED_INGEST, ensure_erasure_constraints, recall_group_hold,
+)
 from core.read_receipts import SOURCES_STILL_HOLD
 
 
@@ -138,6 +141,7 @@ class IngestClaimLost(RuntimeError):
 
 async def mark_ingest_claim_write_attempt(
     graphiti, *, group_id: str, fingerprint: str, token: str,
+    read_receipt=None, user_id: str | None = None,
 ) -> int:
     """Durably record, before add_episode, that this owner is about to call Graphiti.
 
@@ -146,17 +150,32 @@ async def mark_ingest_claim_write_attempt(
     number of attempts recorded (rate-limit retries call Graphiti again).
     """
     result = await graphiti.driver.execute_query(
-        """
+        LOCK_ERASURE_CONTROL + """
         MATCH (c:FractalIngestClaim {claim_key:$claim_key})
         SET c.lock_serial = coalesce(c.lock_serial, 0) + 1
         WITH c
         WHERE c.token = $token AND c.state = 'PENDING'
+          AND NOT """ + recall_group_hold("$group_id", source_claim=True) + """
+          AND NOT EXISTS { MATCH (t:FractalErasure) WHERE """ + OPEN_TOMBSTONE + """
+                            AND $group_id IN coalesce(t.blocked_groups,[t.group_id]) }
+          AND ($source_receipt_id IS NULL OR (
+            NOT EXISTS { MATCH (other:FractalIngestClaim {group_id:$group_id})
+                         WHERE other.token <> $token AND """
+                         + UNSETTLED_INGEST.replace("c.", "other.") + """ }
+            AND NOT EXISTS { MATCH (:FractalChatWriteAttempt {group_id:$group_id, state:'OPEN'}) }))
+          AND (""" + SOURCES_STILL_HOLD + """)
         SET c.write_attempts = coalesce(c.write_attempts, 0) + 1,
-            c.write_attempted_at = coalesce(c.write_attempted_at, datetime())
+            c.write_attempted_at = coalesce(c.write_attempted_at, datetime()),
+            c.recall_receipt_id = $source_receipt_id,
+            c.recall_receipt_revision = $receipt_revision
         RETURN c.write_attempts AS attempts
         """,
         claim_key=claim_key(group_id, fingerprint),
-        token=token,
+        token=token, group_id=group_id,
+        source_checks=read_receipt.checks() if read_receipt else [],
+        source_receipt_id=read_receipt.receipt_id if read_receipt else None,
+        receipt_revision=read_receipt.revision if read_receipt else None,
+        source_receipt_user=user_id, source_claim_token=token,
     )
     if not result.records:
         raise IngestClaimLost("ingest claim is no longer held by this writer; not calling Graphiti")
@@ -355,6 +374,8 @@ async def finalize_episode_identity(
           AND coalesce(e.erasure_quarantined,false)=false
           AND NOT EXISTS { MATCH (:FractalErasure {target_uuid:e.uuid}) }
           AND coalesce(e.deleted,false)=false
+          AND (($recall_receipt_id IS NULL AND c.recall_receipt_id IS NULL)
+               OR c.recall_receipt_id=$recall_receipt_id)
           AND (""" + SOURCES_STILL_HOLD + """)
         SET e.fingerprint=$fingerprint,
             e.group_id=$group_id,
@@ -397,6 +418,8 @@ async def finalize_episode_identity(
         ingest_quality=ingest_quality,
         content_sha256=content_sha256,
         source_checks=read_receipt.checks() if read_receipt else [],
+        source_receipt_id=read_receipt.receipt_id if read_receipt else None,
+        source_receipt_user=user_id, source_claim_token=claim_token,
         recall_source_ids=list(read_receipt.source_ids) if read_receipt else [],
         recall_receipt_id=read_receipt.receipt_id if read_receipt else None,
     )
@@ -406,7 +429,8 @@ async def finalize_episode_identity(
             from core.read_receipts import verify_read_receipt
             try:
                 await verify_read_receipt(graphiti, user_id=user_id, receipt_id=read_receipt.receipt_id,
-                                          source_ids=list(read_receipt.source_ids))
+                                          source_ids=list(read_receipt.source_ids),
+                                          _source_claim_token=claim_token)
             except ReadReceiptRejected as exc:
                 raise ReadReceiptStale(exc.code) from exc
         raise RuntimeError("episode finalization not admitted: missing target, claim, or an erasure in this group happened meanwhile")

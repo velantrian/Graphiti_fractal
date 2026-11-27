@@ -245,3 +245,126 @@ async def test_retelling_of_cross_group_entity_is_transitively_contained(env, ha
     after = await observe(env)
     assert gone(after, SRC) and gone(after, RET)
     assert CONTROL in after["search_all"] and CONTROL in after["mcp_search"] and CONTROL in after["model_input"]
+
+
+
+@pytest.mark.asyncio
+async def test_edit_during_recall_write_holds_graph_without_a_tombstone(env):
+    from core.erasure_guard import GroupWriteRestricted, require_group_writable
+    from core.late_writes import list_unsettled_writes, contain_known_unsettled_writes
+    from core.settlement import settle_unsettled_write
+
+    src = await seed_source(env)
+    receipt = await read_source(env, src)
+    gate = env.llm.hold_next("extract_nodes.extract_message")
+    task = asyncio.create_task(retell(env, receipt, [src]))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 30)
+        await env.q("MATCH (x:Episodic {uuid:$u}) SET x.content=$text",
+                    u=src, text="Mira Venn changed the vault passphrase.")
+    finally:
+        gate.release.set()
+        result = await task
+    assert result["unconfirmed_writes"] == 1
+    assert any("ReadReceiptStale" in warning for warning in result["warnings"])
+    assert await env.q("MATCH (t:FractalErasure) RETURN t.event_id AS event") == []
+    after = await observe(env)
+    assert gone(after, RET)
+    assert CONTROL in after["episodes"] and CONTROL in after["model_input"]
+    attempts = [a for a in await list_unsettled_writes(env.graphiti) if a["group_id"] == P]
+    assert len(attempts) == 1 and attempts[0]["episode_uuid"] and not attempts[0]["events"]
+    await contain_known_unsettled_writes(env.graphiti)
+    with pytest.raises(GroupWriteRestricted):
+        await require_group_writable(env.graphiti, P)
+    refused = await settle_unsettled_write(env.graphiti, kind="ingest", key=attempts[0]["key"],
+                                          group_id=P, outcome="contained", decided_by="owner",
+                                          episode_uuids=[attempts[0]["episode_uuid"]])
+    assert refused["refused"] == "recall_containment_requires_erasure"
+    assert gone(await observe(env), RET)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hard", [False, True], ids=["soft", "hard"])
+async def test_lost_reply_after_cross_group_erasure_remains_held(env, monkeypatch, hard):
+    from core.erasure_guard import GroupWriteRestricted, require_group_writable
+    from core.late_writes import list_unsettled_writes
+
+    src = await seed_source(env)
+    receipt = await read_source(env, src)
+    add_episode = env.graphiti.add_episode
+
+    async def lose_reply_after_write(*args, **kwargs):
+        await add_episode(*args, **kwargs)
+        raise RuntimeError("Simulated lost Graphiti reply after commit")
+
+    monkeypatch.setattr(env.graphiti, "add_episode", lose_reply_after_write)
+    gate = env.llm.hold_next("extract_nodes.extract_message")
+    task = asyncio.create_task(retell(env, receipt, [src]))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 30)
+        await erase(env, src, hard=hard)
+    finally:
+        gate.release.set()
+        result = await task
+        monkeypatch.setattr(env.graphiti, "add_episode", add_episode)
+    assert result["unconfirmed_writes"] == 1
+    attempts = [a for a in await list_unsettled_writes(env.graphiti) if a["group_id"] == P]
+    assert len(attempts) == 1 and attempts[0]["episode_uuid"] is None and attempts[0]["events"]
+    with pytest.raises(GroupWriteRestricted):
+        await require_group_writable(env.graphiti, P)
+    after = await observe(env)
+    assert gone(after, SRC) and gone(after, RET)
+    assert CONTROL in after["episodes"] and CONTROL in after["model_input"]
+
+
+@pytest.mark.asyncio
+async def test_pending_receipt_write_is_hidden_before_upstream_reply(env, monkeypatch):
+    from core.erasure_guard import GroupWriteRestricted, require_group_writable
+
+    src = await seed_source(env)
+    receipt = await read_source(env, src)
+    add_episode = env.graphiti.add_episode
+    written, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_reply_after_write(*args, **kwargs):
+        result = await add_episode(*args, **kwargs)
+        written.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(env.graphiti, "add_episode", hold_reply_after_write)
+    task = asyncio.create_task(retell(env, receipt, [src]))
+    try:
+        await asyncio.wait_for(written.wait(), 30)
+        before = await observe(env, ask=False)
+        assert RET not in before["search_all"] and RET not in before["mcp_search"]
+        assert CONTROL in before["episodes"]
+        with pytest.raises(GroupWriteRestricted):
+            await require_group_writable(env.graphiti, P)
+    finally:
+        release.set()
+        result = await task
+        monkeypatch.setattr(env.graphiti, "add_episode", add_episode)
+    assert result["completeness"] == "complete"
+    await require_group_writable(env.graphiti, P)
+    after = await observe(env)
+    assert RET in after["model_input"] and CONTROL in after["model_input"]
+
+
+@pytest.mark.asyncio
+async def test_expired_receipt_during_write_cannot_finalize(env):
+    src = await seed_source(env)
+    receipt = await read_source(env, src)
+    gate = env.llm.hold_next("extract_nodes.extract_message")
+    task = asyncio.create_task(retell(env, receipt, [src]))
+    try:
+        await asyncio.wait_for(gate.reached.wait(), 30)
+        await env.q("MATCH (r:FractalReadReceipt {receipt_id:$rid}) "
+                    "SET r.expires_at=datetime()-duration('PT1S')",
+                    rid=receipt["read_receipt"]["receipt_id"])
+    finally:
+        gate.release.set()
+        result = await task
+    assert result["unconfirmed_writes"] == 1
+    assert any("ReadReceiptStale" in warning for warning in result["warnings"])
+    assert gone(await observe(env), RET)

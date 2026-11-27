@@ -82,13 +82,14 @@ async def issue_read_receipt(graphiti, *, user_id: str, tool: str, items: list[d
             "sources": [{"type": s["type"], "uuid": s["uuid"], "group_id": s["group_id"]} for s in sources]}
 
 
-async def verify_read_receipt(graphiti, *, user_id: str, receipt_id: str, source_ids: list[str]) -> VerifiedReceipt:
+async def verify_read_receipt(graphiti, *, user_id: str, receipt_id: str, source_ids: list[str],
+                              _source_claim_token: str | None = None) -> VerifiedReceipt:
     if (not isinstance(receipt_id, str) or not receipt_id or not isinstance(source_ids, list) or not source_ids
-            or len(source_ids) > MAX_SOURCES or len(set(source_ids)) != len(source_ids)
-            or any(not isinstance(u, str) or not u for u in source_ids)):
+            or len(source_ids) > MAX_SOURCES or any(not isinstance(u, str) or not u for u in source_ids)
+            or len(set(source_ids)) != len(source_ids)):
         raise ReadReceiptRejected("bad_request", "receipt_id and a non-empty list of distinct source ids are required")
     rows = await _rows(graphiti, "MATCH (r:FractalReadReceipt {receipt_id:$id}) RETURN r.user_id AS u, r.sources AS s, "
-                                 "r.revision AS rev, r.expires_at < datetime() AS expired", id=receipt_id)
+                                 "r.revision AS rev, (r.expires_at IS NULL OR r.expires_at <= datetime()) AS expired", id=receipt_id)
     if len(rows) != 1:
         raise ReadReceiptRejected("unknown_receipt")
     r = rows[0]
@@ -103,7 +104,8 @@ async def verify_read_receipt(graphiti, *, user_id: str, receipt_id: str, source
         if src is None:
             raise ReadReceiptRejected("source_not_in_receipt", uuid)
         nodes = await _rows(graphiti, f"MATCH (n:{src['type']} {{uuid:$u}}) RETURN n.group_id AS g, n.summary AS s, "
-                                      f"n.content AS c, n.name AS name, ({visible_node('n')}) AS visible", u=uuid)
+                                      f"n.content AS c, n.name AS name, ({visible_node('n', source_claim=True)}) AS visible",
+                            u=uuid, source_claim_token=_source_claim_token)
         if len(nodes) != 1 or nodes[0]["g"] != src["group_id"]:
             raise ReadReceiptRejected("source_missing", uuid)
         if not nodes[0]["visible"]:
@@ -117,19 +119,25 @@ async def verify_read_receipt(graphiti, *, user_id: str, receipt_id: str, source
 
 # Cypher fragment used by atomic statements: every source still exists once, is visible and has the verified text.
 SOURCES_STILL_HOLD = """
-    size($source_checks) = 0 OR size([chk IN $source_checks WHERE
+    ($source_receipt_id IS NULL AND size($source_checks) = 0) OR (
+      $source_receipt_id IS NOT NULL AND size($source_checks) > 0
+      AND COUNT { MATCH (:FractalReadReceipt {receipt_id:$source_receipt_id}) } = 1
+      AND EXISTS { MATCH (fz_rr:FractalReadReceipt {receipt_id:$source_receipt_id})
+                   WHERE fz_rr.user_id=$source_receipt_user AND fz_rr.expires_at > datetime() }
+      AND size([chk IN $source_checks WHERE
         COUNT { MATCH (fz_s) WHERE fz_s.uuid = chk.uuid AND fz_s.group_id = chk.group_id
-                  AND (fz_s:Episodic OR fz_s:Entity) AND """ + visible_node("fz_s") + """ AND
+                  AND ((chk.type='Episodic' AND fz_s:Episodic) OR (chk.type='Entity' AND fz_s:Entity))
+                  AND """ + visible_node("fz_s", source_claim=True) + """ AND
                   (CASE WHEN coalesce(fz_s.summary,'') <> '' THEN fz_s.summary
                         WHEN coalesce(fz_s.content,'') <> '' THEN fz_s.content
                         ELSE coalesce(fz_s.name,'') END) = chk.text } = 1
         AND COUNT { MATCH (fz_s2) WHERE fz_s2.uuid = chk.uuid AND (fz_s2:Episodic OR fz_s2:Entity) } = 1
-    ]) = size($source_checks)
+    ]) = size($source_checks))
 """
 
 
 async def merge_lineage_into_existing(graphiti, *, group_id: str, fingerprint: str, content: str,
-                                      receipt: VerifiedReceipt) -> bool:
+                                      receipt: VerifiedReceipt, user_id: str) -> bool:
     """A repeat or deduplicated derived write: the already stored derived episode keeps and extends its links.
 
     Only an existing episode that is itself ``agent_derived`` takes the sources (monotonic union, same exact content,
@@ -137,9 +145,14 @@ async def merge_lineage_into_existing(graphiti, *, group_id: str, fingerprint: s
     and is left untouched."""
     rows = await _rows(graphiti, LOCK_ERASURE_CONTROL + """
         MATCH (e:Episodic {group_id:$g, fingerprint:$fp})
-        WHERE e.origin_class = 'agent_derived' AND e.content = $content AND (""" + SOURCES_STILL_HOLD + """)
+        WHERE e.origin_class = 'agent_derived' AND e.content = $content
+          AND EXISTS { MATCH (e)-[:STORED_FOR]->(:User {user_id:$owner}) }
+          AND """ + visible_node("e") + """ AND (""" + SOURCES_STILL_HOLD + """)
+        WITH collect(e) AS matches WHERE size(matches)=1
+        WITH matches[0] AS e
         SET e.recall_source_ids = [x IN coalesce(e.recall_source_ids,[]) WHERE NOT x IN $ids] + $ids,
             e.recall_derived = true
         RETURN count(e) AS n""", g=group_id, fp=fingerprint, content=content, ids=list(receipt.source_ids),
-        source_checks=receipt.checks())
+        source_checks=receipt.checks(), source_receipt_id=receipt.receipt_id,
+        source_receipt_user=user_id, source_claim_token=None, owner=user_id)
     return bool(rows and rows[0]["n"])

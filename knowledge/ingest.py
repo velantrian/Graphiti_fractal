@@ -386,7 +386,8 @@ async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: 
             result = await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
             if result.get("events") and claim_fingerprint:
                 await graphiti.driver.execute_query(
-                    "MATCH (c:FractalIngestClaim {claim_key:$k}) WHERE c.late_settled_at IS NULL "
+                    "MATCH (c:FractalIngestClaim {claim_key:$k}) "
+                    "WHERE c.late_settled_at IS NULL AND c.recall_receipt_id IS NULL "
                     "SET c.late_settled_at=datetime(), c.late_settlement='contained'",
                     k=claim_key(group_id, claim_fingerprint))
         elif claim_fingerprint:
@@ -395,14 +396,16 @@ async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: 
         logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
 
 
-async def _contain_stale_derivation(graphiti, episode_uuid: str, receipt) -> None:
+async def _contain_stale_derivation(graphiti, group_id: str, episode_uuid: str, receipt) -> None:
     """A source of a derived write vanished between the check and finalization: the episode already exists.
     Isolate it and mark everything derived from it as exposed to every erasure since the read (any group)."""
     try:
         from core.erasure_guard import quarantine_unconfirmed_episode
         from core.erasure_scope import mark_late_write
         await quarantine_unconfirmed_episode(graphiti, episode_uuid)
-        await mark_late_write(graphiti, None, receipt.revision, [episode_uuid], any_group=True)
+        await mark_late_write(graphiti, group_id, receipt.revision, [episode_uuid], any_group=True)
+        # With no newer erasure, the durable recall claim remains the hold.
+        # Never invent a tombstone or automatically settle an unconfirmed receipt.
     except Exception:  # noqa: BLE001
         logger.error("Could not contain a derived episode whose source vanished")
 
@@ -515,8 +518,9 @@ async def ingest_text_document(
                                     origin_class=resolved_origin_class, user_id=user_id,
                                     source_description=source_description):
                 if read_receipt is not None:
-                    await merge_lineage_into_existing(graphiti, group_id=group_id, fingerprint=chunk_fp,
-                                                      content=chunk, receipt=read_receipt)
+                    if not await merge_lineage_into_existing(graphiti, group_id=group_id, fingerprint=chunk_fp,
+                                                              content=chunk, receipt=read_receipt, user_id=user_id):
+                        raise UnconfirmedEpisodeIdentity("receipt lineage was not confirmed")
                 skipped_count += 1
                 skipped_existing += 1
                 if job_id:
@@ -550,7 +554,8 @@ async def ingest_text_document(
                         await verify_read_receipt(graphiti, user_id=user_id, receipt_id=read_receipt.receipt_id,
                                                   source_ids=list(read_receipt.source_ids))
                     await mark_ingest_claim_write_attempt(
-                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token)
+                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                        read_receipt=read_receipt, user_id=user_id)
                     if write_started:
                         # A previous attempt already reached Graphiti and its outcome is
                         # unknown: another add_episode could store the chunk twice.
@@ -668,7 +673,7 @@ async def ingest_text_document(
                     write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
             if isinstance(exc, ReadReceiptStale) and episode_uuid:
-                await _contain_stale_derivation(graphiti, episode_uuid, read_receipt)
+                await _contain_stale_derivation(graphiti, group_id, episode_uuid, read_receipt)
             if write_started:
                 await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision,
                                                    written_uuids[chunk_uuid_start:], claim_fingerprint=chunk_fp)
