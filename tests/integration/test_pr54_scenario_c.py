@@ -82,6 +82,12 @@ async def world(isolated_graph, neo4j_isolation, monkeypatch):
     monkeypatch.setattr("knowledge.ingest.get_embedding", AsyncMock(return_value=None))
     monkeypatch.setenv("FRACTAL_API_TOKEN", "scenario-c-token")
     monkeypatch.setenv("FRACTAL_USER_ID", "owner")
+    # These scenarios are about what happens AFTER recall completed (outage hooks and gates sit behind it). The
+    # 2.5 s production recall budget is exceeded by a cold Neo4j (first queries compile for ~3 s), which would
+    # cancel recall and make the hooks never run (c1 then waits forever). The budget is not what is tested here.
+    monkeypatch.setenv("FRACTAL_RECALL_TIMEOUT_SECONDS", "30")
+    from core.config import get_config
+    get_config.cache_clear()
     await isolated_graph.reset()
     s = neo4j_isolation
     graphiti = Graphiti(s.uri, s.user, s.password, llm_client=RecordingLLM(),

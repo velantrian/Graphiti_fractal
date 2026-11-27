@@ -400,9 +400,9 @@ async def test_live_neo4j_erasure_boundary_blocks_opaque_derivations_and_keeps_o
                    (b:Episodic {uuid:'keep-me',group_id:'knowledge',content:'independent marker',origin_class:'owner'}),
                    (d:Episodic {uuid:'derived',group_id:'knowledge',content:'secret marker in summary',
                                 origin_class:'agent_derived',derived_source_ids:['erase-me']}),
-                   (x:Entity {uuid:'x',group_id:'knowledge',summary:'secret marker'}),
+                   (x:Entity {uuid:'x',group_id:'knowledge',name:'X',summary:'secret marker'}),
                    (y:Entity {uuid:'y',group_id:'knowledge',summary:'other'}),
-                   (c:Community {uuid:'community',group_id:'knowledge',summary:'secret marker'}),
+                   (c:Community {uuid:'community',group_id:'knowledge',name:'C',summary:'secret marker'}),
                    (a)-[:MENTIONS]->(x),
                    (c)-[:HAS_MEMBER]->(x),
                    (x)-[:RELATES_TO {uuid:'edge',group_id:'knowledge',fact:'secret marker'}]->(y)

@@ -135,6 +135,15 @@ changes; `database_revision` is the current global revision and grows with every
 an unknown uuid returns `found=false` and creates nothing. Only the creating request runs the scope phase; scoping
 holds a lease so a retry or the recovery sweep cannot compute the same area twice.
 
+## Text changed between search and admission (D2)
+`admit_search_candidates` (one batched statement) compares the text Graphiti returned - taken BEFORE the 8000-character
+cut applied for display - with the same fields in Neo4j: episode content; entity name and summary; edge fact and name;
+community name and summary. A candidate whose text changed after the search is excluded: its relevance score belongs to
+the old text and must not pass to the new one (it is simply absent from this answer; the next search sees the current
+text). A candidate without `_raw_text` (other callers) is checked for identity and erasure state only; `_raw_text` is
+internal and never part of a result. Cost: `tests/support/measure_d2_admission_cost.py` (admission only, synthetic 1 KB texts,
+median over 25 interleaved runs): +1-5 ms at 10-200 candidates, +16-25 ms at 1000 (a 1 MB statement).
+
 ## Limits
 * Re-derivation costs one extractor call per live source episode of an affected edge.
 * Entity summaries that a model wrote richer than the edge facts lose that richness when rebuilt.

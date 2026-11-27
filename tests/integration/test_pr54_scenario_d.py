@@ -95,8 +95,9 @@ async def test_d1_requirement_knowledge_search_honours_erasure_quarantined(world
 
 # --- D2 ---------------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_d2_returned_text_is_checked_for_identity_not_for_current_version(world):
-    """Search returns text X for an entity; the entity is rewritten before admission."""
+async def test_d2_text_changed_between_search_and_admission_is_not_returned(world):
+    """Search returns text X for an entity; the entity is rewritten before admission: the candidate is
+    excluded (its score belonged to X). Before D2 was fixed this returned X (characterized in PR #54)."""
     real_search = world.graphiti.search_
 
     async def search_then_rewrite(*a, **k):
@@ -106,13 +107,12 @@ async def test_d2_returned_text_is_checked_for_identity_not_for_current_version(
 
     world.graphiti.search_ = search_then_rewrite
     memory = await MemoryOps(world.graphiti, "owner").search_memory("AtlasK MKentK", scopes=["knowledge"], limit=20)
-    current = (await world.graphiti.driver.execute_query(
-        "MATCH (n:Entity {uuid:'ent-K'}) RETURN n.summary AS s")).records[0]["s"]
     returned = json.dumps(memory.entities, ensure_ascii=False)
-    obs = {"current_text_in_database": current, "returned_old_text": "MKentK" in returned,
-           "returned_current_text": "REDACTEDV2" in returned}
+    obs = {"returned_old_text": "MKentK" in returned, "returned_current_text": "REDACTEDV2" in returned,
+           "returned_entity_uuids": [e["uuid"] for e in memory.entities]}
     print("OBSERVED_D2 " + json.dumps(obs, sort_keys=True))
-    assert obs["returned_old_text"] is True and obs["returned_current_text"] is False
+    assert obs["returned_old_text"] is False and obs["returned_current_text"] is False
+    assert "ent-K" not in obs["returned_entity_uuids"]
 
 
 # --- D3 ---------------------------------------------------------------------------------
