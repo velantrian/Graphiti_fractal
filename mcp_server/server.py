@@ -14,7 +14,8 @@ from core.conversation_buffer import clear_user_buffer
 from core.erasure_guard import erase_node
 from experience.retrieval import get_antipatterns, get_success_patterns
 from knowledge.ingest import ingest_text_document, resolve_group_id
-from knowledge.retrieval import search_knowledge
+from core.read_receipts import ReadReceiptRejected, VerifiedReceipt, verify_read_receipt
+from knowledge.retrieval import search_knowledge_with_receipt
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,22 @@ TOOLS: list[Tool] = [
             "properties": {
                 "text": {"type": "string"},
                 "source_description": {"type": "string", "default": "mcp_remember"},
+                "derivation": {
+                    "type": ["string", "null"],
+                    "enum": ["retelling", None],
+                    "default": None,
+                    "description": "Declare the text a retelling of memory you read; derived_from is then required.",
+                },
+                "derived_from": {
+                    "type": ["object", "null"],
+                    "default": None,
+                    "properties": {
+                        "receipt_id": {"type": "string", "description": "read_receipt.receipt_id from memory.search_knowledge"},
+                        "source_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50},
+                    },
+                    "required": ["receipt_id", "source_ids"],
+                    "description": "The server-issued read receipt and the delivered source uuids this text is derived from.",
+                },
                 "memory_type": {
                     "type": ["string", "null"],
                     "enum": ["personal", "project", "knowledge", "experience", None],
@@ -88,6 +105,22 @@ TOOLS: list[Tool] = [
             "properties": {
                 "text": {"type": "string"},
                 "source_description": {"type": "string", "default": "mcp_upload"},
+                "derivation": {
+                    "type": ["string", "null"],
+                    "enum": ["retelling", None],
+                    "default": None,
+                    "description": "Declare the text a retelling of memory you read; derived_from is then required.",
+                },
+                "derived_from": {
+                    "type": ["object", "null"],
+                    "default": None,
+                    "properties": {
+                        "receipt_id": {"type": "string", "description": "read_receipt.receipt_id from memory.search_knowledge"},
+                        "source_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50},
+                    },
+                    "required": ["receipt_id", "source_ids"],
+                    "description": "The server-issued read receipt and the delivered source uuids this text is derived from.",
+                },
                 "memory_type": {
                     "type": "string",
                     "enum": ["personal", "project", "knowledge", "experience"],
@@ -197,6 +230,26 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(maximum, parsed))
 
 
+async def _verified_derivation(graphiti, owner: str, args: dict[str, Any]) -> VerifiedReceipt | None:
+    """The read receipt a write is derived from, verified now; None only for a plain (legacy) write.
+
+    A text declared as a retelling (``derivation``) or carrying ``derived_from`` must have a receipt that verifies,
+    otherwise the write is refused before Graphiti is called. Old clients send neither and keep the previous
+    behaviour (origin agent_derived, no link to what they read) unless the owner sets
+    FRACTAL_MCP_REQUIRE_READ_RECEIPT=1, which refuses every agent write without a verifiable receipt."""
+    derived = args.get("derived_from")
+    if derived is None:
+        if args.get("derivation") == "retelling":
+            raise ReadReceiptRejected("receipt_required", "a text declared as a retelling needs derived_from")
+        if os.getenv("FRACTAL_MCP_REQUIRE_READ_RECEIPT") == "1":
+            raise ReadReceiptRejected("receipt_required", "this server requires derived_from for agent writes")
+        return None
+    if not isinstance(derived, dict):
+        raise ReadReceiptRejected("bad_request", "derived_from must be an object")
+    return await verify_read_receipt(graphiti, user_id=owner, receipt_id=derived.get("receipt_id"),
+                                     source_ids=derived.get("source_ids"))
+
+
 async def _tool_call(name: str, args: dict[str, Any]) -> Any:
     owner = get_instance_user_id()
 
@@ -205,14 +258,16 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         if not query:
             raise ValueError("query is required")
         graphiti = await _get_graphiti()
-        return {
-            "items": await search_knowledge(
-                graphiti,
-                query,
-                limit=_bounded_int(args.get("limit"), default=10, minimum=1, maximum=50),
-                group_id=args.get("group_id"),
-            )
-        }
+        found = await search_knowledge_with_receipt(
+            graphiti,
+            query,
+            user_id=owner,
+            limit=_bounded_int(args.get("limit"), default=10, minimum=1, maximum=50),
+            group_id=args.get("group_id"),
+        )
+        # "read_receipt": the server's record of exactly what was delivered; pass its receipt_id and the source uuids
+        # you used as derived_from to memory.remember / memory.upload (null when nothing was delivered).
+        return found
 
     if name == "memory.search_experience":
         mode = str(args.get("mode") or "success")
@@ -240,11 +295,13 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         if not text:
             raise ValueError("text is required")
         graphiti = await _get_graphiti()
+        receipt = await _verified_derivation(graphiti, owner, args)        # before anything reaches Graphiti
         return await MemoryOps(graphiti, owner).remember_text(
             text,
             memory_type=args.get("memory_type"),
             source_description=str(args.get("source_description") or "mcp_remember"),
             origin_class="agent_derived",
+            read_receipt=receipt,
         )
 
     if name == "memory.upload":
@@ -255,6 +312,7 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
         if memory_type not in {"personal", "project", "knowledge", "experience"}:
             raise ValueError("invalid memory_type")
         graphiti = await _get_graphiti()
+        receipt = await _verified_derivation(graphiti, owner, args)
         return await ingest_text_document(
             graphiti,
             text,
@@ -262,6 +320,7 @@ async def _tool_call(name: str, args: dict[str, Any]) -> Any:
             user_id=owner,
             group_id=resolve_group_id(memory_type),
             origin_class="agent_derived",
+            read_receipt=receipt,
         )
 
     if name == "memory.delete":

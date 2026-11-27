@@ -12,6 +12,27 @@ async def search_knowledge(
     limit: int = 10,
     group_id: str | None = None,
 ) -> list[dict]:
+    items, _ = await _search_knowledge(graphiti, query, limit=limit, group_id=group_id)
+    return items
+
+
+async def search_knowledge_with_receipt(
+    graphiti,
+    query: str,
+    *,
+    user_id: str,
+    limit: int = 10,
+    group_id: str | None = None,
+) -> dict:
+    """Same search, plus a server-side read receipt for exactly the items delivered (core/read_receipts.py)."""
+    from core.read_receipts import issue_read_receipt
+
+    items, delivered = await _search_knowledge(graphiti, query, limit=limit, group_id=group_id)
+    receipt = await issue_read_receipt(graphiti, user_id=user_id, tool="memory.search_knowledge", items=delivered)
+    return {"items": items, "read_receipt": receipt}
+
+
+async def _search_knowledge(graphiti, query: str, *, limit: int, group_id: str | None) -> tuple[list[dict], list[dict]]:
     """Structural knowledge search over Graphiti fulltext indexes without LLM calls.
 
     External imports are untrusted and therefore excluded from the default search.
@@ -20,7 +41,7 @@ async def search_knowledge(
     """
     q = (query or "").strip()
     if not q:
-        return []
+        return [], []
 
     experience_group_id = get_config().memory.experience_group_id
     result = await graphiti.driver.execute_query(
@@ -67,6 +88,7 @@ async def search_knowledge(
     )
 
     items = []
+    delivered = []      # what the client was shown, with the text before the 500-character cut
     for record in result.records:
         text = record.get("summary") or record.get("content") or record.get("name")
         if not text:
@@ -77,6 +99,9 @@ async def search_knowledge(
         if len(normalized) > 500:
             normalized = normalized[:500].rstrip() + "..."
         item_group_id = record.get("group_id")
+        delivered.append({"type": "episode" if record["kind"] == "Episodic" else "entity", "uuid": record.get("uuid"),
+                          "group_id": item_group_id,
+                          "raw_text": str(record.get("summary") or record.get("content") or record.get("name") or "")})
         items.append(
             {
                 "kind": record["kind"],
@@ -88,4 +113,4 @@ async def search_knowledge(
                 "text": normalized,
             }
         )
-    return items
+    return items, delivered

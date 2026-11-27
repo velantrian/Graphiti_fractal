@@ -25,7 +25,9 @@ from core.ingest_atomicity import (
     mark_ingest_claim_failed,
     mark_ingest_claim_write_attempt,
     release_ingest_claim,
+    ReadReceiptStale,
 )
+from core.read_receipts import merge_lineage_into_existing, verify_read_receipt
 from core.text_utils import fingerprint, split_into_semantic_chunks
 
 logger = logging.getLogger(__name__)
@@ -381,16 +383,30 @@ async def _contain_if_erased_meanwhile(graphiti, group_id: str, since_revision: 
         from core.erasure_scope import mark_late_write
         from core.late_writes import reopen_for_unsettled_writes
         if episode_uuids:
-            result = await mark_late_write(graphiti, group_id, since_revision, episode_uuids)
+            result = await mark_late_write(
+                graphiti, group_id, since_revision, episode_uuids,
+                ingest_claim_key=claim_key(group_id, claim_fingerprint) if claim_fingerprint else None)
             if result.get("events") and claim_fingerprint:
                 await graphiti.driver.execute_query(
-                    "MATCH (c:FractalIngestClaim {claim_key:$k}) WHERE c.late_settled_at IS NULL "
+                    "MATCH (c:FractalIngestClaim {claim_key:$k}) "
+                    "WHERE c.late_settled_at IS NULL AND c.recall_receipt_id IS NULL "
                     "SET c.late_settled_at=datetime(), c.late_settlement='contained'",
                     k=claim_key(group_id, claim_fingerprint))
-        elif claim_fingerprint:
+        if claim_fingerprint:
+            # Even with a known UUID, an event's relation can still be UNKNOWN.
+            # Only the durable claim may hold it until the scope is verified.
             await reopen_for_unsettled_writes(graphiti)
     except Exception:  # noqa: BLE001
         logger.error("Could not contain objects written during an erasure: group paused is not guaranteed")
+
+
+async def _contain_stale_derivation(graphiti, episode_uuid: str) -> None:
+    """Isolate an unfinalized episode; the common claim-based late-write path marks its graph."""
+    try:
+        from core.erasure_guard import quarantine_unconfirmed_episode
+        await quarantine_unconfirmed_episode(graphiti, episode_uuid)
+    except Exception:  # noqa: BLE001
+        logger.error("Could not contain a derived episode whose source vanished")
 
 
 async def ingest_text_document(
@@ -403,8 +419,14 @@ async def ingest_text_document(
     group_id: str | None = None,
     origin_class: str | None = None,
     expected_revision: int | None = None,
+    read_receipt=None,
 ) -> dict:
     """Canonical Graphiti-native text ingestion path with durable origin.
+
+    ``read_receipt`` (core.read_receipts.VerifiedReceipt): the write is a retelling of those delivered sources. It is
+    verified again before every chunk reaches Graphiti and inside the atomic finalization of every stored chunk, which
+    also records the lineage on the episode; a source deleted or changed meanwhile contains the already created episode
+    and its derived objects instead of finalizing it.
 
     A unique Fractal ingest claim is acquired before Graphiti writes. This closes
     concurrent same-group/fingerprint races at the app boundary. Graphiti still
@@ -422,6 +444,10 @@ async def ingest_text_document(
     cleaned = text.strip()
     if not cleaned:
         raise ValueError("text is empty")
+    if read_receipt is not None:
+        # refused as a whole, before any chunk is claimed or sent: ReadReceiptRejected is not swallowed per chunk
+        await verify_read_receipt(graphiti, user_id=user_id, receipt_id=read_receipt.receipt_id,
+                                  source_ids=list(read_receipt.source_ids))
     if not group_id:
         group_id = get_config().memory.knowledge_group_id
 
@@ -490,6 +516,10 @@ async def ingest_text_document(
             if await episode_exists(graphiti, chunk_fp, chunk, group_id=group_id,
                                     origin_class=resolved_origin_class, user_id=user_id,
                                     source_description=source_description):
+                if read_receipt is not None:
+                    if not await merge_lineage_into_existing(graphiti, group_id=group_id, fingerprint=chunk_fp,
+                                                              content=chunk, receipt=read_receipt, user_id=user_id):
+                        raise UnconfirmedEpisodeIdentity("receipt lineage was not confirmed")
                 skipped_count += 1
                 skipped_existing += 1
                 if job_id:
@@ -519,8 +549,12 @@ async def ingest_text_document(
                     await require_erasure_revision(graphiti, expected_revision, group_id=group_id)
                     await require_group_writable(graphiti, group_id)       # re-check right before the call
                     previous = await live_previous_episode_uuids(graphiti, group_id, reference_time)
+                    if read_receipt is not None:      # still before the attempt marker: a refusal here proves no write
+                        await verify_read_receipt(graphiti, user_id=user_id, receipt_id=read_receipt.receipt_id,
+                                                  source_ids=list(read_receipt.source_ids))
                     await mark_ingest_claim_write_attempt(
-                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token)
+                        graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
+                        read_receipt=read_receipt, user_id=user_id)
                     if write_started:
                         # A previous attempt already reached Graphiti and its outcome is
                         # unknown: another add_episode could store the chunk twice.
@@ -589,6 +623,7 @@ async def ingest_text_document(
                 origin_class=resolved_origin_class,
                 ingest_quality="degraded" if degraded else "complete",
                 content_sha256=hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
+                read_receipt=read_receipt,
             )
             if degraded:
                 degraded_chunks += 1
@@ -636,6 +671,8 @@ async def ingest_text_document(
                     graphiti, group_id=group_id, fingerprint=chunk_fp, token=claim_token,
                     write_started=write_started, error_type=type(exc).__name__)
             logger.error("Ingest chunk %d/%d failed: %s", index, total_chunks, type(exc).__name__)
+            if isinstance(exc, ReadReceiptStale) and episode_uuid:
+                await _contain_stale_derivation(graphiti, episode_uuid)
             if write_started:
                 await _contain_if_erased_meanwhile(graphiti, group_id, expected_revision,
                                                    written_uuids[chunk_uuid_start:], claim_fingerprint=chunk_fp)
