@@ -163,6 +163,103 @@ def test_provisioning_marks_only_an_empty_database(monkeypatch):
     assert mode == "WRITE" and "WHERE existing = 0" in query
 
 
+# --- Graphiti on the admitted connection ---------------------------------------
+
+def _graphiti_neo4j_module():
+    from graphiti_core.driver import neo4j_driver
+
+    return neo4j_driver
+
+
+class _OpenedPools:
+    """Stand-in for neo4j.AsyncGraphDatabase that records every pool request."""
+
+    def __init__(self):
+        self.calls = []
+
+    def driver(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        raise AssertionError("graphiti_core opened a pool of its own")
+
+
+def _construct_graphiti_driver(uri="bolt://127.0.0.1:1", user="neo4j", password="pw"):
+    # A worker thread has no running loop, so graphiti_core schedules no schema task.
+    module = _graphiti_neo4j_module()
+    return asyncio.run(asyncio.to_thread(module.Neo4jDriver, uri, user, password))
+
+
+def test_graphiti_receives_the_admitted_driver_and_opens_no_pool(monkeypatch):
+    module = _graphiti_neo4j_module()
+    pools = _OpenedPools()
+    monkeypatch.setattr(module, "AsyncGraphDatabase", pools)
+    admitted = object()
+    with guard.graphiti_bound_to_admitted_driver(admitted, settings()) as handed_out:
+        graph_driver = _construct_graphiti_driver()
+    assert graph_driver.client is admitted
+    assert handed_out == [admitted]
+    assert pools.calls == []
+    assert module.AsyncGraphDatabase is pools  # restored after the context
+
+
+@pytest.mark.parametrize(
+    "uri, user, password",
+    [("bolt://127.0.0.1:2", "neo4j", "pw"), ("bolt://127.0.0.1:1", "other", "pw"),
+     ("bolt://127.0.0.1:1", "neo4j", "other")],
+)
+def test_graphiti_cannot_reach_a_connection_other_than_the_admitted_one(monkeypatch, uri, user, password):
+    module = _graphiti_neo4j_module()
+    pools = _OpenedPools()
+    monkeypatch.setattr(module, "AsyncGraphDatabase", pools)
+    with guard.graphiti_bound_to_admitted_driver(object(), settings()) as handed_out:
+        with pytest.raises(guard.IsolationRejected, match="different Neo4j connection"):
+            _construct_graphiti_driver(uri, user, password)
+    assert handed_out == [] and pools.calls == []
+
+
+def test_graphiti_cannot_open_a_second_driver(monkeypatch):
+    module = _graphiti_neo4j_module()
+    monkeypatch.setattr(module, "AsyncGraphDatabase", _OpenedPools())
+    with guard.graphiti_bound_to_admitted_driver(object(), settings()):
+        _construct_graphiti_driver()
+        with pytest.raises(guard.IsolationRejected, match="second Neo4j driver"):
+            _construct_graphiti_driver()
+
+
+def test_graphiti_binding_refuses_a_database_graphiti_would_not_use(monkeypatch):
+    module = _graphiti_neo4j_module()
+    pools = _OpenedPools()
+    monkeypatch.setattr(module, "AsyncGraphDatabase", pools)
+    other_db = guard.IsolatedNeo4jSettings("bolt://127.0.0.1:1", "neo4j", "pw", "scratch", RUN_ID)
+    with pytest.raises(guard.IsolationRejected, match="unverified database"):
+        with guard.graphiti_bound_to_admitted_driver(object(), other_db):
+            raise AssertionError("must be rejected before the body runs")
+    assert module.AsyncGraphDatabase is pools and pools.calls == []
+
+
+def test_graphiti_binding_is_undone_when_the_body_fails(monkeypatch):
+    module = _graphiti_neo4j_module()
+    pools = _OpenedPools()
+    monkeypatch.setattr(module, "AsyncGraphDatabase", pools)
+    with pytest.raises(RuntimeError, match="boom"):
+        with guard.graphiti_bound_to_admitted_driver(object(), settings()):
+            raise RuntimeError("boom")
+    assert module.AsyncGraphDatabase is pools
+
+
+def test_provider_e2e_is_admitted_before_any_client_is_built():
+    source = (ROOT / "tests/e2e/test_provider_backed_memory_e2e.py").read_text(encoding="utf-8")
+    conftest = (ROOT / "tests/e2e/conftest.py").read_text(encoding="utf-8")
+    assert "open_admitted_async_driver" in conftest
+    assert "def test_provider_backed_ingest_and_recall_roundtrip(admitted_neo4j" in source
+    assert "def test_admission_hands_graphiti_the_admitted_connection(admitted_neo4j" in source
+    # the only client construction happens inside the binding to the admitted driver
+    assert source.count("get_graphiti_client(") == 1
+    binding = source.index("with graphiti_bound_to_admitted_driver(admitted_neo4j.driver, settings):\n"
+                           "        client = get_graphiti_client(force_new=True)")
+    assert binding > source.index("def test_provider_backed_ingest_and_recall_roundtrip")
+    assert "skipif" not in source  # protection must not depend on how pytest is invoked
+
+
 # --- static guards over test sources -----------------------------------------
 
 UNSCOPED_WIPE = re.compile(r"MATCH\s*\(\s*\w+\s*\)\s*DETACH\s+DELETE", re.IGNORECASE)
@@ -170,7 +267,7 @@ RUNTIME_ENV_READ = re.compile(r"""os\.(?:environ\.get|getenv|environ\[)\(?\s*["'
 
 
 def _database_test_sources():
-    for folder in ("tests/integration", "tests/isolation", "tests/support"):
+    for folder in ("tests/integration", "tests/isolation", "tests/support", "tests/e2e"):
         yield from sorted((ROOT / folder).glob("*.py"))
 
 

@@ -18,16 +18,20 @@ read-only query, that the database is the disposable resource provisioned for
 
 Admission must happen before a Graphiti client is constructed: graphiti_core's
 ``Neo4jDriver.__init__`` schedules ``build_indices_and_constraints()`` as soon
-as it is created inside a running event loop.
+as it is created inside a running event loop. ``graphiti_bound_to_admitted_driver``
+makes that constructor reuse the admitted driver instead of opening its own, so
+admission, schema setup and writes share one connection pool.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from neo4j import READ_ACCESS, WRITE_ACCESS
 
@@ -220,6 +224,60 @@ async def open_admitted_async_driver(settings: IsolatedNeo4jSettings, *, timeout
         await driver.close()
         raise
     return driver
+
+
+# --- application client on the admitted connection ---------------------------
+
+def graphiti_default_database() -> str:
+    """Database that ``Graphiti(uri=...)`` uses: the default of ``Neo4jDriver``."""
+    from graphiti_core.driver.neo4j_driver import Neo4jDriver
+
+    return inspect.signature(Neo4jDriver.__init__).parameters["database"].default
+
+
+@contextlib.contextmanager
+def graphiti_bound_to_admitted_driver(driver: Any, settings: IsolatedNeo4jSettings) -> Iterator[list]:
+    """Hand graphiti_core the admitted AsyncDriver instead of a pool of its own.
+
+    graphiti_core's ``Neo4jDriver.__init__`` opens its own pool with
+    ``AsyncGraphDatabase.driver(...)`` and, inside an event loop, immediately
+    schedules schema writes on it. While this context is active that call
+    returns *driver* itself, so the connection whose marker was verified is the
+    one Graphiti uses for schema setup and every later write. A request for a
+    different URI or credentials, or for a second driver, is rejected before any
+    pool exists. A database other than the one ``Graphiti(uri=...)`` always uses
+    is rejected before the constructor can run.
+
+    Yields the list of drivers handed out (at most one).
+    """
+    from graphiti_core.driver import neo4j_driver as graphiti_neo4j
+
+    expected = graphiti_default_database()
+    if settings.database != expected:
+        raise IsolationRejected(
+            f"Graphiti(uri=...) writes to database {expected!r}, but database "
+            f"{settings.database!r} was admitted; refusing to let it use an unverified database"
+        )
+    handed_out: list = []
+    original = graphiti_neo4j.AsyncGraphDatabase
+
+    class _AdmittedDriverFactory:
+        @staticmethod
+        def driver(uri: Any = None, auth: Any = None, **kwargs: Any) -> Any:
+            if handed_out:
+                raise IsolationRejected("Graphiti asked for a second Neo4j driver; only the admitted one exists")
+            if kwargs or uri != settings.uri or tuple(auth or ()) != (settings.user, settings.password):
+                raise IsolationRejected(
+                    "Graphiti asked for a different Neo4j connection than the admitted one; refusing"
+                )
+            handed_out.append(driver)
+            return driver
+
+    graphiti_neo4j.AsyncGraphDatabase = _AdmittedDriverFactory
+    try:
+        yield handed_out
+    finally:
+        graphiti_neo4j.AsyncGraphDatabase = original
 
 
 # --- guarded mutation --------------------------------------------------------

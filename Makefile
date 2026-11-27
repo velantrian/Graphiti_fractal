@@ -3,7 +3,7 @@ PYTHON?=$(VENV)/bin/python
 PIP?=$(VENV)/bin/pip
 CONTRACT_TESTS?=tests/contract_suite.txt
 
-.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test test-contracts test-collect test-integration test-integration-provisioned test-isolation migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
+.PHONY: venv install setup seed quality search context l1 l2 l3 l3-build viz benchmark test test-contracts test-collect test-integration test-integration-provisioned test-isolation test-e2e test-e2e-isolation migrate web dedupe-entities dedupe-episodes dc-build dc-up dc-down dc-logs
 
 venv:
 	python -m venv $(VENV)
@@ -68,6 +68,16 @@ test-integration-provisioned:
 # Acceptance for the guard itself: integration run + decoy database rejection.
 test-isolation:
 	$(PYTHON) scripts/test_neo4j.py acceptance
+
+# Provider-backed E2E on a fresh disposable database. The marker is verified on the
+# connection Graphiti then uses; without OPENAI_API_KEY only that admission runs and
+# the provider round trip is reported as skipped.
+test-e2e:
+	$(PYTHON) scripts/test_neo4j.py run -- $(PYTHON) -m pytest -q -rs tests/e2e
+
+# Same admission plus decoy rejection evidence for the E2E (what CI runs, no provider key).
+test-e2e-isolation:
+	$(PYTHON) scripts/test_neo4j.py acceptance --target tests/e2e/test_provider_backed_memory_e2e.py
 
 migrate:
 	$(PYTHON) main.py migrate

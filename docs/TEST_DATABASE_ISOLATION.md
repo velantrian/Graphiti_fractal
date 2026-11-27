@@ -29,6 +29,27 @@ in a disposable Neo4j that was provisioned for the current run.
    `tests/test_neo4j_isolation_guard.py` fails if a database test adds an
    unscoped `MATCH (n) DETACH DELETE n` or reads `NEO4J_*`.
 
+## Provider-backed E2E (`tests/e2e`)
+
+The same rule, admitted on Graphiti's own connection:
+
+1. `tests/e2e/conftest.py` opens an `AsyncDriver` with `open_admitted_async_driver`:
+   the marker is read on **that driver's pool**, before anything else.
+2. The Graphiti client is built inside `graphiti_bound_to_admitted_driver`:
+   graphiti_core's `Neo4jDriver` receives exactly that admitted driver instead
+   of opening its own pool (a different URI, credentials, database or a second
+   driver is rejected). Schema setup, migrations and writes therefore run on the
+   connection whose marker was verified.
+3. `test_admission_hands_graphiti_the_admitted_connection` checks this without a
+   provider key and without writing. The provider round trip needs
+   `OPENAI_API_KEY`; without it, it is skipped with an explicit reason, and with
+   `FRACTAL_REQUIRE_PROVIDER_E2E=1` (the opt-in Provider E2E workflow) a missing
+   key is an error.
+4. A plain `pytest tests/e2e` follows the integration rule: no `FRACTAL_TEST_*`
+   means skip (error when `FRACTAL_REQUIRE_TEST_NEO4J=1`) and no driver is
+   created. A rejected database fails every E2E test of the session after a
+   single read-only marker query.
+
 ## Commands
 
 | Command | What it does |
@@ -36,6 +57,8 @@ in a disposable Neo4j that was provisioned for the current run.
 | `make test-integration` | Fresh container (random port, password and run id), provision, `pytest tests/integration`, remove container. Needs Docker. |
 | `make test-isolation` | The same, plus a decoy database with a synthetic control record and `tests/isolation/test_decoy_rejection.py`. CI runs this. |
 | `python scripts/test_neo4j.py provision` | Mark a fresh, empty database supplied by other infrastructure; prints `FRACTAL_TEST_RUN_ID`. Then `make test-integration-provisioned`. |
+| `make test-e2e` | Fresh container, then `pytest tests/e2e`: admission on the connection Graphiti uses; the provider round trip runs only with `OPENAI_API_KEY`, otherwise it is reported as skipped. |
+| `make test-e2e-isolation` | `make test-e2e` without the provider key, plus the decoy checks for `tests/e2e`. CI runs this. |
 
 `FRACTAL_TEST_NEO4J_IMAGE` overrides the image (default: the reviewed
 `neo4j:5.26.29-community` pin from `docker-compose.yml`), e.g. for a registry
@@ -62,5 +85,6 @@ access mode. The acceptance test requires:
 
 * The marker proves which database a process talks to; it does not stop a
   person from deliberately provisioning an empty production database.
-* `tests/e2e` and the provider/provenance workflows still use their own
-  `NEO4J_*` settings and are not covered by this guard.
+* The provenance dry-run workflow still uses its own `NEO4J_*` settings and is
+  not covered by this guard. `tests/e2e` and the Provider E2E workflow are
+  (see above).

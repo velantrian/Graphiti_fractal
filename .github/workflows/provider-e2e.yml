@@ -9,19 +9,14 @@ permissions:
 jobs:
   provider-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      neo4j:
-        image: neo4j:5.26.29-community
-        env:
-          NEO4J_AUTH: neo4j/fractal-e2e-password
-        ports:
-          - 7687:7687
+    timeout-minutes: 20
+    # No service container and no NEO4J_*: scripts/test_neo4j.py starts a disposable
+    # database with random credentials and a per-run marker, and the test verifies that
+    # marker on the connection Graphiti then uses, before schema setup or any write.
     env:
-      NEO4J_URI: bolt://127.0.0.1:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: fractal-e2e-password
+      FRACTAL_TEST_NEO4J_IMAGE: neo4j:5.26.29-community
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      FRACTAL_REQUIRE_PROVIDER_E2E: "1"
       FRACTAL_USER_ID: e2e-owner
       FRACTAL_MEMORY_RECALL: always
     steps:
@@ -48,6 +43,7 @@ jobs:
           python -m pip install -c constraints-ci.txt -r requirements.txt
           python -m pip check
 
-      - name: Run bounded provider-backed E2E
+      - name: Run bounded provider-backed E2E on an admitted disposable database
         run: |
-          python -m pytest -q tests/e2e/test_provider_backed_memory_e2e.py
+          python scripts/test_neo4j.py run -- \
+            python -m pytest -q -rs tests/e2e/test_provider_backed_memory_e2e.py
